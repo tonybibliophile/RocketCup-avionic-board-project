@@ -1118,7 +1118,12 @@ def main():
         port = args.port or serial_link.resolve_port()
         print(f"🔄 正在連線地面站板 UART2: {port} @ {args.baud} baud ...")
         try:
-            ser = serial_link.open_serial(port, args.baud, timeout=0.5)
+            # ★2026-07-28：pyserial 的 read(size) 在湊不滿 size 前會一路卡到 timeout 才
+            # 返回剩下的部分——0.5s 太大，這個 baud/印出速率下 ser.read(4096) 幾乎每次都
+            # 卡滿整整 500ms 才回來，把這段時間內所有 console 行一次性吐出，害「紀錄管線」
+            # gap 統計變成人工的 0ms(同批瞬間蓋章)/500ms(批間卡 timeout) 兩極值，跟真實
+            # 封包到達間隔/SD 記錄卡頓無關。降到遠小於封包週期(100ms)的值才不會把時間攤平。
+            ser = serial_link.open_serial(port, args.baud, timeout=0.02)
         except Exception as e:
             print(f"[ERROR] 無法開啟串口 {port}: {e}")
             sys.exit(1)
