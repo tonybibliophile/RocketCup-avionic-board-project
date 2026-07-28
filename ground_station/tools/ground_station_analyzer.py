@@ -77,14 +77,30 @@ RSSI_SNR_NA = -32768   # 見 gs_log.h GS_RSSI_NA/GS_SNR_NA（433 恆無 SNR；RS
 DEDUPE_WINDOW_S = 0.6
 
 # 火箭端下行排程（見 main.c LoRaTelemetry_Task）：Telemetry_Build() 每 LORA_TELEM_PERIOD_MS
-# (100ms) 打包一筆並「共用同一個 seq」，920(E80) 幾乎每個時槽都發(僅受 BUSY 背壓跳過)，
-# 433(E22) 因空中時間較長，韌體刻意每 LORA433_TX_EVERY(=3) 個時槽才發一次（~3.33Hz）。
-# 這代表 433 連續兩筆「正常」封包之間 seq 本來就該差 3，不能套用「差 1 才正常」的丟包演算法
-# ——早期版本沒做這個正規化，曾把 433 的合法降速誤判成 90%+ 丟包（見兩次真實 report 比對）。
+# (100ms) 打包一筆並「共用同一個 seq」，920(E80) 每個時槽都發(僅受 BUSY 背壓跳過)。
+# ★2026-07-28（main.c:2633 起註解）：433(E22) 的 AUX 背壓已是真的限流，LORA433_TX_EVERY
+# 已從 3 改回 1（每槽都嘗試發送），實際發送速率改由空中時間自然限流，不再靠時槽除數硬撐。
+# 早期版本 TX_EVERY=3 時若不做 step 正規化，會把合法降速誤判成 90%+ 丟包；TX_EVERY 改 1
+# 後若忘了同步改這裡（曾發生），後果相反且更危險：seq 差 3 才被當作「差 1 步」，
+# calc_seq_loss() 的 expected 因此被除小、lost 貼地板成 0 ——真丟包會被吃成 0% 完全測不出來。
 LORA_TELEM_PERIOD_MS = 100.0
-LORA433_TX_EVERY = 3
+LORA433_TX_EVERY = 1
+
+# 上行接收窗（main.c UPLINK_LISTEN_EVERY，FEATURE_UPLINK_DEPLOY 開啟時生效，主航電預設開）：
+# 每 10 個 433 時槽固定空出 1 槽不發射，讓地面站上行命令有機會被收到。這個槽仍會讓
+# Telemetry_Build() 的全域 seq 往前走，但 433 這次「不嘗試發送」——地面站收到的 433 seq
+# 因此規律性每 10 筆多墊 1（gap=2 而非 1），是已知設計行為，不是遺失，calc_seq_loss()
+# 需要用 listen_skip_every 把這個規律間隙扣掉，否則會被誤算成 433 專屬的假丟包。
+UPLINK_LISTEN_EVERY = 10
+
+# 433/E22 實際可達速率不再是「時槽除數」而是空中時間物理上限（見 main.c:2634-2636）：
+# 2400bps、TELEM_PACKET_SIZE=116 bytes → 116*8/2400 ≈ 386.7ms/包 ≈ 2.59 pkt/s，
+# 再扣掉上行接收窗佔用的 1/10 嘗試次數，才是韌體實際會嘗試逼近的速率上限。
+LORA433_AIR_BPS = 2400.0
+LORA433_PACKET_BYTES = 116
+LORA433_AIRTIME_S = LORA433_PACKET_BYTES * 8.0 / LORA433_AIR_BPS
 NOMINAL_RATE_HZ = {
-    LINK_433: 1000.0 / (LORA_TELEM_PERIOD_MS * LORA433_TX_EVERY),  # ≈3.33 Hz
+    LINK_433: (1.0 / LORA433_AIRTIME_S) * (UPLINK_LISTEN_EVERY - 1) / UPLINK_LISTEN_EVERY,  # ≈2.33 Hz
     LINK_920: 1000.0 / LORA_TELEM_PERIOD_MS,                        # 10 Hz（受空中時間/BUSY 影響）
 }
 SEQ_STEP = {LINK_433: LORA433_TX_EVERY, LINK_920: 1}
@@ -168,13 +184,16 @@ class StatMetrics:
         self.p2p = self.max_val - self.min_val
 
 
-def calc_seq_loss(seqs: list, step: int = 1) -> dict:
+def calc_seq_loss(seqs: list, step: int = 1, listen_skip_every: int = None) -> dict:
     """依 uint8 seq 序號（可能重複/繞回）算丟包率。同 seq 重複（常見於雙鏈路都收到同一筆，
     或去重前同一封包被算兩次）不算新進度也不算丟包。
 
-    step：此鏈路每隔幾個火箭端 100ms 全域 tick 才會被排到發送一次（見 NOMINAL_RATE_HZ 註解，
-    433=3、920=1）。若不做這個正規化，433 因排程本就每 3 個 tick 才發一次，會被誤判成
-    每次「seq 差 3」都是丟了 2 筆——這正是早期版本把合法降速誤報成 90%+ 丟包的根因。"""
+    step：此鏈路每隔幾個火箭端 100ms 全域 tick 才會被排到發送一次（見 NOMINAL_RATE_HZ 註解；
+    目前 433/920 皆為 1，即每個 tick 都嘗試發送——保留此參數以防日後排程再度降速）。
+
+    listen_skip_every：433 專屬。UPLINK_LISTEN_EVERY 上行接收窗每 N 個時槽固定空出 1 槽
+    不發射，但全域 seq 仍會往前走，讓 433 收到的 seq 規律性每 N 筆多墊 1（gap=2）。這是
+    已知設計行為，不是遺失，需從 expected 扣掉，否則會被誤算成 433 專屬的假丟包。"""
     total_gap = 0
     total_steps = 0
     for i in range(1, len(seqs)):
@@ -184,6 +203,8 @@ def calc_seq_loss(seqs: list, step: int = 1) -> dict:
         total_gap += gap
         total_steps += 1
     expected = total_gap / float(step)
+    if listen_skip_every:
+        expected -= expected / float(listen_skip_every)
     lost = max(expected - total_steps, 0.0)
     ratio = (lost / expected) if expected > 0 else 0.0
     return {"expected": expected, "lost": lost, "ratio": ratio}
@@ -463,9 +484,9 @@ class GsAnalyzerEngine:
                       f"{rate_src}；本次擷取到 {ok_count} 筆有效封包 / {bad_count} 筆 CRC 錯誤")
 
             # --- 總通訊頻率（含 CRC 無效）：只要有觸發同步/CRC 檢查就算「有通訊」，不論解碼
-            # 是否成功。跟韌體設計排程(見 NOMINAL_RATE_HZ：920≈10Hz，433≈3.33Hz)比較，能分辨
-            # 「RF 前端根本沒收到東西」(總頻率遠低於排定值) 跟「有收到但解不出來」(總頻率接近
-            # 排定值、但有效頻率偏低，即 CRC 錯誤率高) 這兩種完全不同的問題。
+            # 是否成功。跟韌體設計排程(見 NOMINAL_RATE_HZ：920≈10Hz，433≈空中時間上限扣上行窗
+            # 後≈2.33Hz)比較，能分辨「RF 前端根本沒收到東西」(總頻率遠低於排定值) 跟「有收到
+            # 但解不出來」(總頻率接近排定值、但有效頻率偏低，即 CRC 錯誤率高) 這兩種完全不同的問題。
             if len(gs_stats) >= 2:
                 d_total = (gs_stats[-1][ok_key] + gs_stats[-1][crc_key]) - (gs_stats[0][ok_key] + gs_stats[0][crc_key])
                 d_t = gs_stats[-1]["t"] - gs_stats[0]["t"]
@@ -481,9 +502,10 @@ class GsAnalyzerEngine:
             add_check(name, "總通訊頻率 (含 CRC 無效)", total_rate_hz, nominal, "pkt/s",
                       ">=", total_rate_hz < nominal * SPEC_LIMITS["total_rate_fail_ratio"],
                       total_rate_hz < nominal * SPEC_LIMITS["total_rate_warn_ratio"],
-                      f"{total_src}；韌體排定速率≈{nominal:.2f}Hz（見 main.c LORA_TELEM_PERIOD_MS/"
-                      f"LORA433_TX_EVERY）。遠低於排定值代表 RF 前端可能根本沒收到訊號，"
-                      f"而非單純解碼品質問題")
+                      f"{total_src}；韌體排定速率≈{nominal:.2f}Hz（920 見 main.c "
+                      f"LORA_TELEM_PERIOD_MS；433 為空中時間物理上限(2400bps/116B)"
+                      f"扣掉 UPLINK_LISTEN_EVERY 上行接收窗後的值）。遠低於排定值代表 "
+                      f"RF 前端可能根本沒收到訊號，而非單純解碼品質問題")
 
             # --- CRC 錯誤率：優先用 [GS_STAT] 累計計數（跨整個連線期間，較不受擷取窗切點影響）
             if len(gs_stats) >= 1:
@@ -518,16 +540,20 @@ class GsAnalyzerEngine:
 
             # --- 單鏈路 RF 到達率丟失：CRC 錯誤的封包仍證明「這個排定時槽有訊號進來」，
             # 只是解不出來，不該跟「完全沒收到」混為一談——併入 any_rx 才能單獨反映真正的
-            # RF 靜默(如死角/斷線)，跟上面的 CRC 錯誤率(解碼品質)分開看。step 依此鏈路的
-            # 排程正規化(433 每 3 個 tick 才發一次是設計行為，不是丟包)。
+            # RF 靜默(如死角/斷線)，跟上面的 CRC 錯誤率(解碼品質)分開看。433 額外扣掉
+            # UPLINK_LISTEN_EVERY 上行接收窗造成的規律性 seq 間隙(設計行為，不是丟包)。
             any_rx = sorted(evs + bad_evs, key=lambda e: e["t"])
+            listen_skip = UPLINK_LISTEN_EVERY if link == LINK_433 else None
             if len(any_rx) >= 2:
-                loss = calc_seq_loss([e["seq"] for e in any_rx], step=SEQ_STEP[link])
+                loss = calc_seq_loss([e["seq"] for e in any_rx], step=SEQ_STEP[link],
+                                      listen_skip_every=listen_skip)
                 add_check(name, "單鏈路 RF 到達率丟失", loss["ratio"] * 100.0,
                           SPEC_LIMITS["single_link_loss_max_ratio"] * 100.0, "%",
                           "<=", loss["ratio"] > SPEC_LIMITS["single_link_loss_max_ratio"] * 1.5,
                           loss["ratio"] > SPEC_LIMITS["single_link_loss_max_ratio"],
-                          f"已依排程正規化(step={SEQ_STEP[link]})、CRC 錯誤也算「有到達」："
+                          f"已依排程正規化(step={SEQ_STEP[link]}"
+                          f"{f', 已扣除每{listen_skip}槽1次上行接收窗' if listen_skip else ''})、"
+                          f"CRC 錯誤也算「有到達」："
                           f"預期 {loss['expected']:.1f} 個時槽、遺失 {loss['lost']:.1f} 個"
                           f"（僅此鏈路，未計入另一鏈路補收；純 RF 靜默，非解碼品質）")
             else:
@@ -833,13 +859,13 @@ class ReportGenerator:
         lines.extend([
             "", "---", "",
             "## 排錯建議",
-            "1. **總通訊頻率遠低於排定值(920≈10Hz/433≈3.33Hz)**：RF 前端可能根本沒收到訊號"
+            "1. **總通訊頻率遠低於排定值(920≈10Hz/433≈2.33Hz)**：RF 前端可能根本沒收到訊號"
             "（天線/接線/供電/模組未初始化），先查這個再查 CRC，順序不能反。",
             "2. **總通訊頻率接近排定值，但 CRC 錯誤率偏高**：代表 RF 前端有收到東西、只是解不出來——"
             "檢查天線接頭/駐波、RF 參數(SF/BW/CR 兩端須一致)，或空中速率與雜訊環境不符。",
             "3. **Resync 比例偏高（433）**：多半是空中位元速率不符或強雜訊源干擾，非單純距離問題。",
-            "4. **單鏈路 RF 到達率丟失偏高**：已扣掉 433 每 3 個時槽才發一次的正常降速排程，"
-            "剩下的才是真正的 RF 靜默，需查天線/距離/遮蔽。",
+            "4. **單鏈路 RF 到達率丟失偏高**：已扣掉 433 每 UPLINK_LISTEN_EVERY(=10) 個時槽固定"
+            "空出 1 槽讓地面站上行的正常設計行為，剩下的才是真正的 RF 靜默，需查天線/距離/遮蔽。",
             "5. **合併到達率丟失偏高但單鏈路正常**：檢查是否兩鏈路收到的其實是同一時間窗（火箭端 TX 排程異常）。",
             "6. **紀錄管線停頓**：對應已知 Flash sector erase 阻塞，嚴重時可能造成飛行末段掉包，"
             "建議改用 --csv 對實際 SD 卡 GSLOGnnn.CSV 做離線分析確認真實影響。",
@@ -950,8 +976,10 @@ new Chart(document.getElementById('chartGap'), {{
 # ===========================================================================
 def generate_selftest_events(engine: GsAnalyzerEngine):
     """依 main.c LoRaTelemetry_Task 的真實排程模擬：兩鏈路共用同一個每 100ms 遞增的全域
-    seq，920 幾乎每個 tick 都發，433 每 LORA433_TX_EVERY(=3) 個 tick 才發一次——這是
-    calc_seq_loss() 需要 step 正規化的原因，selftest 資料若不照這個排程生成就測不出問題。"""
+    seq，920 幾乎每個 tick 都發；433 每個 tick 都嘗試發送(LORA433_TX_EVERY=1)，但每
+    UPLINK_LISTEN_EVERY(=10) 個 tick 固定空出 1 個不發、留給上行接收窗——這個規律間隙
+    是設計行為、不是遺失，calc_seq_loss() 需要用 listen_skip_every 正規化，selftest
+    資料若不照這個排程生成就測不出這項邏輯有沒有壞掉。"""
     import random
     t = time.time() - 60.0
     gs_stat = {"hw433_ok": True, "hw920_ok": True, "raw433": 0, "ok433": 0, "crc433": 0, "rsync433": 0,
@@ -972,8 +1000,10 @@ def generate_selftest_events(engine: GsAnalyzerEngine):
             engine.add_pkt_bad(t, LINK_920, global_seq)
             gs_stat["crc920"] += 1
 
-        # 433：只在每 LORA433_TX_EVERY 個 tick 才發一次，稍高雜訊
-        if (i % LORA433_TX_EVERY) == 0:
+        # 433：每個 tick 都嘗試(LORA433_TX_EVERY=1)，但每 UPLINK_LISTEN_EVERY 個 tick 空出
+        # 最後 1 槽給上行接收窗不發送，稍高雜訊
+        listen_slot = (i % UPLINK_LISTEN_EVERY) == (UPLINK_LISTEN_EVERY - 1)
+        if (i % LORA433_TX_EVERY) == 0 and not listen_slot:
             if random.random() > 0.06:
                 engine.add_pkt(t + 0.02, LINK_433, RSSI_SNR_NA, RSSI_SNR_NA, global_seq)
                 gs_stat["ok433"] += 1
