@@ -192,10 +192,31 @@ class StatMetrics:
         self.p2p = self.max_val - self.min_val
 
 
+def unwrap_seq_sequential(ordered_seqs: list) -> list:
+    """把 uint8 seq（每 256 就繞回）依「已確定為真實傳送順序」的序列展開成連續遞增值，
+    純粹用相鄰兩筆的 mod 256 差值累加，完全不依賴 wall-clock 時間。
+
+    用在單鏈路檢查：同一鏈路收到的封包，印出順序本來就等於真實傳送順序（韌體單執行緒
+    同步解碼＋printf，不會有重排），所以直接從「起始 seq」往後累加「中間掉了幾個」即可，
+    不需要引入時間反推 tick——這樣量測結果完全不受序列埠讀取的時序/緩衝延遲影響
+    （即使 [ground_station_analyzer.py](serial timeout) 這類 host 端計時源不準也沒差）。
+
+    ⚠ 限制：若同一鏈路真的連續靜默超過 128 個 tick(~12.8s)，mod 256 差值會把這段
+    空窗誤讀成一個較小的正常間隔（aliasing）。一般 RF 短暫失聯不會斷這麼久，可接受；
+    真的要防這個，才需要另外引入時間輔助（見 unwrap_seq_to_ticks）。"""
+    if not ordered_seqs:
+        return []
+    out = [ordered_seqs[0]]
+    for i in range(1, len(ordered_seqs)):
+        gap = (ordered_seqs[i] - ordered_seqs[i - 1]) % 256
+        out.append(out[-1] + gap)
+    return out
+
+
 def unwrap_seq_to_ticks(events: list, period_s: float, t0: float) -> list:
     """把 uint8 seq（每 256 就繞回）依已知的固定全域 tick 週期(period_s，即
     LORA_TELEM_PERIOD_MS/1000，兩鏈路共用同一個 100ms tick 計數器)展開成連續遞增的
-    整數 tick 值，不再依賴事件的到達順序。
+    整數 tick 值，不依賴事件的到達順序——只有「合併雙鏈路」時才需要這個版本。
 
     ★2026-07-28 修正根因：舊版 calc_seq_loss() 是把事件按「到達時間」排序後，逐一算
     (seq[i]-seq[i-1]) % 256——這個算法隱含假設「按到達時間排序後 seq 必然遞增」。但
@@ -205,7 +226,8 @@ def unwrap_seq_to_ticks(events: list, period_s: float, t0: float) -> list:
     脫離物理上限（見四次實測 report：Union Loss 換算出的隱含 tick 頻率高達 ~270~370Hz，
     遠超火箭端 10Hz 設計上限）。改用「已知週期反推最接近的 tick」展開，只要 t0 附近
     時鐘誤差遠小於半個 256-tick 週期(~12.8s)，就與事件到達順序完全無關，不會再被
-    偶發的跨鏈路延遲差污染。"""
+    偶發的跨鏈路延遲差污染。★單鏈路檢查不會有這個跨鏈路重排問題，改用不依賴時間的
+    unwrap_seq_sequential()。"""
     out = []
     for e in events:
         est_tick = (e["t"] - t0) / period_s
@@ -577,16 +599,24 @@ class GsAnalyzerEngine:
                           "<=", False, False, "未見到 [GS_STAT] 行（純 CSV 離線分析無此資料）")
 
             # --- 單鏈路 RF 到達率丟失：CRC 錯誤的封包仍證明「這個排定時槽有訊號進來」，
-            # 只是解不出來，不該跟「完全沒收到」混為一談——併入 any_rx 才能單獨反映真正的
-            # RF 靜默(如死角/斷線)，跟上面的 CRC 錯誤率(解碼品質)分開看。433 額外扣掉
+            # 只是解不出來，不該跟「完全沒收到」混為一談——併入 any_rx 才能單獨反映真正
+            # 沒收到訊號的比例，跟上面的 CRC 錯誤率(解碼品質)分開看。433 額外扣掉
             # UPLINK_LISTEN_EVERY 上行接收窗造成的規律性 seq 間隙(設計行為，不是丟包)。
+            # ★同一鏈路收到的順序就是真實傳送順序(韌體單執行緒同步解碼+印出，不會重排)，
+            # 直接用 seq 本身累加展開即可，不需要靠 wall-clock 時間反推(那是合併雙鏈路
+            # 才需要的做法，見 unwrap_seq_to_ticks 註解)。
             any_rx = sorted(evs + bad_evs, key=lambda e: e["t"])
             listen_skip = UPLINK_LISTEN_EVERY if link == LINK_433 else None
             if len(any_rx) >= 2:
-                ticks = unwrap_seq_to_ticks(any_rx, LORA_TELEM_PERIOD_MS / 1000.0, any_rx[0]["t"])
+                ticks = unwrap_seq_sequential([e["seq"] for e in any_rx])
                 loss = calc_tick_loss(ticks, step=SEQ_STEP[link], listen_skip_every=listen_skip)
                 step_note = (f"每{SEQ_STEP[link]}tick最多1次成功發射(空中時間限制)"
                              if SEQ_STEP[link] > 1 else "step=1，每tick都是機會")
+                # ★這裡量到的「遺失」只代表「地面站沒收到」，成因可能是 RF 真的沒收到，
+                # 也可能是航電端自己卡住/排隊延遲(如 SPI3 mutex 跟 Flash 記錄搶用、任務
+                # 排程被高優先仼務搶佔)導致實際發射間隔比 step 假設的物理下限還長——單靠
+                # 地面站封包無法分辨這兩種成因，需要對照航電板自己的 [LORA_TX_LOG]
+                # (main.c，ok/try 計數，每 25 槽印一次)才能確認是哪一種。
                 add_check(name, "單鏈路 RF 到達率丟失", loss["ratio"] * 100.0,
                           SPEC_LIMITS["single_link_loss_max_ratio"] * 100.0, "%",
                           "<=", loss["ratio"] > SPEC_LIMITS["single_link_loss_max_ratio"] * 1.5,
@@ -595,7 +625,8 @@ class GsAnalyzerEngine:
                           f"{f'、已扣除每{listen_skip}槽1次上行接收窗' if listen_skip else ''}正規化、"
                           f"CRC 錯誤也算「有到達」："
                           f"預期 {loss['expected']:.1f} 個時槽、遺失 {loss['lost']:.1f} 個"
-                          f"（僅此鏈路，未計入另一鏈路補收；純 RF 靜默，非解碼品質）")
+                          f"（僅此鏈路，未計入另一鏈路補收；地面站收不到訊號可能是 RF 真的沒收到，"
+                          f"也可能是航電端自己卡住晚發，需對照該板 [LORA_TX_LOG] 才能分辨）")
             else:
                 add_check(name, "單鏈路 RF 到達率丟失", 0.0,
                           SPEC_LIMITS["single_link_loss_max_ratio"] * 100.0, "%",
