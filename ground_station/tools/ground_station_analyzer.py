@@ -207,27 +207,35 @@ def unwrap_seq_to_ticks(events: list, period_s: float, t0: float) -> list:
 
 
 def calc_tick_loss(unwrapped_ticks: list, step: int = 1, listen_skip_every: int = None) -> dict:
-    """依展開後的全域 tick 值算丟包率：用「涵蓋的 tick 範圍」扣掉「實際收到幾個相異
-    tick」，取代舊版逐一取相鄰事件差值的做法——不受事件排列順序影響，天生免疫
+    """依展開後的全域 tick 值算丟包率：逐一走訪涵蓋範圍內「每一個該有發送機會的 tick」，
+    直接檢查該 tick 是否出現在實收集合裡——真的用 seq 決定每一筆是否漏掉，而不是拿
+    「範圍大小 - 收到幾筆」的整體統計去反推近似值。不受事件排列順序影響，天生免疫
     unwrap_seq_to_ticks() 註解描述的跨鏈路時間序倒置問題。
 
     step：此鏈路每隔幾個全域 tick 才有一次發送機會（見 NOMINAL_RATE_HZ 註解；目前
     433/920 皆為 1，即每個 tick 都嘗試發送——保留此參數以防日後排程再度降速）。
 
-    listen_skip_every：433 專屬。UPLINK_LISTEN_EVERY 上行接收窗每 N 個時槽固定空出
-    1 槽不發射，是已知設計行為、不是遺失，需從 expected 扣掉，否則會被誤算成 433
-    專屬的假丟包。"""
+    listen_skip_every：433 專屬。UPLINK_LISTEN_EVERY 上行接收窗每 N 個全域 tick 固定
+    空出 1 個(tick % N == N-1)不發射（見 main.c listen_slot 判斷式，這裡直接用同一個
+    條件逐 tick 判斷，不是套用平均折讓），是已知設計行為、該 tick 不計入 expected，
+    否則會被誤算成 433 專屬的假丟包。"""
     if not unwrapped_ticks:
         return {"expected": 0.0, "lost": 0.0, "ratio": 0.0}
     distinct = set(unwrapped_ticks)
-    span = max(distinct) - min(distinct)
-    expected = span / float(step) + 1.0
-    if listen_skip_every:
-        expected -= expected / float(listen_skip_every)
-    received = float(len(distinct))
-    lost = max(expected - received, 0.0)
-    ratio = (lost / expected) if expected > 0 else 0.0
-    return {"expected": expected, "lost": lost, "ratio": ratio}
+    lo, hi = min(distinct), max(distinct)
+    g = lo - (lo % step)
+    if g < lo:
+        g += step
+    expected = 0
+    lost = 0
+    while g <= hi:
+        if not (listen_skip_every and (g % listen_skip_every) == (listen_skip_every - 1)):
+            expected += 1
+            if g not in distinct:
+                lost += 1
+        g += step
+    ratio = (lost / float(expected)) if expected > 0 else 0.0
+    return {"expected": float(expected), "lost": float(lost), "ratio": ratio}
 
 
 def merge_dedupe_events(events: list) -> list:
