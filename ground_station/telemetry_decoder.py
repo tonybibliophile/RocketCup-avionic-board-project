@@ -4,8 +4,12 @@
 telemetry_decoder.py — RocketCom 下行遙測二進制解碼器（地面站）
 
 封包契約（與 Main_Code/Core/Inc/telemetry.h 同步,由 tests/test_telemetry.c 機器鎖定）:
-    79 bytes packed little-endian, sync 0xA5,0x5A,
-    CRC-16/CCITT-FALSE (poly=0x1021, init=0xFFFF) 覆蓋前 77 bytes。
+    115 bytes packed little-endian, sync 0xA5,0x5A,
+    CRC-16/CCITT-FALSE (poly=0x1021, init=0xFFFF) 覆蓋前 113 bytes。
+    （含本板垂直濾波器 (VF) 摘要：vf_pos_z_cm/vf_vel_z_cms；主/副協同「對端(副板)
+      摘要」尾段：peer_fsm_state/peer_flags/peer_h_cm/peer_v_cms/peer_baro_cm/
+      peer_link/peer_loss_pmil/peer_az_cg/peer_vf_h_cm/peer_vf_v_cms；以及
+      arm_flags——ARM 被 flash pool 擋下時的原因位元，見 TELEM_ARM_* / arm_flags。）
 
 用法:
     python3 telemetry_decoder.py --port /dev/cu.usbserial-110 --baud 460800
@@ -21,11 +25,11 @@ import struct
 import sys
 import time
 
-PACKET_SIZE = 79
+PACKET_SIZE = 115
 SYNC0, SYNC1 = 0xA5, 0x5A
 
 # 與 test_telemetry.c offset 表一一對應(little-endian)
-_STRUCT_FMT = "<4BI2i4hiI12h2ih2B3H3BH"
+_STRUCT_FMT = "<4BI2i4hiI12h2ih2B3H3B2iBBiiiBHh2iBH"
 _FIELDS = [
     "sync0", "sync1", "seq", "fsm_state", "tick_ms",
     "ekf_pos_z_cm", "ekf_vel_z_cms",
@@ -37,20 +41,60 @@ _FIELDS = [
     "mag_x_mg", "mag_y_mg", "mag_z_mg",
     "gps_lat_1e6", "gps_lon_1e6", "gps_alt_m", "gps_sats", "gps_fix",
     "bat_mv", "cpu_main_x10", "cpu_ekf_x10",
-    "flags", "health_bits", "sensor_bits", "crc16",
+    "flags", "health_bits", "sensor_bits",
+    "vf_pos_z_cm", "vf_vel_z_cms",
+    "peer_fsm_state", "peer_flags", "peer_h_cm", "peer_v_cms", "peer_baro_cm",
+    "peer_link", "peer_loss_pmil", "peer_az_cg", "peer_vf_h_cm", "peer_vf_v_cms",
+    "arm_flags",
+    "crc16",
 ]
 assert struct.calcsize(_STRUCT_FMT) == PACKET_SIZE, struct.calcsize(_STRUCT_FMT)
-assert len(_FIELDS) == len(_STRUCT_FMT.replace("<", "").replace("4B", "BBBB")
-                           .replace("2i", "ii").replace("4h", "hhhh")
-                           .replace("12h", "h" * 12).replace("2h", "hh")
-                           .replace("2B", "BB").replace("3H", "HHH")
-                           .replace("3B", "BBB"))
 
-FSM_NAMES = ["INIT", "PAD", "BOOST", "COAST", "DEPLOY_DROGUE", "APOGEE", "DESCENT", "MAIN", "LANDED"]
+
+def _fmt_field_count(fmt: str) -> int:
+    """展開 struct 格式字串（如 "4B" -> 4 個欄位）算總欄位數，驗證與 _FIELDS 對齊。"""
+    n, digits = 0, ""
+    for ch in fmt:
+        if ch == "<":
+            continue
+        if ch.isdigit():
+            digits += ch
+        else:
+            n += int(digits) if digits else 1
+            digits = ""
+    return n
+
+
+assert _fmt_field_count(_STRUCT_FMT) == len(_FIELDS), \
+    (_fmt_field_count(_STRUCT_FMT), len(_FIELDS))
+
+FSM_NAMES = ["INIT", "PAD", "PAD_ARMED", "BOOST", "COAST", "DEPLOY_DROGUE", "APOGEE", "DESCENT", "MAIN", "LANDED"]
 FLAG_NAMES = [
     (0x01, "DROGUE"), (0x02, "MAIN"), (0x04, "SD"), (0x08, "GPS_STALE"),
     (0x10, "EKF_UNHEALTHY"), (0x20, "SENSOR_FAULT"), (0x40, "FAILSAFE"), (0x80, "HOTSTART"),
 ]
+# peer_link 位（主/副協同：主板中繼的副板鏈路健康）
+PEER_LINK_EVER, PEER_LINK_FRESH, PEER_LINK_LOST, PEER_LINK_DESYNC = 0x01, 0x02, 0x04, 0x08
+
+# arm_flags 位（ARM 被擋下的原因，與 telemetry.h TELEM_ARM_* 對應）
+TELEM_ARM_BLOCKED_FLASH_POOL = 0x01
+
+
+def fmt_peer(p: dict) -> str:
+    link = p.get("peer_link", 0)
+    if not (link & PEER_LINK_EVER):
+        return "peer:--"                       # 從未收過對端（無副板 / 鏈路未起）
+    pstate = (FSM_NAMES[p["peer_fsm_state"]] if p["peer_fsm_state"] < len(FSM_NAMES)
+              else f"?{p['peer_fsm_state']}")
+    pflags = "|".join(name for bit, name in FLAG_NAMES if p["peer_flags"] & bit) or "-"
+    tags = ["FRESH" if (link & PEER_LINK_FRESH) else "STALE"]
+    if link & PEER_LINK_LOST:   tags.append("LOST")
+    if link & PEER_LINK_DESYNC: tags.append("DESYNC")
+    loss = p.get("peer_loss_pmil", 0) / 10.0
+    return (f"peer:{pstate} ph={p['peer_h_cm']/100.0:.1f}m pv={p['peer_v_cms']/100.0:+.1f}m/s "
+            f"pbaro={p.get('peer_baro_cm', 0)/100.0:.1f}m paz={p.get('peer_az_cg', 0)/100.0:+.2f}g "
+            f"pvf=({p.get('peer_vf_h_cm', 0)/100.0:.1f}m,{p.get('peer_vf_v_cms', 0)/100.0:+.1f}m/s) "
+            f"[{pflags}] {'|'.join(tags)} loss={loss:.1f}%")
 
 
 def crc16_ccitt_false(data: bytes) -> int:
@@ -94,10 +138,14 @@ def fmt_human(p: dict) -> str:
     health = ""
     if p["health_bits"] or p["sensor_bits"]:
         health = f" !ekf=0x{p['health_bits']:02X} !sens=0x{p['sensor_bits']:02X}"
+    arm_block = ""
+    if p.get("arm_flags", 0) & TELEM_ARM_BLOCKED_FLASH_POOL:
+        arm_block = " [ARM BLOCKED: flash pool not ready]"
+    vf = f"vf=({p.get('vf_pos_z_cm', 0)/100.0:.2f}m,{p.get('vf_vel_z_cms', 0)/100.0:+.2f}m/s)"
     return (f"#{p['seq']:3d} t={p['tick_ms']/1000.0:8.2f}s {fsm:7s} "
             f"h={p['ekf_pos_z_cm']/100.0:7.2f}m v={p['ekf_vel_z_cms']/100.0:7.2f}m/s "
-            f"baro={p['baro_alt_cm']/100.0:8.2f}m bat={p['bat_mv']/1000.0:.2f}V "
-            f"[{flags}]{health} gps={gps}")
+            f"baro={p['baro_alt_cm']/100.0:8.2f}m {vf} bat={p['bat_mv']/1000.0:.2f}V "
+            f"[{flags}]{health}{arm_block} gps={gps} | {fmt_peer(p)}")
 
 
 def csv_header() -> str:
@@ -121,8 +169,8 @@ def scan_stream(read_chunk, stats: Stats, on_packet):
                 del buf[0]
                 continue
             raw = bytes(buf[:PACKET_SIZE])
-            crc_recv = raw[77] | (raw[78] << 8)
-            if crc16_ccitt_false(raw[:77]) != crc_recv:
+            crc_recv = raw[PACKET_SIZE - 2] | (raw[PACKET_SIZE - 1] << 8)
+            if crc16_ccitt_false(raw[:PACKET_SIZE - 2]) != crc_recv:
                 stats.crc_err += 1
                 del buf[0]      # 滑動重同步(可能是假 sync 或封包損毀)
                 continue
@@ -138,9 +186,13 @@ def make_selftest_packet(seq=7) -> bytes:
     vals.update(sync0=SYNC0, sync1=SYNC1, seq=seq, fsm_state=3, tick_ms=123456,
                 ekf_pos_z_cm=25032, ekf_vel_z_cms=-1500, baro_alt_cm=24890,
                 baro_press_pa=98412, bat_mv=11850, flags=0x41,
-                health_bits=0x01, sensor_bits=0x04, gps_fix=0)
+                health_bits=0x01, sensor_bits=0x04, gps_fix=0,
+                vf_pos_z_cm=24950, vf_vel_z_cms=-1480,
+                peer_fsm_state=3, peer_flags=0x01, peer_h_cm=24800, peer_v_cms=-1490,
+                peer_baro_cm=24750, peer_link=0x03, peer_loss_pmil=12,
+                peer_az_cg=-980, peer_vf_h_cm=24760, peer_vf_v_cms=-1470)
     raw = struct.pack(_STRUCT_FMT, *[vals[f] for f in _FIELDS])
-    raw = raw[:77] + struct.pack("<H", crc16_ccitt_false(raw[:77]))
+    raw = raw[:PACKET_SIZE - 2] + struct.pack("<H", crc16_ccitt_false(raw[:PACKET_SIZE - 2]))
     return raw
 
 

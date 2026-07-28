@@ -24,7 +24,8 @@ FATFS SDFatFS;    /* File system object for SD logical drive */
 FIL SDFile;       /* File object for SD */
 
 /* USER CODE BEGIN Variables */
-
+FIL SDImuFile;    /* S6：原始 IMU 二進位記錄檔 (IMU_xxx.BIN)，與 SDFile(CSV) 並存；
+                   * 兩者剛好用滿 _FS_LOCK=2（ffconf.h），未來若再加第三個檔須先調高該值。 */
 /* USER CODE END Variables */
 
 void MX_FATFS_Init(void)

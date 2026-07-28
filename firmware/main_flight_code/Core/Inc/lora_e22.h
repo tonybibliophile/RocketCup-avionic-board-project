@@ -82,6 +82,29 @@ HAL_StatusTypeDef LoRaE22_SetPowerLevel(uint8_t pwr_level);
  * @return HAL_OK 成功；HAL_ERROR 未初始化/未回讀到暫存器；HAL_TIMEOUT AUX 逾時。
  */
 HAL_StatusTypeDef LoRaE22_SetAirRate(uint8_t air_rate);
+void LoRaE22_GetParams(uint32_t *freq_mhz, uint8_t *pwr_level, uint8_t *air_rate);
+
+/**
+ * @brief 模組是否已開啟「每包附加 RSSI 位元組」（REG3 bit7）。
+ *        開啟時模組每收一包會在酬載後多吐 1 個位元組（值 v → −(256−v) dBm）；
+ *        接收端必須據此決定要不要多讀那個位元組，否則 framing 會差一個位元組
+ *        （關閉卻硬讀 → 吃掉下一包的 sync0，RSSI 恆為假值 −91dBm）。
+ * @return 1 = 已開啟；0 = 未開啟或尚未 probe 到暫存器（保守值，接收端不應多讀）。
+ */
+uint8_t LoRaE22_RssiByteEnabled(void);
+
+/**
+ * @brief 註冊「重新掛載 UART3 接收」的回呼，於本驅動每次離開設定模式後呼叫。
+ *
+ * 本驅動進出設定模式都要改 UART baud（設定模式恆 9600），而 HAL_UART_Init 會把
+ * huart->RxState 打回 READY —— 進行中的 HAL_UARTEx_ReceiveToIdle_IT/DMA 就此失效
+ * （IDLE 分支要求 RxState == BUSY_RX 才回呼），433 接收會靜默到重開機。
+ * 驅動不知道誰在收 UART3（地面站遙測 / 主航電上行各一份），故由擁有者註冊。
+ *
+ * 呼叫時機必須在啟動接收「之前」（否則第一次設定模式的重掛會漏掉）。
+ * 傳 NULL 可取消註冊。回呼在呼叫者的執行緒情境下執行，不是 ISR。
+ */
+void LoRaE22_SetRxRearmCallback(void (*cb)(void));
 
 #ifdef __cplusplus
 }

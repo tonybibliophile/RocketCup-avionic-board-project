@@ -37,8 +37,8 @@ static void test_geometry(void)
 {
     printf("[1] 幾何不變量\n");
     check("環容量 = END+1-BASE", FLASH_RINGBUF_SIZE == END + 1UL - BASE);
-    check("封包恰好鋪滿整環（80B × 208896）", FLASH_RINGBUF_SIZE % PKT == 0 &&
-                                              FLASH_RINGBUF_SIZE / PKT == 208896UL);
+    check("封包恰好鋪滿整環（128B × 130560）", FLASH_RINGBUF_SIZE % PKT == 0 &&
+                                               FLASH_RINGBUF_SIZE / PKT == 130560UL);
     check("sector 恰好鋪滿整環（4KB × 4080）", FLASH_RINGBUF_SIZE % SECTOR == 0 &&
                                                FLASH_RINGBUF_SIZE / SECTOR == 4080UL);
     check("BASE sector 對齊", (BASE % SECTOR) == 0);
@@ -62,7 +62,7 @@ static void test_pool(void)
 static void test_write_advance(void)
 {
     printf("[3] 寫入指標推進\n");
-    check("中段 +80", ring_write_advance(BASE) == BASE + PKT);
+    check("中段 +128", ring_write_advance(BASE) == BASE + PKT);
     check("最後一格寫完 → 迴繞回 BASE", ring_write_advance(END + 1UL - PKT) == BASE);
     check("倒數第二格 → 最後一格", ring_write_advance(END + 1UL - 2 * PKT) == END + 1UL - PKT);
 }
@@ -82,7 +82,7 @@ static void test_erase_advance(void)
 static void test_packet_addr(void)
 {
     printf("[5] 熱啟動回讀位址\n");
-    check("中段：last = write - 80", ring_last_packet_addr(BASE + 10 * PKT) == BASE + 9 * PKT);
+    check("中段：last = write - 128", ring_last_packet_addr(BASE + 10 * PKT) == BASE + 9 * PKT);
     check("write 已迴繞回 BASE：last = 環尾最後一格",
           ring_last_packet_addr(BASE) == END + 1UL - PKT);
     check("prev 中段", ring_prev_packet_addr(BASE + PKT) == BASE);
@@ -140,7 +140,7 @@ static void sim_write(uint32_t addr, uint32_t len)
 
 static void test_full_lap_sim(void)
 {
-    printf("[7] 假 flash 模擬：兩整圈（417,792 筆）寫入\n");
+    printf("[7] 假 flash 模擬：兩整圈（261,120 筆）寫入\n");
     g_map = (uint8_t *)calloc(FLASH_RINGBUF_SIZE, 1);   /* 全 ST_DIRTY */
     if (!g_map) { check("calloc 假 flash", 0); return; }
     g_violations = 0;

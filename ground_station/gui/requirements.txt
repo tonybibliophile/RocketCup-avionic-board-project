@@ -1,6 +1,9 @@
 # RocketCom Python 工具相依（test_runner.py / gui_monitor.py / ekf_visualizer.py /
-# GroundStation/telemetry_decoder.py）。釘到已驗證可用的版本下限。
+# GroundStation/telemetry_decoder.py / tools/flash_analyzer.py）。釘到已驗證可用的版本下限。
+# folium 僅供 flash_analyzer.py 產生互動式 GPS 地圖（.html）；產生報告時不需網路，
+# 但「開啟 html 檔查看地圖底圖」時瀏覽器需連網下載地圖圖磚（OpenStreetMap tiles）。
 #   pip3 install -r requirements.txt
 pyserial>=3.5
 numpy>=1.26
 matplotlib>=3.8
+folium>=0.19

@@ -31,11 +31,17 @@
 #ifndef PYRO_SELFTEST_H
 #define PYRO_SELFTEST_H
 
+#include <stdint.h>
 #include "board_config.h"
 
-/* 本模組編入條件：開機自測（FEATURE_PYRO_SELFTEST）或遠端桌面測試（FEATURE_UPLINK_DEPLOY
- * 經 433 BENCH 命令觸發，見 uplink_cmd.c / main.c）。任一開啟即需要序列函式與參數。 */
-#define PYRO_SELFTEST_AVAILABLE  (FEATURE_PYRO_SELFTEST || FEATURE_UPLINK_DEPLOY)
+/* 本模組編入條件：開機自測（FEATURE_PYRO_SELFTEST）、遠端桌面測試（FEATURE_UPLINK_DEPLOY
+ * 經 433 BENCH 命令觸發，見 uplink_cmd.c / main.c），或副板板間鏈路自動跟隨（FEATURE_LINK
+ * && IS_BACKUP，見 main.c 的 IS_BACKUP 自動跟隨區塊）。任一開啟即需要序列函式與參數。
+ * ⚠ FEATURE_UPLINK_DEPLOY 恆等於 IS_PRIMARY（board_config.h），若只靠它，副板會整個模組
+ *   編譯不進去、PyroSelfTest_RunSequence_Ex 不存在，導致副板永遠無法自動跟隨 bench 測試
+ *   （曾發生過的 bug）。故明確補上 (FEATURE_LINK && IS_BACKUP) 這條件。 */
+#define PYRO_SELFTEST_AVAILABLE  (FEATURE_PYRO_SELFTEST || FEATURE_UPLINK_DEPLOY || \
+                                   (FEATURE_LINK && IS_BACKUP))
 
 #if PYRO_SELFTEST_AVAILABLE
 
@@ -96,6 +102,7 @@
  * 走此函式，見 main.c 診斷任務）。開機自測（FEATURE_PYRO_SELFTEST）則由 RunOnce 呼叫本函式。
  */
 void PyroSelfTest_RunSequence(void);
+void PyroSelfTest_RunSequence_Ex(uint8_t skip_countdown);
 
 #if FEATURE_PYRO_SELFTEST
 /*

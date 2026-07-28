@@ -42,6 +42,16 @@ typedef struct __attribute__((packed)) {
     int32_t  v_est_cms;    /* EKF 垂直速度 (cm/s) */
     int32_t  baro_alt_cm;  /* baro 相對高度 (cm) */
     int16_t  a_z_cg;       /* 高G 垂直加速度 (cg = 0.01g) */
+    uint8_t  ack_state;    /* echo-ACK：回送「我最近採納的對端 FSM 狀態」＝對 peer 的確認 */
+    int16_t  q_w;          /* 四元數 qw * 10000 [-10000, 10000] */
+    int16_t  q_x;          /* 四元數 qx * 10000 [-10000, 10000] */
+    int16_t  q_y;          /* 四元數 qy * 10000 [-10000, 10000] */
+    int16_t  q_z;          /* 四元數 qz * 10000 [-10000, 10000] */
+    uint8_t  main_arb;     /* D2 主傘舵機互斥握手狀態（SERVO_ARB_MSG_*，servo_arb.h） */
+    uint8_t  flash_ready;  /* 1 = 本板 Flash 預擦池已達目標 (960 sectors) */
+    uint8_t  erase_pct;    /* 本板 Flash 預擦進度 0..100% */
+    int32_t  vf_h_cm;      /* 垂直濾波器 (VF) 高度 (cm)：供對端中繼下鏈，與 EKF 對照 */
+    int32_t  vf_v_cms;     /* 垂直濾波器 (VF) 垂直速度 (cm/s) */
     uint16_t crc16;        /* CRC-16/CCITT-FALSE，覆蓋本封包前面所有位元組 */
 } LinkPacket_t;
 
@@ -58,6 +68,16 @@ typedef struct {
     int32_t  v_est_cms;
     int32_t  baro_alt_cm;
     int16_t  a_z_cg;
+    uint8_t  ack_state;    /* echo-ACK：呼叫端填「我最近採納的對端 FSM 狀態」 */
+    int16_t  q_w;
+    int16_t  q_x;
+    int16_t  q_y;
+    int16_t  q_z;
+    uint8_t  main_arb;     /* D2 主傘舵機互斥握手狀態（呼叫端填 ServoArb 廣播值） */
+    uint8_t  flash_ready;  /* 1 = 本板 Flash 預擦池已達目標 (960 sectors) */
+    uint8_t  erase_pct;    /* 本板 Flash 預擦進度 0..100% */
+    int32_t  vf_h_cm;      /* 垂直濾波器 (VF) 高度 (cm) */
+    int32_t  vf_v_cms;     /* 垂直濾波器 (VF) 垂直速度 (cm/s) */
 } LinkStatus_t;
 
 /**
@@ -67,10 +87,13 @@ typedef struct {
  */
 uint16_t LinkProto_Build(uint8_t *out, const LinkStatus_t *st);
 
-/* 逐位元組接收狀態機（DMA/IDLE 或軟體 UART 把收到的 byte 餵進來） */
+/* 逐位元組接收狀態機 + 鏈路品質統計（照 ack_proto.h 的 AckRx_t 慣例） */
 typedef struct {
-    uint8_t buf[sizeof(LinkPacket_t)];
-    uint8_t idx;   /* 已存入 buf 的位元組數（0 = 等待 sync0） */
+    uint8_t  buf[sizeof(LinkPacket_t)];
+    uint8_t  idx;      /* 已存入 buf 的位元組數（0 = 等待 sync0） */
+    uint32_t ok;       /* 成功解出（CRC 通過）的封包數 */
+    uint32_t crc_err;  /* 湊滿一筆但 CRC 不符 */
+    uint32_t resync;   /* sync0 後遇非法 sync1 → 重新對齊 */
 } LinkRx_t;
 
 void LinkRx_Init(LinkRx_t *rx);

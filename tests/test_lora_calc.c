@@ -150,14 +150,15 @@ static void test_stats(void)
     /* 封包率：3 筆跨 1000→3000ms = 2000ms → 1.5 pkt/s → rate_x10=15 */
     check("rate_x10=15 (1.5 pkt/s)", lora_stats_rate_x10(&s) == 15);
 
-    /* 433 鏈路：無 RSSI/SNR，不應納入 rssi_cnt */
+    /* has_rssi/has_snr = 0（沒有量測值的封包）不應污染 rssi_cnt 與平均。
+     * 433 在 E22 未開 REG3 bit7、或該包沒剝到 RSSI 位元組時就是走這條路徑。 */
     lora_stats_t s2;
     lora_stats_reset(&s2);
     lora_stats_on_packet(&s2, 1, 0, 0, 0, 0, 1000);
     lora_stats_on_packet(&s2, 1, 0, 0, 0, 0, 2000);
-    check("433 pkt_ok=2", s2.pkt_ok == 2);
-    check("433 rssi_cnt=0 (無量測)", s2.rssi_cnt == 0);
-    check("433 rssi_avg=0 (除零保護)", lora_stats_rssi_avg(&s2) == 0);
+    check("無量測 pkt_ok=2", s2.pkt_ok == 2);
+    check("無量測 rssi_cnt=0", s2.rssi_cnt == 0);
+    check("無量測 rssi_avg=0 (除零保護)", lora_stats_rssi_avg(&s2) == 0);
 
     /* 空統計封包率 0（除零保護） */
     lora_stats_t s3;

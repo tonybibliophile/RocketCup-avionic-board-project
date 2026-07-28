@@ -101,8 +101,24 @@ uint8_t LoRaE80_RxReady(void);
  */
 HAL_StatusTypeDef LoRaE80_ReadPacket(uint8_t *buf, uint8_t *len, int16_t *rssi_dbm, int16_t *snr_q);
 
-/** @brief 填入初始化診斷結果供週期性遙測輸出。gs = GetStatus byte (0x22=OK). */
+/** @brief 填入初始化診斷結果供週期性遙測輸出。gs = GetStatus 的 Stat1。 */
 void LoRaE80_GetInitDiag(int *rd_st, uint8_t *busy, uint8_t *rb0, uint8_t *rb1, uint8_t *gs);
+
+/**
+ * @brief 開機校準後由 GetErrors 讀回的 16-bit 裝置錯誤旗標（0x0000 = 全正常）。
+ *
+ * 判讀 TCXO/射頻時鐘是否真的起來的唯一直接證據：設定類命令跑在 HF RC 振盪器上，
+ * XOSC 全掛也照樣回 OK。bit5=HF_XOSC_START、bit7=PLL_LOCK 亮起即代表 TCXO 供電或
+ * 電壓設定仍不正確，射頻不會work（表現為 SetTx 回 OK 但 TxDone 永遠不來）。
+ */
+uint16_t LoRaE80_GetErrors(void);
+
+/**
+ * @brief 開機掃描後實際採用的 TCXO 供電檔位（RegTcxoTune）；0xFF = 全部候選都起振失敗。
+ *
+ * 0x00=1.6V 0x01=1.7V 0x02=1.8V 0x03=2.2V 0x04=2.4V 0x05=2.7V 0x06=3.0V 0x07=3.3V。
+ */
+uint8_t LoRaE80_GetTcxoTune(void);
 
 /* ============================================================
  *  地面站通訊測試：動態修改 RF 參數

@@ -17,8 +17,8 @@
  *   新版：erased_end 一律正規化 —— 推進後 ≥ END+1 即迴繞回 BASE，環上恆有
  *   erased_end ∈ [BASE, END]。語意：pool = write→erased_end 的環向距離，
  *   erased_end == write ⇒ pool = 0（空池）。「全環已擦」與「空池」的兩針
- *   歧義由池上限消除：FLASH_RING_PREERASE_TARGET(64 sectors=256KB) 遠小於
- *   環容量 15.9MB，pool 永不合法地達到整環。
+ *   歧義由池上限消除：FLASH_RING_PREERASE_TARGET（見下方定義）遠小於
+ *   環容量 15.9MB（4080 sectors），pool 永不合法地達到整環。
  */
 #ifndef FLASH_RING_MATH_H
 #define FLASH_RING_MATH_H
@@ -33,20 +33,40 @@ extern "C" {
 #define FLASH_RINGBUF_ADDR       0x010000UL   /* Ring Buffer 起始（64KB 對齊） */
 #define FLASH_RINGBUF_END        0xFFFFFFUL   /* Ring Buffer 結束（inclusive） */
 #define FLASH_RINGBUF_SIZE       0xFF0000UL   /* ~15.9 MB */
-#define FLASH_RING_PACKET_SIZE   80UL         /* 每筆封包大小 80 bytes */
+#define FLASH_RING_PACKET_SIZE   128UL        /* 每筆封包大小 128 bytes（含 flight_id，4KB 對齊） */
 #define FLASH_RING_PREERASE_N    10           /* 開機預擦 Sector 數量 */
 
-/* P0-E：PAD 期背景預擦目標池。64 sectors × 51 封包 ÷ 50Hz ≈ 65s 飛行容量（>2× 全程）。
- * 飛行態（BOOST..MAIN_DEPLOY）禁止同步滾動擦除（最壞 ~400ms 阻塞主迴圈，FSM 停擺、
- * EKF 斷饋且持 SPI3 mutex）—— 池耗盡時丟棄該筆並計數（遙測可觀測）。
- * ⚠️ 飛行時間 >60s 的任務需加大此值，並於發射檢核表確認 [FLASH] pool 達標後才起飛。 */
-#define FLASH_RING_PREERASE_TARGET 64U        /* PAD 期背景預擦目標（sectors） */
+/* P0-E：飛行預擦目標池。每 sector 4096/128 = 32 封包，飛行態寫入率固定 100Hz
+ * （main.c：STATE_BOOST..STATE_MAIN_DEPLOY 之 ring_period_ms=10，兩 profile 皆同）。
+ * 飛行態（含 STATE_PAD_ARMED，見 main.c FlashRing_SetEraseAllowed 呼叫處）禁止
+ * 同步滾動擦除（最壞 ~400ms 阻塞主迴圈，FSM 停擺、EKF 斷饋且持 SPI3 mutex）——
+ * 池必須撐滿整段「同步擦除被禁止」的視窗，即 STATE_PAD_ARMED 進入到
+ * STATE_MAIN_DEPLOY 結束。INIT/PAD/PAD_ARMED 已完全不寫入 flash（main.c 的
+ * ring_enabled），整池即飛行預算，地面待命再久也不消耗。
+ *
+ * 本檔不 include board_config.h（維持 header-only、不依賴 HAL/profile 巨集），
+ * 故此常數無法依 FLIGHT_PROFILE_ELEVATOR 分流，須直接取兩 profile 中「較大」的
+ * 硬上限（此視窗長度 = FSM_MAIN_WATCHDOG_MS + FSM_MAIN_INFLATE_MS，見 fsm.h）：
+ *   飛行 profile：248000 + 3000 = 251000ms = 251s（唯一真實來源見 fsm.h，勿抄值）
+ *   電梯 profile：300000 + 3000 = 303000ms = 303s ← 較大，取此為硬上限
+ * 303s + ~4s 邊界餘裕 ≈ 307.2s → 307.2s × 100Hz ÷ 32 封包/sector = 960 sectors。
+ * （舊值 332 sectors≈106.2s 係基於已不成立的 92000ms 假設推算，早已對不上任一
+ * profile 的實際看門狗值，已改正。）960 sectors 仍遠小於環容量 4080 sectors，
+ * 不影響上方迴繞歧義防呆的池上限設計。
+ * 池子由開機序列一次性 bulk 預擦滿（main.c 呼叫 FlashRing_InitEx，內部即
+ * w25qxx.c 的 FlashRing_Init 迴圈，每 sector 餵狗，約 960 × ~50ms ≈ 48s）；
+ * main.c 的 0.5s/次背景 FlashRing_PreEraseOne() 迴圈僅在 INIT/PAD 期作補漏
+ * 安全網（例如上行 EraseAll 指令清池後），非常態填池路徑，PAD_ARMED 不觸發。
+ * ⚠️ 若 fsm.h 任一 profile 的 FSM_MAIN_WATCHDOG_MS／FSM_MAIN_INFLATE_MS 之後調整
+ * （例如換 profile 或重推 OpenRocket），此值須同步依上式重算（取兩 profile較大者），
+ * 並於發射檢核表確認 [FLASH] pool 達標後才起飛。 */
+#define FLASH_RING_PREERASE_TARGET 960U       /* PAD 期背景預擦目標（sectors） */
 
 /* 擦除粒度。必須等於 W25QXX_SECTOR_SIZE（w25qxx.h 以 _Static_assert 鎖定）。 */
 #define FLASH_RING_SECTOR_SIZE   4096UL
 
 /* 幾何不變量：封包與 sector 都恰好鋪滿整環（無封包跨環尾、環尾 sector 對齊）。
- * 0xFF0000 / 80 = 208896 整；0xFF0000 / 4096 = 4080 整。
+ * 0xFF0000 / 128 = 130560 整；0xFF0000 / 4096 = 4080 整。
  * ring_last_packet_addr() 的迴繞回讀與 erased_end 正規化皆依賴此性質。 */
 #if (FLASH_RINGBUF_SIZE % FLASH_RING_PACKET_SIZE) != 0
 #error "FLASH_RINGBUF_SIZE 必須是 FLASH_RING_PACKET_SIZE 的整數倍"

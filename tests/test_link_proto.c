@@ -3,7 +3,7 @@
  * ===========================================================================
  *   cd tests && make run
  *
- *   [1] LinkPacket_t 大小 = 27 bytes，欄位 byte offset 逐一鎖定（解碼契約）
+ *   [1] LinkPacket_t 大小 = 46 bytes（含 echo-ACK ack_state + VF h/v 中繼 + erase_pct），欄位 offset 逐一鎖定
  *   [2] LinkProto_Build → LinkRx_Feed 往返一致（含 sync 對齊與 CRC）
  *   [3] 單一位元翻轉 → CRC 不符 → 不吐封包
  *   [4] 前綴雜訊 / 連續兩筆 → 正確對齊並解出
@@ -32,13 +32,23 @@ static LinkStatus_t sample_status(void) {
     st.v_est_cms   = -1850;        /* -18.50 m/s */
     st.baro_alt_cm = 24990;
     st.a_z_cg      = -981;         /* -9.81 g (cg) */
+    st.ack_state   = 6;            /* echo：我已採納對端 STATE_DESCENT */
+    st.q_w         = 9950;
+    st.q_x         = 100;
+    st.q_y         = 50;
+    st.q_z         = 0;
+    st.main_arb    = 2;            /* SERVO_ARB_MSG_DRIVING */
+    st.flash_ready = 1;
+    st.erase_pct   = 75;
+    st.vf_h_cm     = 24950;        /* 249.50 m */
+    st.vf_v_cms    = -1480;        /* -14.80 m/s */
     return st;
 }
 
 static void test_layout(void) {
     printf("[1] 封包大小與欄位 offset（解碼契約）\n");
-    check("sizeof(LinkPacket_t) == 26", sizeof(LinkPacket_t) == 26);
-    check("LINK_PACKET_SIZE == 26",     LINK_PACKET_SIZE == 26);
+    check("sizeof(LinkPacket_t) == 46", sizeof(LinkPacket_t) == 46);
+    check("LINK_PACKET_SIZE == 46",     LINK_PACKET_SIZE == 46);
 #define OFF(field, expect) \
     check("offsetof " #field " == " #expect, offsetof(LinkPacket_t, field) == (expect))
     OFF(sync0,       0);
@@ -52,7 +62,17 @@ static void test_layout(void) {
     OFF(v_est_cms,   14);
     OFF(baro_alt_cm, 18);
     OFF(a_z_cg,      22);
-    OFF(crc16,       24);
+    OFF(ack_state,   24);
+    OFF(q_w,         25);
+    OFF(q_x,         27);
+    OFF(q_y,         29);
+    OFF(q_z,         31);
+    OFF(main_arb,    33);
+    OFF(flash_ready, 34);
+    OFF(erase_pct,   35);
+    OFF(vf_h_cm,     36);
+    OFF(vf_v_cms,    40);
+    OFF(crc16,       44);
 #undef OFF
 }
 
@@ -61,7 +81,7 @@ static void test_roundtrip(void) {
     LinkStatus_t st = sample_status();
     uint8_t buf[LINK_PACKET_SIZE];
     uint16_t n = LinkProto_Build(buf, &st);
-    check("Build 回傳長度 == 26", n == LINK_PACKET_SIZE);
+    check("Build 回傳長度 == 46", n == LINK_PACKET_SIZE);
     check("buf[0],buf[1] == sync", buf[0] == LINK_SYNC0 && buf[1] == LINK_SYNC1);
 
     LinkRx_t rx; LinkRx_Init(&rx);
@@ -80,6 +100,16 @@ static void test_roundtrip(void) {
     check("v_est_cms 一致",   out.v_est_cms   == st.v_est_cms);
     check("baro_alt_cm 一致", out.baro_alt_cm == st.baro_alt_cm);
     check("a_z_cg 一致",      out.a_z_cg      == st.a_z_cg);
+    check("ack_state 一致",   out.ack_state   == st.ack_state);
+    check("q_w 一致",         out.q_w         == st.q_w);
+    check("q_x 一致",         out.q_x         == st.q_x);
+    check("q_y 一致",         out.q_y         == st.q_y);
+    check("q_z 一致",         out.q_z         == st.q_z);
+    check("main_arb 一致",    out.main_arb    == st.main_arb);
+    check("flash_ready 一致", out.flash_ready == st.flash_ready);
+    check("erase_pct 一致",   out.erase_pct   == st.erase_pct);
+    check("vf_h_cm 一致",     out.vf_h_cm     == st.vf_h_cm);
+    check("vf_v_cms 一致",    out.vf_v_cms    == st.vf_v_cms);
 }
 
 static void test_bad_crc(void) {
@@ -131,6 +161,31 @@ static void test_consecutive_sync0(void) {
     check("連續 sync0 後仍解出 1 筆", got == 1);
 }
 
+static void test_qos_counters(void) {
+    printf("[6] 鏈路品質統計（ok / crc_err / resync）\n");
+    LinkStatus_t st = sample_status();
+    uint8_t buf[LINK_PACKET_SIZE];
+    LinkProto_Build(buf, &st);
+
+    LinkRx_t rx; LinkRx_Init(&rx);
+    LinkPacket_t out;
+    check("初始統計歸零", rx.ok == 0 && rx.crc_err == 0 && rx.resync == 0);
+
+    for (uint16_t i = 0; i < LINK_PACKET_SIZE; i++) LinkRx_Feed(&rx, buf[i], &out);
+    check("好封包 → ok=1", rx.ok == 1 && rx.crc_err == 0);
+
+    uint8_t bad[LINK_PACKET_SIZE];
+    memcpy(bad, buf, LINK_PACKET_SIZE);
+    bad[10] ^= 0x01;                    /* 翻轉酬載 → CRC 不符 */
+    for (uint16_t i = 0; i < LINK_PACKET_SIZE; i++) LinkRx_Feed(&rx, bad[i], &out);
+    check("壞 CRC → crc_err=1（ok 不變）", rx.crc_err == 1 && rx.ok == 1);
+
+    uint32_t r0 = rx.resync;
+    LinkRx_Feed(&rx, LINK_SYNC0, &out); /* sync0 後接非 sync1/非 sync0 */
+    LinkRx_Feed(&rx, 0x00, &out);
+    check("假 sync → resync++", rx.resync == r0 + 1);
+}
+
 int main(void) {
     printf("=== test_link_proto：板間鏈路封包契約 ===\n");
     test_layout();
@@ -138,6 +193,7 @@ int main(void) {
     test_bad_crc();
     test_noise_and_two_frames();
     test_consecutive_sync0();
+    test_qos_counters();
     printf("----------------------------------------\n");
     printf("%s：%d/%d 通過\n", g_fail ? "FAIL" : "ALL PASS", g_total - g_fail, g_total);
     return g_fail ? 1 : 0;

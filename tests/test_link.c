@@ -1,17 +1,12 @@
 /*
- * test_link.c — 板間鏈路對端狀態 + 備板開傘仲裁情境測試（純 host 編譯）
+ * test_link.c — 板間鏈路對端狀態追蹤情境測試（純 host 編譯）
  * ===========================================================================
  *   cd tests && make run
  *
- * 鎖定不對稱冗餘（主決策、備補位）的核心安全行為：
+ * 對稱獨立冗餘：本檔鎖定 LinkPeer 對端狀態追蹤（加法協同的資料基礎）：
  *   [1] freshness：未收包→失聯；收包後 timeout 內新鮮、逾時失聯
  *   [2] 開傘旗標鎖存：收過一次即維持，後續無旗標封包不清除
- *   [3] 情境A：主板先開傘（已鎖存）→ 備板被抑制，永不點火
- *   [4] 情境B：主板失聯（無封包）→ 備板 grace 到期自行點火，且只點一次
- *   [5] 情境C：主板在線但從不送開傘通知 → 備板 grace 到期自行點火
- *   [6] 情境D：grace 期間才收到主板開傘 → 備板抑制
- *   [7] 點火不重複：已點火後即使 FSM 再次要求亦不重複輸出
- *   [8] LinkPeer_Synced：雙向心跳 echo（對端 ack_state 回報已採用我方狀態）＝ACK 確認
+ *       （drogue_latched / main_latched 供 Phase D 加法協同判斷對端是否已開傘）
  */
 #include <stdio.h>
 #include <string.h>
@@ -61,88 +56,50 @@ static void test_latch(void) {
     check("drogue 鎖存仍維持",                 pr.drogue_latched == 1);
 }
 
-/* 模擬 100 Hz 迴圈跑備板閘；local_wants 只在 want_at_ms 那一週期為 1（FSM 一次性）。
- * peer_latched_from_ms < 0 表示對端整段都未開傘。回傳 (首次點火時間, 點火次數)。 */
-static void run_gate(uint32_t want_at_ms, long peer_latched_from_ms,
-                     uint32_t end_ms, uint32_t *first_fire_ms, int *fire_count) {
-    BackupGate_t g; BackupGate_Init(&g);
-    *first_fire_ms = 0xFFFFFFFFu; *fire_count = 0;
-    for (uint32_t t = 0; t <= end_ms; t += 10) {
-        uint8_t local = (t == want_at_ms) ? 1U : 0U;
-        uint8_t peer  = (peer_latched_from_ms >= 0 && t >= (uint32_t)peer_latched_from_ms) ? 1U : 0U;
-        if (BackupGate_Step(&g, local, peer, t, BACKUP_GRACE_MS)) {
-            if (*fire_count == 0) *first_fire_ms = t;
-            (*fire_count)++;
-        }
-    }
-}
-
-static void test_scenario_A_peer_fired_first(void) {
-    printf("[3] 情境A：主板先開傘 → 備板抑制\n");
-    uint32_t first; int cnt;
-    run_gate(/*want_at*/100, /*peer_latched_from*/0, /*end*/2000, &first, &cnt);
-    check("主板已開傘 → 備板 0 次點火", cnt == 0);
-}
-
-static void test_scenario_B_peer_silent(void) {
-    printf("[4] 情境B：主板失聯 → 備板 grace 後自行點火\n");
-    uint32_t first; int cnt;
-    run_gate(/*want_at*/100, /*peer_latched_from*/-1, /*end*/2000, &first, &cnt);
-    check("備板恰點火 1 次", cnt == 1);
-    check("點火時間 = want + grace", first == 100 + BACKUP_GRACE_MS);
-}
-
-static void test_scenario_C_peer_alive_no_fire(void) {
-    printf("[5] 情境C：主板在線但從不開傘 → 備板自行點火\n");
-    /* 對端封包持續到、但 flags 永遠不含開傘旗標 → 對閘而言等同未鎖存 */
+static void test_seq_loss(void) {
+    printf("[3] 鏈路品質：seq 丟包估計\n");
     LinkPeer_t pr; LinkPeer_Init(&pr);
-    BackupGate_t g; BackupGate_Init(&g);
-    uint32_t first = 0xFFFFFFFFu; int cnt = 0;
-    for (uint32_t t = 0; t <= 2000; t += 10) {
-        if ((t % 50) == 0) {                   /* 對端 20 Hz 心跳，但無開傘旗標 */
-            LinkPacket_t hb = make_pkt(LINK_BOARD_PRIMARY, 3, 0, t);
-            LinkPeer_OnPacket(&pr, &hb, t);
-        }
-        uint8_t local = (t == 100) ? 1U : 0U;
-        if (BackupGate_Step(&g, local, pr.drogue_latched, t, BACKUP_GRACE_MS)) {
-            if (cnt == 0) first = t;
-            cnt++;
-        }
+    for (uint8_t s = 0; s <= 2; s++) {
+        LinkPacket_t p = make_pkt(LINK_BOARD_PRIMARY, 3, 0, 100u + (uint32_t)s * 50u);
+        p.seq = s;
+        LinkPeer_OnPacket(&pr, &p, 100u + (uint32_t)s * 50u);
     }
-    check("對端在線(fresh)但未開傘", LinkPeer_Fresh(&pr, 2000, LINK_PEER_TIMEOUT_MS));
-    check("備板恰點火 1 次",        cnt == 1);
-    check("點火時間 = want + grace", first == 100 + BACKUP_GRACE_MS);
+    check("連續 3 筆 → rx_count=3, lost=0", pr.rx_count == 3 && pr.lost_count == 0);
+
+    LinkPacket_t skip = make_pkt(LINK_BOARD_PRIMARY, 3, 0, 300);
+    skip.seq = 5;                       /* 跳過 3,4 → 丟 2 筆 */
+    LinkPeer_OnPacket(&pr, &skip, 300);
+    check("seq 2→跳到5 → lost+=2", pr.rx_count == 4 && pr.lost_count == 2);
+
+    LinkPacket_t jump = make_pkt(LINK_BOARD_PRIMARY, 3, 0, 400);
+    jump.seq = 100;                     /* d=95 > 32 → 視為對端重啟，不計 */
+    LinkPeer_OnPacket(&pr, &jump, 400);
+    check("大跳變(>32) 不灌爆 loss", pr.rx_count == 5 && pr.lost_count == 2);
 }
 
-static void test_scenario_D_peer_latched_during_grace(void) {
-    printf("[6] 情境D：grace 期間收到主板開傘 → 備板抑制\n");
-    uint32_t first; int cnt;
-    /* want 在 100，主板於 grace 期間（200，< 100+300）才鎖存 */
-    run_gate(/*want_at*/100, /*peer_latched_from*/200, /*end*/2000, &first, &cnt);
-    check("grace 期間被主板搶先 → 0 次點火", cnt == 0);
-}
+static void test_synced(void) {
+    printf("[4] echo-ACK 失同步偵測（LinkPeer_Synced）\n");
+    LinkPeer_t pr; LinkPeer_Init(&pr);
+    check("未收包 → 未同步", !LinkPeer_Synced(&pr, 2));
 
-static void test_no_double_fire(void) {
-    printf("[7] 點火不重複\n");
-    BackupGate_t g; BackupGate_Init(&g);
-    int cnt = 0;
-    /* want 在 t=100 與 t=1000 各觸發一次，主板全程未開 */
-    for (uint32_t t = 0; t <= 2000; t += 10) {
-        uint8_t local = (t == 100 || t == 1000) ? 1U : 0U;
-        if (BackupGate_Step(&g, local, 0U, t, BACKUP_GRACE_MS)) cnt++;
-    }
-    check("整段僅點火 1 次（fired 鎖存）", cnt == 1);
+    LinkPacket_t p = make_pkt(LINK_BOARD_PRIMARY, 3, 0, 100);
+    p.ack_state = 2;                    /* 對端回報「它認為我方在 state 2」 */
+    LinkPeer_OnPacket(&pr, &p, 100);
+    check("對端 echo == 我方狀態 → 同步",       LinkPeer_Synced(&pr, 2));
+    check("我方前進到 3、對端仍回 2 → 失同步",  !LinkPeer_Synced(&pr, 3));
+
+    LinkPacket_t p2 = make_pkt(LINK_BOARD_PRIMARY, 3, 0, 150);
+    p2.ack_state = 3;                   /* 對端跟上 */
+    LinkPeer_OnPacket(&pr, &p2, 150);
+    check("對端跟上到 3 → 重新同步", LinkPeer_Synced(&pr, 3));
 }
 
 int main(void) {
-    printf("=== test_link：對端狀態 + 備板開傘仲裁 ===\n");
+    printf("=== test_link：對端狀態追蹤 ===\n");
     test_freshness();
     test_latch();
-    test_scenario_A_peer_fired_first();
-    test_scenario_B_peer_silent();
-    test_scenario_C_peer_alive_no_fire();
-    test_scenario_D_peer_latched_during_grace();
-    test_no_double_fire();
+    test_seq_loss();
+    test_synced();
     printf("----------------------------------------\n");
     printf("%s：%d/%d 通過\n", g_fail ? "FAIL" : "ALL PASS", g_total - g_fail, g_total);
     return g_fail ? 1 : 0;

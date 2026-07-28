@@ -45,8 +45,9 @@ void Link_Init(void)
     s_tx_seq      = 0;
     s_tx_busy     = 0;
 
-    /* USART2 由 MX_USART2_UART_Init 設為 460800；板間鏈路改用 LINK_BAUD。 */
     HAL_UART_DeInit(&huart2);
+
+    /* USART2 由 MX_USART2_UART_Init 設為 460800；板間鏈路改用 LINK_BAUD。 */
     huart2.Init.BaudRate = LINK_BAUD;
     HAL_UART_Init(&huart2);
 
@@ -68,11 +69,36 @@ void Link_SendStatus(const LinkStatus_t *st)
 }
 
 const LinkPeer_t *Link_GetPeer(void) { return &s_peer; }
+const LinkRx_t   *Link_GetRx(void)   { return &s_rx;   }
 
 uint8_t Link_PeerFresh(uint32_t now_ms)
 {
     return LinkPeer_Fresh(&s_peer, now_ms, LINK_PEER_TIMEOUT_MS);
 }
+
+/* 失同步/失聯偵測（純觀測）：追蹤我方狀態變更時刻，若對端未於 LINK_SYNC_TIMEOUT_MS
+ * 內 echo-ACK 回同一狀態 → DESYNC；對端逾時無封包 → LOST。 */
+static uint8_t  s_link_status         = 0U;
+static uint8_t  s_last_my_state       = 0xFFU;
+static uint32_t s_my_state_changed_ms = 0U;
+
+void Link_UpdateStatus(uint8_t my_fsm_state, uint32_t now_ms)
+{
+    if (my_fsm_state != s_last_my_state) {
+        s_last_my_state       = my_fsm_state;
+        s_my_state_changed_ms = now_ms;
+    }
+    uint8_t st = 0U;
+    if (!LinkPeer_Fresh(&s_peer, now_ms, LINK_PEER_TIMEOUT_MS)) {
+        st |= LINK_STATUS_LOST;
+    } else if (!LinkPeer_Synced(&s_peer, my_fsm_state) &&
+               (now_ms - s_my_state_changed_ms) >= LINK_SYNC_TIMEOUT_MS) {
+        st |= LINK_STATUS_DESYNC;
+    }
+    s_link_status = st;
+}
+
+uint8_t Link_GetStatus(void) { return s_link_status; }
 
 /* 循環 DMA 接收事件：Size = 自緩衝起點至目前寫入位置的累計位元組數。
  * 以 s_dma_old_pos 環形差分取出新位元組（與 gps.c 同法）。 */

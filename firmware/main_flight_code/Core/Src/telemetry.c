@@ -18,6 +18,9 @@
 #include "mmc5983.h"
 #include "sensor_axis.h"
 #include "crc16.h"
+#if FEATURE_LINK
+#include "link_hw.h"   /* Link_GetPeer / Link_GetRx / Link_PeerFresh：中繼對端摘要 */
+#endif
 
 #include <string.h>
 
@@ -34,6 +37,9 @@ extern uint8_t           sd_logging_active;
 extern volatile uint8_t  g_fsm_failsafe_fired;  /* P0-B：失效保護計時器強制點火鎖存 */
 extern volatile uint8_t  g_sensor_fault_bits;   /* P0-D：感測器健康彙整位（SH_BIT_*） */
 extern volatile uint8_t  g_hotstart_restored;   /* P0-F：熱啟動恢復鎖存 */
+extern volatile uint8_t  g_arm_blocked_flash;   /* ARM 被 flash pool 未達標擋下（見 FSM_Update） */
+extern volatile float    g_vf_h_m;              /* 垂直濾波器 (VF) 高度 (m)，FEATURE_VFILTER=0 時恆為 0 */
+extern volatile float    g_vf_v_ms;             /* 垂直濾波器 (VF) 垂直速度 (m/s) */
 extern TIM_HandleTypeDef htim4;              /* PWM_Servo（主傘舵機）CH3 */
 
 /* float → int16 飽和轉換，避免大數值 wrap 成錯誤負值 */
@@ -130,6 +136,50 @@ uint16_t Telemetry_Build(uint8_t *out)
     /* --- P1：完整健康位（flags 僅是「有/無問題」摘要，這裡給出哪一位故障） --- */
     pkt.health_bits = EKF_GetHealthBits();
     pkt.sensor_bits = g_sensor_fault_bits;
+
+    /* --- 本板垂直濾波器 (VF)：與 EKF 並列下鏈，供地面站同屏比對 --- */
+    pkt.vf_pos_z_cm  = (int32_t)(g_vf_h_m * 100.0f);
+    pkt.vf_vel_z_cms = (int32_t)(g_vf_v_ms * 100.0f);
+
+    /* --- 主/副協同：中繼對端(副板)摘要供地面雙板監看（僅主板有下鏈；FEATURE_LINK） --- */
+#if FEATURE_LINK
+    {
+        const LinkPeer_t *pr  = Link_GetPeer();
+        uint8_t plink = 0U;
+        uint8_t lstat = Link_GetStatus();
+        if (pr->valid)                     plink |= TELEM_PEER_EVER;
+        if (Link_PeerFresh(HAL_GetTick()))  plink |= TELEM_PEER_FRESH;
+        if (lstat & LINK_STATUS_LOST)       plink |= TELEM_PEER_LOST;
+        if (lstat & LINK_STATUS_DESYNC)     plink |= TELEM_PEER_DESYNC;
+        pkt.peer_fsm_state = pr->fsm_state;
+        pkt.peer_flags     = pr->flags;
+        pkt.peer_h_cm      = pr->h_est_cm;
+        pkt.peer_v_cms     = pr->v_est_cms;
+        pkt.peer_baro_cm   = pr->baro_alt_cm;
+        pkt.peer_link      = plink;
+        uint32_t denom = pr->rx_count + pr->lost_count;
+        pkt.peer_loss_pmil = denom ? (uint16_t)((1000UL * pr->lost_count) / denom) : 0U;
+        pkt.peer_az_cg     = pr->a_z_cg;
+        pkt.peer_vf_h_cm   = pr->vf_h_cm;
+        pkt.peer_vf_v_cms  = pr->vf_v_cms;
+        pkt.peer_bench_arb = pr->peer_main_arb;
+    }
+#else
+    pkt.peer_fsm_state = 0U;
+    pkt.peer_flags     = 0U;
+    pkt.peer_h_cm      = 0;
+    pkt.peer_v_cms     = 0;
+    pkt.peer_baro_cm   = 0;
+    pkt.peer_link      = 0U;
+    pkt.peer_loss_pmil = 0U;
+    pkt.peer_az_cg     = 0;
+    pkt.peer_vf_h_cm   = 0;
+    pkt.peer_vf_v_cms  = 0;
+    pkt.peer_bench_arb = 0U;
+#endif
+
+    /* --- ARM 被擋下原因（fail-open 已在 FSM_Update 組 flash_pool_ready 時處理，這裡只回報） --- */
+    pkt.arm_flags = g_arm_blocked_flash ? TELEM_ARM_BLOCKED_FLASH_POOL : 0U;
 
     /* --- CRC16 覆蓋除最後 2 bytes(crc16 本身) 外的全部內容 --- */
     pkt.crc16 = telem_crc16((const uint8_t *)&pkt, (uint16_t)(sizeof(pkt) - 2));

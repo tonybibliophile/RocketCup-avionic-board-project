@@ -36,7 +36,8 @@ static float EKF_q[4] CCMRAM;
 
 // Dynamic stationary calibration variables
 uint8_t EKF_calibrated CCMRAM = 0;
-static uint32_t EKF_calib_samples CCMRAM = 0;
+static uint32_t EKF_calib_samples CCMRAM = 0;      // 陀螺樣本計數（每筆 1000Hz 樣本遞增）
+static uint32_t EKF_accel_calib_n CCMRAM = 0;       // 加速度樣本計數（僅 has_accel=1 時遞增，避免 ZOH 重複值灌入平均）
 static float EKF_accel_bias[3] CCMRAM = {0.0f, 0.0f, 0.0f};
 static float EKF_accel_sum[3] CCMRAM = {0.0f, 0.0f, 0.0f};
 static float EKF_gyro_bias[3] CCMRAM = {0.0f, 0.0f, 0.0f};
@@ -170,6 +171,7 @@ void EKF_Init(void) {
     // Reset calibration and launchpad variables
     EKF_calibrated = 0;
     EKF_calib_samples = 0;
+    EKF_accel_calib_n = 0;
     memset(EKF_accel_bias, 0, sizeof(EKF_accel_bias));
     memset(EKF_accel_sum, 0, sizeof(EKF_accel_sum));
     memset(EKF_gyro_bias, 0, sizeof(EKF_gyro_bias));
@@ -478,7 +480,8 @@ void EKF_UpdateBaroDelayed(float baro_alt, float z_pred) {
              * 速度歸零（P 放大讓 200Hz 量測在 ~0.3s 內重新拉出真實速度）、
              * P 的 z/vz 行列重設 —— 讓濾波器重新收斂而非永久降級。
              * 不清 DIVERGE 位：之後 baro 被接受時自然清除（innovation 已歸零；
-             * z_history 群延遲補償殘留的 ≤20 筆舊預測會再拒收 ~100ms，無妨）。 */
+             * z_history 群延遲補償殘留的 ≤EKF_BARO_GROUP_DELAY_SAMPLES 筆舊預測會再拒收
+             * ~EKF_BARO_GROUP_DELAY_MS ms，無妨）。 */
             if ((HAL_GetTick() - EKF_diverge_since_tick) > EKF_GUARD_DIVERGE_RESET_MS) {
                 EKF_x[2] = baro_alt;
                 EKF_x[5] = 0.0f;
@@ -701,11 +704,12 @@ static void EKF_PrintFloat(float val, char separator) {
 void EKF_Task(void *argument) {
     (void)argument;
     EKF_Buffer_t* p_buf = NULL;
-    uint32_t last_timestamp_us = 0;
+    uint32_t last_cyc = 0;      // 上一顆樣本的 DWT->CYCCNT；0 = 尚未有上一顆（任務剛啟動）
 
-    // Local circular history buffer for 20ms barometer group-delay compensation
-    // 20ms delay at 1000Hz = 20 samples. circular buffer size 25 is safe.
-    float z_history[25] = {0.0f};
+    // Local circular history buffer for barometer group-delay compensation.
+    // 群延遲樣本數/緩衝長度依 ekf.h 的 EKF_BARO_GROUP_DELAY_SAMPLES / EKF_Z_HISTORY_LEN
+    // （隨 BMP388 ODR 與 EKF_GYRO_RATE_HZ 連動換算，見該處註解）。
+    float z_history[EKF_Z_HISTORY_LEN] = {0.0f};
     uint8_t z_history_idx = 0;
 
     // P0-x：靜止偵測器歸零防護 —— 追蹤最新一筆 baro 相對高度（直接以原始樣本
@@ -713,6 +717,12 @@ void EKF_Task(void *argument) {
     // 判斷式使用。與 z_history 同為函式作用域局部變數，EKF_Task 為無限迴圈，
     // 生命週期涵蓋整個任務執行期間。
     float ekf_rest_last_baro_rel = 0.0f;
+
+    // Predict()(位置/共變異數，400Hz) 累積的 dt：AttitudeUpdate 每顆樣本(1000Hz)都跑，
+    // 但 Predict 只在 has_accel=1（真正的新加速度樣本）時才跑一次，用「上次 Predict
+    // 之後累積的所有 dt」作為其積分區間，涵蓋期間所有 ZOH 樣本的時間。函式作用域，
+    // 不因 buffer 邊界重置——buffer 間的 10ms frame 本就連續，不應在邊界處丟失累積。
+    float dt_pred_accum = 0.0f;
 
     EKF_Init();
 
@@ -733,25 +743,37 @@ void EKF_Task(void *argument) {
                 EKF_Sample_t* sample = &p_buf->samples[i];
 
                 float dt;
-                if (last_timestamp_us == 0) {
-                    dt = 0.001f; // Standard 1000 Hz interval as baseline
+                if (last_cyc == 0) {
+                    dt = 1.0f / (float)EKF_GYRO_RATE_HZ; // Standard interval as baseline
                 } else {
-                    // Compute dt from microsecond clock difference
-                    uint32_t diff = sample->timestamp_us - last_timestamp_us;
-                    dt = (float)diff * 1e-6f;
+                    // Cycle-domain 差值：uint32 減法本身對 2^32 回繞安全（無論
+                    // sample->timestamp_cyc 是否已繞過 last_cyc，結果都是正確的
+                    // 正向經過 cycle 數），不像先除後減的 us 版本會在 ~25.6s
+                    // 週期處算錯。DWT->CYCCNT 本身在 168MHz 下約 25.6s 回繞一次，
+                    // 但 diff 只要小於半個回繞週期（實際遠小於，正常樣本間隔僅 ~1ms）
+                    // 就恆正確。
+                    uint32_t diff = sample->timestamp_cyc - last_cyc;
+                    dt = (float)diff * (1.0f / (float)SystemCoreClock);
                 }
-                last_timestamp_us = sample->timestamp_us;
+                last_cyc = sample->timestamp_cyc;
 
                 // Protect against outliers/system startup timing gaps
                 if (dt <= 0.0f || dt > 0.05f) {
-                    dt = 0.001f;
+                    dt = 1.0f / (float)EKF_GYRO_RATE_HZ;
                 }
 
                 // --- 1. Dynamic Accelerometer & Barometer Stationary Calibration Phase ---
                 if (!EKF_calibrated) {
-                    EKF_accel_sum[0] += sample->ax;
-                    EKF_accel_sum[1] += sample->ay;
-                    EKF_accel_sum[2] += sample->az;
+                    // accel 為 400Hz ZOH：只在 has_accel=1（真正新樣本）時累加，否則
+                    // 同一筆值會被 1000Hz 迴圈重複灌入 2~3 次，稀釋不了平均值但會讓
+                    // 「除以樣本數」的分母與實際獨立樣本數脫鉤，故獨立計數
+                    // EKF_accel_calib_n，不與陀螺共用 EKF_calib_samples。
+                    if (sample->has_accel) {
+                        EKF_accel_sum[0] += sample->ax;
+                        EKF_accel_sum[1] += sample->ay;
+                        EKF_accel_sum[2] += sample->az;
+                        EKF_accel_calib_n++;
+                    }
                     EKF_gyro_sum[0] += sample->gx;
                     EKF_gyro_sum[1] += sample->gy;
                     EKF_gyro_sum[2] += sample->gz;
@@ -762,24 +784,24 @@ void EKF_Task(void *argument) {
                         EKF_baro_samples++;
                     }
 
-                    if (EKF_calib_samples >= 3000) { // 3 seconds at 1000Hz
-                        EKF_accel_bias[0] = EKF_accel_sum[0] / 3000.0f;
-                        EKF_accel_bias[1] = EKF_accel_sum[1] / 3000.0f;
-                        
+                    if (EKF_calib_samples >= EKF_CALIB_SAMPLES) {
+                        EKF_accel_bias[0] = EKF_accel_sum[0] / (float)EKF_accel_calib_n;
+                        EKF_accel_bias[1] = EKF_accel_sum[1] / (float)EKF_accel_calib_n;
+
                         // Universal bias calculation: forces az_corr to equal +g when stationary upright
-                        float avg_az = EKF_accel_sum[2] / 3000.0f;
+                        float avg_az = EKF_accel_sum[2] / (float)EKF_accel_calib_n;
                         EKF_accel_bias[2] = avg_az - GRAVITY;
 
-                        EKF_gyro_bias[0] = EKF_gyro_sum[0] / 3000.0f;
-                        EKF_gyro_bias[1] = EKF_gyro_sum[1] / 3000.0f;
-                        EKF_gyro_bias[2] = EKF_gyro_sum[2] / 3000.0f;
-                        
+                        EKF_gyro_bias[0] = EKF_gyro_sum[0] / (float)EKF_calib_samples;
+                        EKF_gyro_bias[1] = EKF_gyro_sum[1] / (float)EKF_calib_samples;
+                        EKF_gyro_bias[2] = EKF_gyro_sum[2] / (float)EKF_calib_samples;
+
                         if (EKF_baro_samples > 0) {
                             EKF_baro_launchpad = EKF_baro_sum / (float)EKF_baro_samples;
                         } else {
                             EKF_baro_launchpad = 0.0f;
                         }
-                        
+
                         EKF_calibrated = 1;
                         EKF_SaveCalibrationToFlash();
 
@@ -787,9 +809,9 @@ void EKF_Task(void *argument) {
                         // This gives the correct absolute attitude immediately — no Mahony convergence needed.
                         // grav_b = raw average accel during calibration (before bias removal; points toward +Z_body when upright)
                         float grav_b[3] = {
-                            EKF_accel_sum[0] / 3000.0f,
-                            EKF_accel_sum[1] / 3000.0f,
-                            EKF_accel_sum[2] / 3000.0f
+                            EKF_accel_sum[0] / (float)EKF_accel_calib_n,
+                            EKF_accel_sum[1] / (float)EKF_accel_calib_n,
+                            EKF_accel_sum[2] / (float)EKF_accel_calib_n
                         };
                         // Use the most recently submitted mag vector (body-frame, from EKF_SubmitMag).
                         // If mag is not yet available (EKF_mag_x/y/z still 0), TRIAD will return early
@@ -852,11 +874,22 @@ void EKF_Task(void *argument) {
                 float gy_corr = sample->gy - EKF_gyro_bias[1];
                 float gz_corr = sample->gz - EKF_gyro_bias[2];
 
-                // --- 3. Attitude Integration with Mahony Gravity Feedback ---
+                // --- 3. Attitude Integration with Mahony Gravity Feedback（每顆樣本，1000Hz）---
+                // ax_corr/ay_corr/az_corr 在 has_accel=0 樣本上是 ZOH 值：Mahony 的重力回授
+                // 時間常數(Kp=2.0，τ~0.5s)遠慢於 2.5ms 保持期，ZOH 對此輸入足夠精確；
+                // Kp 本身加在角速度上再乘 dt 積分（EKF_AttitudeUpdate 內部），時間常數與
+                // 呼叫速率無關，1000Hz 化不需重新調參。
                 EKF_AttitudeUpdate(gx_corr, gy_corr, gz_corr, ax_corr, ay_corr, az_corr, dt);
 
-                // --- 4. Linear Propagation (Predict) ---
-                EKF_Predict(ax_corr, ay_corr, az_corr, dt);
+                // --- 4. Linear Propagation (Predict)（僅新加速度樣本，400Hz）---
+                // 用「上次 Predict 之後累積的所有 dt」積分，涵蓋期間所有 ZOH 樣本的時間，
+                // 位置/速度/共變異數傳播的物理意義才正確（不是每顆 1000Hz 樣本都重複用
+                // 同一顆舊加速度值再 Predict 一次）。
+                dt_pred_accum += dt;
+                if (sample->has_accel) {
+                    EKF_Predict(ax_corr, ay_corr, az_corr, dt_pred_accum);
+                    dt_pred_accum = 0.0f;
+                }
 
                 // --- 5. Stationary Launchpad Lock (ZUPT) with Baro-Only Trigger ---
                 if (!EKF_in_flight) {
@@ -872,9 +905,8 @@ void EKF_Task(void *argument) {
                         EKF_PrintFloat(relative_baro_alt, ' ');
                         printf("m)\r\n");
                     } else {
-                        // [TEST] ZUPT disabled for EKF algorithm testing
                         // Force states to 0 to eliminate all pre-launch horizontal and vertical drift
-                        // memset(EKF_x, 0, sizeof(EKF_x));
+                        memset(EKF_x, 0, sizeof(EKF_x));
                     }
                 }
 
@@ -890,14 +922,15 @@ void EKF_Task(void *argument) {
 
                 // --- 7. Save predicted Z-altitude to historical circular buffer ---
                 z_history[z_history_idx] = EKF_x[2];
-                z_history_idx = (z_history_idx + 1) % 25;
+                z_history_idx = (z_history_idx + 1) % EKF_Z_HISTORY_LEN;
 
                 // --- 8. Delayed Measurement Update from Barometer ---
                 if (sample->has_baro) {
                     float z_pred;
-                    if (EKF_calib_samples > 20) {
-                        // Look back exactly 20 samples ago (20ms group delay at 1000Hz)
-                        uint8_t hist_idx = (z_history_idx + 25 - 20) % 25;
+                    if (EKF_calib_samples > EKF_BARO_GROUP_DELAY_SAMPLES) {
+                        // 回看 EKF_BARO_GROUP_DELAY_SAMPLES 個樣本前的預測值，補償 BMP388 群延遲
+                        uint8_t hist_idx = (uint8_t)((z_history_idx + EKF_Z_HISTORY_LEN
+                                                       - EKF_BARO_GROUP_DELAY_SAMPLES) % EKF_Z_HISTORY_LEN);
                         z_pred = z_history[hist_idx];
                     } else {
                         z_pred = EKF_x[2];
@@ -922,19 +955,19 @@ void EKF_Task(void *argument) {
                         }
                     }
 
-                    // Reset to launchpad mode if resting still for 1.0 second (1000 samples)
-                    if (EKF_rest_counter >= 1000) {
+                    // Reset to launchpad mode if resting still for 1.0 second (EKF_REST_SAMPLES @ 1000Hz)
+                    if (EKF_rest_counter >= EKF_REST_SAMPLES) {
                         /* P0-x：歸零防護 —— 陀螺安靜 + 加速度計恆 1g 這兩個條件，
                          * 電梯等速段（無論上升或下降途中）1 秒內就會滿足，但此刻
                          * 明明還在空中。原本一律歸零 EKF_x，把電梯等速段誤判成
                          * 「已回到發射台靜止」，是實測誤判主因。
-                         * 改為：唯有「FSM 處於地面狀態」（<=STATE_PAD 或
-                         * >=STATE_LANDED）且「baro 相對高度貼近地面」
-                         * （< EKF_REST_RESET_MAX_BARO_M）同時成立，才是真正靜止
-                         * 在地面（如落地後尚未關機），才可安全歸零高度/速度。
+                         * 改為：唯有「FSM 處於地面狀態」（<=STATE_PAD_ARMED，即
+                         * INIT/PAD/PAD_ARMED，或 >=STATE_LANDED）且「baro 相對高度
+                         * 貼近地面」（< EKF_REST_RESET_MAX_BARO_M）同時成立，才是
+                         * 真正靜止在地面（如落地後尚未關機），才可安全歸零高度/速度。
                          * 否則只重新累計計數器、不動狀態，並列印原因供排查。 */
-                        uint8_t on_ground_state = (current_fsm_state <= STATE_PAD ||
-                                                    current_fsm_state >= STATE_LANDED) ? 1U : 0U;
+                        uint8_t on_ground_state = (current_fsm_state <= STATE_PAD_ARMED ||
+                                                   current_fsm_state >= STATE_LANDED) ? 1U : 0U;
                         uint8_t near_ground_alt  = (ekf_rest_last_baro_rel < EKF_REST_RESET_MAX_BARO_M) ? 1U : 0U;
                         if (on_ground_state && near_ground_alt) {
                             EKF_in_flight = 0;

@@ -11,6 +11,8 @@
 #include "usbd_cdc_if.h"
 #include "usb_device.h"
 
+#include "gs_lora_test.h"
+
 /* 收/送使用者緩衝 */
 static uint8_t UserRxBufferFS[APP_RX_DATA_SIZE];
 static uint8_t UserTxBufferFS[APP_TX_DATA_SIZE];
@@ -79,8 +81,8 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t *pbuf, uint16_t length)
 
 static int8_t CDC_Receive_FS(uint8_t *Buf, uint32_t *Len)
 {
-    /* 地面站不處理 PC→板資料，但仍重新掛載接收以免 OUT 端點停滯 */
-    (void)Len;
+    /* 將 PC 傳入的 USB CDC 資料餵入指令緩衝區（地面站與航電板皆支援 USB CDC CLI） */
+    GsLoraTest_FeedRxBuffer(Buf, *Len);
     USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
     USBD_CDC_ReceivePacket(&hUsbDeviceFS);
     return (int8_t)USBD_OK;

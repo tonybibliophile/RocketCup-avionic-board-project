@@ -52,6 +52,7 @@ extern "C" {
 typedef struct {
     float x[3];      /* [h, v, a]：相對高度 (m)、垂直速度 (m/s)、垂直加速度 (m/s²) */
     float P[3][3];   /* 狀態協方差 */
+    uint8_t consec_gate_rejects; /* 連續閘扣拒收計數器（滿 10 週期自動重置對齊） */
 } VFilter_t;
 
 /* 讀值（inline 取代巨集，型別安全） */
@@ -160,8 +161,18 @@ static inline int vf_update_baro(VFilter_t *f, float h_meas)
 
     float gate = VF_GATE_SIGMA * sqrtf(S);
     if (gate < VF_GATE_MIN_M) gate = VF_GATE_MIN_M;
-    if (fabsf(y) > gate) return 0;
+    if (fabsf(y) > gate) {
+        if (f->consec_gate_rejects < 255U) f->consec_gate_rejects++;
+        if (f->consec_gate_rejects < 10U) {
+            return 0; /* 偶發單筆壞值：拒收 */
+        }
+        /* 連續 10 週期 (100ms) 拒收：極可能是狀態發散或大幅位移，強制重估對齊 */
+        f->x[0] = h_meas;
+        f->consec_gate_rejects = 0U;
+        return 1;
+    }
 
+    f->consec_gate_rejects = 0U;
     vf__update_scalar(f, 0, y, S, VF_R_BARO);
     return 1;
 }

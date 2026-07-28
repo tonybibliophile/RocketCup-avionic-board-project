@@ -18,6 +18,7 @@
  *   e80 pre <n>           → 設 E80 前導碼長度 (6~65535)
  *   e80 show              → 顯示 E80 目前 RF 參數
  *   e22 show              → 顯示 E22 目前頻率
+ *   e22 dump on/off       → 433 原始位元組 hex dump 開關（診斷 RSSI byte 是否真的只有一個/在哪個位置）
  *
  * 整檔以 #if IS_GROUND 包住：航電板編譯為空。
  */
@@ -51,7 +52,22 @@ void GsLoraTest_UpdateStats(uint8_t link, int16_t rssi_dbm, int16_t snr_q, uint8
 /** @brief 主迴圈 tick：掃描 UART2 RX 環形緩衝、解析並執行命令。每 poll 呼叫一次。 */
 void GsLoraTest_Tick(void);
 
+/**
+ * @brief 433 原始位元組 hex dump 是否開啟（`e22 dump on`）。
+ *        由 ground_station.c 的收包迴圈查詢：開啟時把 u3_pop() 出來的每個原始
+ *        位元組（不論是否被解析成功）直接印成 hex，供人工核對 RSSI byte 實際
+ *        位置與數量，不必再靠推論。預設關閉（避免洗版）。
+ */
+uint8_t GsLoraTest_RawDumpEnabled(void);
+
 #endif /* IS_GROUND */
+
+/* 以下 API 在地面站與航電板皆可用 */
+/** @brief 供 USB CDC 寫入字元緩衝區（中斷安全）；IS_GROUND 版接進完整 CLI 環形緩衝，航電版接進 USB CLI stub。 */
+void GsLoraTest_FeedRxBuffer(const uint8_t *buf, uint32_t len);
+
+/** @brief 航電板：從 USB CDC 環形緩衝取出一個字元。無資料回傳 0。地面站版不使用此 API。 */
+int  GsLoraTest_PopUsbByte(uint8_t *out);
 
 #ifdef __cplusplus
 }

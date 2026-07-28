@@ -28,6 +28,45 @@ extern "C" {
 /* NMEA 單句最長 82 字元（含 $ 與 CRLF）。緩衝留 96 充足餘量。 */
 #define GPS_PARSE_LINE_MAX  96U
 
+#pragma pack(push, 1)
+/* UBX-NAV-PVT (Class 0x01, ID 0x07) Payload 92 位元組結構 */
+typedef struct {
+    uint32_t iTOW;       /* GPS time of week (ms) */
+    uint16_t year;       /* Year (UTC) */
+    uint8_t  month;      /* Month (1..12) */
+    uint8_t  day;        /* Day (1..31) */
+    uint8_t  hour;       /* Hour (0..23) */
+    uint8_t  min;        /* Min (0..59) */
+    uint8_t  sec;        /* Sec (0..60) */
+    uint8_t  valid;      /* Validity flags */
+    uint32_t tAcc;       /* Time accuracy estimate (ns) */
+    int32_t  nano;       /* Fraction of second (ns) */
+    uint8_t  fixType;    /* GNSSfix Type: 0=No fix, 1=DR, 2=2D, 3=3D, 4=GNSS+DR, 5=Time */
+    uint8_t  flags;      /* Fix status flags (bit 0 = gnssFixOK) */
+    uint8_t  flags2;     /* Additional flags */
+    uint8_t  numSV;      /* Number of satellites used */
+    int32_t  lon;        /* Longitude (deg * 1e-7) */
+    int32_t  lat;        /* Latitude (deg * 1e-7) */
+    int32_t  height;     /* Height above ellipsoid (mm) */
+    int32_t  hMSL;       /* Height above MSL (mm) */
+    uint32_t hAcc;       /* Horizontal accuracy (mm) */
+    uint32_t vAcc;       /* Vertical accuracy (mm) */
+    int32_t  velN;       /* NED north velocity (mm/s) */
+    int32_t  velE;       /* NED east velocity (mm/s) */
+    int32_t  velD;       /* NED down velocity (mm/s) */
+    int32_t  gSpeed;     /* Ground Speed (2D) (mm/s) */
+    int32_t  headMot;    /* Heading of motion (2D) (deg * 1e-5) */
+    uint32_t sAcc;       /* Speed accuracy estimate (mm/s) */
+    uint32_t headAcc;    /* Heading accuracy estimate (deg * 1e-5) */
+    uint16_t pDOP;       /* Position DOP (* 0.01) */
+    uint16_t flags3;     /* Additional flags */
+    uint8_t  reserved1[4];
+    int32_t  headVeh;    /* Heading of vehicle (2D) */
+    int16_t  magDec;     /* Magnetic declination */
+    uint16_t magAcc;     /* Magnetic declination accuracy */
+} UbxNavPvt_t;
+#pragma pack(pop)
+
 /* --- 解析後的 GPS 資料（自 gps.h 移入；欄位皆純資料，無 HAL 依賴） --- */
 typedef struct {
     uint8_t  fix_valid;        /* 1 = RMC 狀態 'A' 或 GGA fix>0（有有效定位） */
@@ -311,8 +350,155 @@ static inline uint8_t gps_parse_sentence(GPS_Data_t *d, const char *line, uint32
     return GPS_SENT_SKIP;
 }
 
+/* ------------------------------------------------------------------ */
+/* UBX 二進位解包與解析                                               */
+/* ------------------------------------------------------------------ */
+
+typedef enum {
+    UBX_STEP_SYNC1 = 0,
+    UBX_STEP_SYNC2,
+    UBX_STEP_CLASS,
+    UBX_STEP_ID,
+    UBX_STEP_LEN_LSB,
+    UBX_STEP_LEN_MSB,
+    UBX_STEP_PAYLOAD,
+    UBX_STEP_CK_A,
+    UBX_STEP_CK_B
+} UbxStep_t;
+
+typedef struct {
+    UbxStep_t step;
+    uint8_t   msg_class;
+    uint8_t   msg_id;
+    uint16_t  payload_len;
+    uint16_t  payload_idx;
+    uint8_t   calc_ck_a;
+    uint8_t   calc_ck_b;
+    uint8_t   payload_buf[128];
+} GpsUbxAsm_t;
+
+static inline void gps_ubx_asm_init(GpsUbxAsm_t *a)
+{
+    memset(a, 0, sizeof(*a));
+    a->step = UBX_STEP_SYNC1;
+}
+
+/* 餵入一個位元組至 UBX 二進位解包狀態機。
+ * 若收滿一包完整的 UBX-NAV-PVT (Class 0x01, ID 0x07) 且 Checksum 通過，回傳 1。
+ * 成功解出的 92 位元組 payload 在 a->payload_buf 中。
+ */
+static inline uint8_t gps_ubx_feed(GpsUbxAsm_t *a, uint8_t b)
+{
+    switch (a->step) {
+    case UBX_STEP_SYNC1:
+        if (b == 0xB5) {
+            a->step = UBX_STEP_SYNC2;
+        }
+        break;
+
+    case UBX_STEP_SYNC2:
+        if (b == 0x62) {
+            a->step = UBX_STEP_CLASS;
+        } else if (b != 0xB5) {
+            a->step = UBX_STEP_SYNC1;
+        }
+        break;
+
+    case UBX_STEP_CLASS:
+        a->msg_class = b;
+        a->calc_ck_a = b;
+        a->calc_ck_b = b;
+        a->step = UBX_STEP_ID;
+        break;
+
+    case UBX_STEP_ID:
+        a->msg_id = b;
+        a->calc_ck_a = (uint8_t)(a->calc_ck_a + b);
+        a->calc_ck_b = (uint8_t)(a->calc_ck_b + a->calc_ck_a);
+        a->step = UBX_STEP_LEN_LSB;
+        break;
+
+    case UBX_STEP_LEN_LSB:
+        a->payload_len = b;
+        a->calc_ck_a = (uint8_t)(a->calc_ck_a + b);
+        a->calc_ck_b = (uint8_t)(a->calc_ck_b + a->calc_ck_a);
+        a->step = UBX_STEP_LEN_MSB;
+        break;
+
+    case UBX_STEP_LEN_MSB:
+        a->payload_len |= ((uint16_t)b << 8);
+        a->calc_ck_a = (uint8_t)(a->calc_ck_a + b);
+        a->calc_ck_b = (uint8_t)(a->calc_ck_b + a->calc_ck_a);
+        if (a->payload_len > sizeof(a->payload_buf)) {
+            a->step = UBX_STEP_SYNC1;
+        } else if (a->payload_len == 0) {
+            a->step = UBX_STEP_CK_A;
+        } else {
+            a->payload_idx = 0;
+            a->step = UBX_STEP_PAYLOAD;
+        }
+        break;
+
+    case UBX_STEP_PAYLOAD:
+        a->payload_buf[a->payload_idx++] = b;
+        a->calc_ck_a = (uint8_t)(a->calc_ck_a + b);
+        a->calc_ck_b = (uint8_t)(a->calc_ck_b + a->calc_ck_a);
+        if (a->payload_idx >= a->payload_len) {
+            a->step = UBX_STEP_CK_A;
+        }
+        break;
+
+    case UBX_STEP_CK_A:
+        if (b == a->calc_ck_a) {
+            a->step = UBX_STEP_CK_B;
+        } else {
+            a->step = UBX_STEP_SYNC1;
+        }
+        break;
+
+    case UBX_STEP_CK_B:
+        a->step = UBX_STEP_SYNC1;
+        if (b == a->calc_ck_b) {
+            if (a->msg_class == 0x01 && a->msg_id == 0x07 && a->payload_len == sizeof(UbxNavPvt_t)) {
+                return 1U;
+            }
+        }
+        break;
+
+    default:
+        a->step = UBX_STEP_SYNC1;
+        break;
+    }
+    return 0U;
+}
+
+/* 將解包後的 UBX-NAV-PVT payload 轉換並更新至 GPS_Data_t */
+static inline void gps_parse_ubx_pvt(GPS_Data_t *d, const UbxNavPvt_t *pvt, uint32_t now_ms)
+{
+    uint8_t valid = ((pvt->fixType >= 2U) && (pvt->flags & 0x01U)) ? 1U : 0U;
+
+    d->fix_quality = pvt->fixType;
+    d->satellites = pvt->numSV;
+    d->lat_1e6 = pvt->lat / 10;
+    d->lon_1e6 = pvt->lon / 10;
+    d->altitude_m = (float)pvt->hMSL / 1000.0f;
+    d->geoid_sep_m = (float)(pvt->height - pvt->hMSL) / 1000.0f;
+    d->speed_mps = (float)pvt->gSpeed / 1000.0f;
+    d->course_deg = (float)pvt->headMot / 100000.0f;
+    d->utc_hhmmss = (uint32_t)pvt->hour * 10000U + (uint32_t)pvt->min * 100U + (uint32_t)pvt->sec;
+
+    if (valid) {
+        d->fix_valid = 1U;
+        d->last_fix_tick = now_ms;
+    } else {
+        d->fix_valid = 0U;
+    }
+    d->sentences_ok++;
+}
+
 #ifdef __cplusplus
 }
 #endif
 
 #endif /* GPS_PARSE_H */
+

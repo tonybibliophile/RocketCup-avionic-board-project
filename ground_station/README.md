@@ -11,7 +11,7 @@
 | :--- | :--- |
 | `serial_link.py` | 串口連線與收發核心 |
 | `telemetry_decoder.py` | 遙測封包解碼 |
-| `gui/` | 上位機 GUI：`ground_gui.py`、`gui_monitor.py`、`requirements.txt` |
+| `gui/` | 上位機 GUI：`ground_gui.py`、`GUI_avionic.py`、`gui_monitor.py`、`requirements.txt` |
 | `tools/` | 分析工具：`ekf_visualizer.py`、`realtime_charts.py`、`test_runner.py` |
 | `logs/` | 執行時串口紀錄輸出（runtime 產物） |
 
@@ -19,6 +19,8 @@
 
 ```bash
 pip install -r gui/requirements.txt
-python serial_link.py        # 命令列串口工具
-python gui/ground_gui.py     # 圖形介面
+python serial_link.py         # 命令列串口工具
+python gui/ground_gui.py      # 地面站 GUI：接 ROLE_GROUND 板，雙鏈路(433/920)收報統計、
+                               # RSSI/SNR 分頻率繪圖、火箭/地面站 GPS 分開顯示、主副航電狀態
+python gui/GUI_avionic.py     # 航電板直連 GUI：USB-TTL 直接接航電板除錯輸出用
 ```

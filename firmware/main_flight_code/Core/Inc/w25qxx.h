@@ -151,7 +151,15 @@ W25QXX_StatusTypeDef W25QXX_WriteData(uint32_t addr, const uint8_t *buf, uint32_
 W25QXX_StatusTypeDef W25QXX_EraseSector(uint32_t sectorAddr);
 
 /**
- * @brief  擦除整顆 Flash (時間較長，約 20~100 秒)
+ * @brief  擦除一個 64 KB Block (單次最壞 ~2s，遠快於 16 次 Sector Erase)
+ * @param  blockAddr  Block 起始位址 (需為 65536 的倍數)
+ * @retval W25QXX_OK 或錯誤碼
+ */
+W25QXX_StatusTypeDef W25QXX_EraseBlock64K(uint32_t blockAddr);
+
+/**
+ * @brief  擦除整顆 Flash (時間較長，約 20~100 秒；單次阻塞不餵狗)
+ * @note   會觸發 IWDG 重啟，一般改用 FlashRing_EraseAll() 逐塊擦除 + 餵狗
  * @retval W25QXX_OK 或錯誤碼
  */
 W25QXX_StatusTypeDef W25QXX_EraseChip(void);
@@ -232,7 +240,21 @@ typedef struct __attribute__((packed)) {
         float    gyro_bias[3];   /* EKF 陀螺儀三軸偏置 (X, Y, Z) */
     } calib;                     /* [16..47] 校準參數，對齊 FLASH_OFF_CALIB_PARAMS */
     float    mag_offsets[3];     /* [48..59] MMC5983MA 地磁計三軸硬鐵偏置 (Gauss) */
-    uint16_t crc16;              /* [60..61] 整個結構的 CRC-16 校驗碼 */
+    struct __attribute__((packed)) {
+        uint32_t magic;          /* magic = 0x50544c4f ('PTLO') */
+        uint32_t e22_freq_mhz;
+        uint8_t  e22_pwr;
+        uint8_t  e22_air;
+        uint8_t  reserved1[2];   /* alignment */
+        uint32_t e80_freq_hz;
+        uint8_t  e80_sf;
+        uint8_t  e80_bw;
+        uint8_t  e80_cr;
+        int8_t   e80_pwr_dbm;
+        uint16_t e80_preamble;
+        uint8_t  reserved2[2];   /* alignment */
+    } lora;
+    uint16_t crc16;              /* 整個結構的 CRC-16 校驗碼 */
 } FlashSysFlags_t;
 
 /* 任務總結區結構體 (98 Bytes) */
@@ -254,50 +276,56 @@ typedef struct __attribute__((packed)) {
     uint16_t crc16;              /* [96..97] 整個結構的 CRC-16 校驗碼 */
 } FlashMissionSummary_t;
 
-/* 飛行數據環形緩衝區封包格式 (80 Bytes) */
+/* 飛行數據環形緩衝區封包格式 (128 Bytes) */
 typedef struct __attribute__((packed)) {
     uint8_t  magic[2];       /* [0..1]   0xAA 0x55 作為環形掃描標記 */
     uint16_t seq;            /* [2..3]   封包序號（滾動） */
-    uint32_t tick_ms;        /* [4..7]   HAL_GetTick() ms */
-    uint8_t  fsm_state;      /* [8]      飛行狀態機 state */
-    uint8_t  flags;          /* [9]      系統狀態旗標 */
-    uint16_t bat_voltage_mv; /* [10..11] 電池電壓 (mV) */
-    int16_t  bmi_ax;         /* [12..13] BMI088 Accel X raw LSB */
-    int16_t  bmi_ay;         /* [14..15] BMI088 Accel Y raw */
-    int16_t  bmi_az;         /* [16..17] BMI088 Accel Z raw */
-    int16_t  bmi_gx;         /* [18..19] BMI088 Gyro X raw */
-    int16_t  bmi_gy;         /* [20..21] BMI088 Gyro Y raw */
-    int16_t  bmi_gz;         /* [22..23] BMI088 Gyro Z raw */
-    int16_t  adxl_x;         /* [24..25] ADXL375 X raw LSB */
-    int16_t  adxl_y;         /* [26..27] ADXL375 Y raw */
-    int16_t  adxl_z;         /* [28..29] ADXL375 Z raw */
-    int16_t  baro_temp_c_x100;/* [30..31] 氣壓計溫度 * 100 */
-    uint32_t baro_press_pa;  /* [32..35] 氣壓計壓力 (Pa) */
-    int32_t  baro_alt_cm;    /* [36..39] 氣壓計相對高度 (cm) */
-    int32_t  ekf_pos_z_cm;   /* [40..43] EKF 估計相對高度 (cm) */
-    int32_t  ekf_vel_z_cms;  /* [44..47] EKF 估計垂直速度 (cm/s) */
-    float    ekf_q0;         /* [48..51] EKF 四元數 q0 */
-    float    ekf_q1;         /* [52..55] EKF 四元數 q1 */
-    float    ekf_q2;         /* [56..59] EKF 四元數 q2 */
-    float    ekf_q3;         /* [60..63] EKF 四元數 q3 */
-    int32_t  gps_lat;        /* [64..67] GPS 緯度 (lat * 1e6) */
-    int32_t  gps_lon;        /* [68..71] GPS 經度 (lon * 1e6) */
-    int16_t  gps_alt_m;      /* [72..73] GPS 海拔高度 (m) */
-    int16_t  gps_spd_cms;    /* [74..75] GPS 地速 (cm/s) */
-    uint8_t  gps_sats;       /* [76]     GPS 衛星數 */
-    uint8_t  gps_fix;        /* [77]     GPS 定位品質 */
-    uint16_t crc16;          /* [78..79] CRC-16/CCITT */
+    uint32_t flight_id;      /* [4..7]   飛行批次 ID（同一次 ARM/熱重啟沿用同一值） */
+    uint32_t tick_ms;        /* [8..11]  HAL_GetTick() ms */
+    uint8_t  fsm_state;      /* [12]     飛行狀態機 state */
+    uint8_t  flags;          /* [13]     系統狀態旗標 */
+    uint16_t bat_voltage_mv; /* [14..15] 電池電壓 (mV) */
+    int16_t  bmi_ax;         /* [16..17] BMI088 Accel X raw LSB */
+    int16_t  bmi_ay;         /* [18..19] BMI088 Accel Y raw */
+    int16_t  bmi_az;         /* [20..21] BMI088 Accel Z raw */
+    int16_t  bmi_gx;         /* [22..23] BMI088 Gyro X raw */
+    int16_t  bmi_gy;         /* [24..25] BMI088 Gyro Y raw */
+    int16_t  bmi_gz;         /* [26..27] BMI088 Gyro Z raw */
+    int16_t  adxl_x;         /* [28..29] ADXL375 X raw LSB */
+    int16_t  adxl_y;         /* [30..31] ADXL375 Y raw */
+    int16_t  adxl_z;         /* [32..33] ADXL375 Z raw */
+    int16_t  baro_temp_c_x100;/* [34..35] 氣壓計溫度 * 100 */
+    uint32_t baro_press_pa;  /* [36..39] 氣壓計壓力 (Pa) */
+    int32_t  baro_alt_cm;    /* [40..43] 氣壓計相對高度 (cm) */
+    int32_t  ekf_pos_z_cm;   /* [44..47] EKF 估計相對高度 (cm) */
+    int32_t  ekf_vel_z_cms;  /* [48..51] EKF 估計垂直速度 (cm/s) */
+    float    ekf_q0;         /* [52..55] EKF 四元數 q0 */
+    float    ekf_q1;         /* [56..59] EKF 四元數 q1 */
+    float    ekf_q2;         /* [60..63] EKF 四元數 q2 */
+    float    ekf_q3;         /* [64..67] EKF 四元數 q3 */
+    int32_t  gps_lat;        /* [68..71] GPS 緯度 (lat * 1e6) */
+    int32_t  gps_lon;        /* [72..75] GPS 經度 (lon * 1e6) */
+    int16_t  gps_alt_m;      /* [76..77] GPS 海拔高度 (m) */
+    int16_t  gps_spd_cms;    /* [78..79] GPS 地速 (cm/s) */
+    uint8_t  gps_sats;       /* [80]     GPS 衛星數 */
+    uint8_t  gps_fix;        /* [81]     GPS 定位品質 */
+    uint8_t  reserved[44];   /* [82..125] 預留，維持 128B sector 對齊 */
+    uint16_t crc16;          /* [126..127] CRC-16/CCITT */
 } FlashRingPacket_t;
+_Static_assert(sizeof(FlashRingPacket_t) == FLASH_RING_PACKET_SIZE,
+               "FlashRingPacket_t 必須等於 FLASH_RING_PACKET_SIZE");
 
 /* ============================================================
  *  環形緩衝區 API
  * ============================================================ */
 
 /**
- * @brief  初始化環形緩衝區：掃描寫入頭、預擦 FLASH_RING_PREERASE_N 個 Sector
+ * @brief  初始化環形緩衝區：掃描寫入頭、預擦 FLASH_RING_PREERASE_TARGET 個 Sector
  *         輸出 [FLASH_RING] 訊息至 UART
  */
 void FlashRing_Init(void);
+void FlashRing_InitEx(void (*progress_cb)(uint32_t current, uint32_t total));
+uint8_t FlashRing_GetErasePct(void);
 
 /**
  * @brief  寫入一筆飛行數據封包至環形緩衝區
@@ -320,6 +348,17 @@ W25QXX_StatusTypeDef FlashRing_GetLastPacket(FlashRingPacket_t *pkt);
  * @retval W25QXX_OK 成功提取, W25QXX_ERR_ID 數據無效或未寫入
  */
 W25QXX_StatusTypeDef FlashRing_GetSecondLastPacket(FlashRingPacket_t *pkt);
+
+/**
+ * @brief  只擦除飛行環形緩衝區（0x010000~0xFFFFFF，Block 1..255），保留 Sector 0
+ *         系統旗標區（校準/mag/LoRa）與任務總結區。
+ * @note   以 64KB Block Erase 逐塊擦除並每塊餵狗；每次 SPI 交易自帶 CS_LOW/CS_HIGH
+ *         SPI3 鎖，呼叫端不需另外包外層鎖（包外層鎖只會讓 E80 920MHz LoRa 遙測整段
+ *         期間發不出去）。呼叫端應先放寬 IWDG 視窗（單次 block erase 最壞 ~2s）。
+ *         擦除後請呼叫 FlashRing_Init() 重新掃描寫入頭與預擦。
+ * @retval W25QXX_OK 或錯誤碼
+ */
+W25QXX_StatusTypeDef FlashRing_EraseAll(void);
 
 /** @brief 取得目前寫入地址 */
 uint32_t FlashRing_GetWriteAddr(void);
