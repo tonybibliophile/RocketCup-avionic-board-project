@@ -19,6 +19,16 @@
 #define MMC5983_SETRESET_SETTLE_MS  (1U)     /* SET/RESET 線圈脈衝後沉降時間 */
 #define MMC5983_RAW_BYTES           (7U)     /* XOUT0..XYZOUT2 共 7 bytes */
 
+/* CONTROL_2 (0x0B) 位元配置（datasheet p.16 / SparkFun·kriswiner 驅動同）：
+ *   bits2:0 = CM_Freq（101 = 100Hz）
+ *   bit3    = Cmm_en（連續量測模式致能）★ 不是 bit4！
+ *   bits6:4 = Prd_set, bit7 = En_prd_set（本驅動不用，週期 SET 由軟體 Recalibrate 做）
+ * 舊值 0x15 誤把 Cmm_en 當 bit4 → 連續模式根本沒開，輸出暫存器凍結，
+ * 只剩每 10s Recalibrate 的 TM_M 更新一筆（且為 RESET 負极性）→
+ * 「不同時間戳讀值全一樣」的根因。 */
+#define MMC5983_CTRL2_CMM_100HZ     (0x0DU)  /* Cmm_en(0x08) | CM_Freq=101(0x05) */
+#define MMC5983_CTRL2_CMM_OFF       (0x00U)
+
 static MMC5983_Data_t     mmc_data;
 
 /* --- 軟體低通濾波相關變數 --- */
@@ -92,6 +102,7 @@ HAL_StatusTypeDef MMC5983_Init(void)
     for (int i = 0; i < 3; i++) {
         mmc_data.raw[i] = 0;
         mmc_data.offset[i] = (int32_t)MMC5983_ZERO_COUNT;  /* 預設中點，待校準覆蓋 */
+        mmc_data.hard_iron_offset[i] = 0;                 /* 預設無環境硬鐵偏置 */
         mmc_data.gauss[i] = 0.0f;
     }
     mmc_data.heading_deg = 0.0f;
@@ -130,9 +141,8 @@ HAL_StatusTypeDef MMC5983_Init(void)
     filtered_gauss[1] = mmc_data.gauss[1];
     filtered_gauss[2] = mmc_data.gauss[2];
 
-    /* 啟用 100Hz 硬體連續量測模式 (Continuous Measurement Mode)
-     * 寫入 CONTROL_2 (0x0B)：Cmm_en = 1 (bit 4), CM_Freq = 101 (100Hz, bits 2:0) -> 0x15U */
-    if (mmc_write_reg(MMC5983_REG_CTRL2, 0x15U) != HAL_OK) {
+    /* 啟用 100Hz 硬體連續量測模式（Cmm_en=bit3；定義與勘誤見檔頭 MMC5983_CTRL2_CMM_100HZ） */
+    if (mmc_write_reg(MMC5983_REG_CTRL2, MMC5983_CTRL2_CMM_100HZ) != HAL_OK) {
         return HAL_ERROR;
     }
 
@@ -140,7 +150,8 @@ HAL_StatusTypeDef MMC5983_Init(void)
     return HAL_OK;
 }
 
-HAL_StatusTypeDef MMC5983_Recalibrate(void)
+/* SET/RESET 校準本體（呼叫前必須已暫停 CMM——CMM 下 TM_M 行為未定義） */
+static HAL_StatusTypeDef mmc_recalibrate_body(void)
 {
     int32_t s[3] = {0};
     int32_t r[3] = {0};
@@ -168,13 +179,27 @@ HAL_StatusTypeDef MMC5983_Recalibrate(void)
         mmc_data.offset[i] = (s[i] + r[i]) / 2;
     }
 
-    /* 4) 收尾再做一次 SET，讓感測器停在 +極性供後續快速讀取 */
+    /* 4) 收尾再做一次 SET，讓感測器停在 +極性供後續連續量測 */
     if (mmc_write_reg(MMC5983_REG_CTRL0, MMC5983_CTRL0_SET) != HAL_OK) {
         return HAL_ERROR;
     }
     HAL_Delay(MMC5983_SETRESET_SETTLE_MS);
 
     return HAL_OK;
+}
+
+HAL_StatusTypeDef MMC5983_Recalibrate(void)
+{
+    /* 暫停連續量測（初始化階段 CMM 尚未開，寫 0 無害），校準完不論成敗都恢復：
+     * 若失敗仍把 CMM 關著，讀值會再度凍結——寧可帶著舊橋偏繼續量。 */
+    (void)mmc_write_reg(MMC5983_REG_CTRL2, MMC5983_CTRL2_CMM_OFF);
+
+    HAL_StatusTypeDef st = mmc_recalibrate_body();
+
+    if (mmc_data.ok) {
+        (void)mmc_write_reg(MMC5983_REG_CTRL2, MMC5983_CTRL2_CMM_100HZ);
+    }
+    return st;
 }
 
 /* 本函數為相容性保留，做阻塞式單次 one-shot 量測。 */
@@ -191,10 +216,10 @@ HAL_StatusTypeDef MMC5983_Read(void)
     mmc_data.raw[1] = y;
     mmc_data.raw[2] = z;
 
-    /* 扣除橋偏 → Gauss */
-    mmc_data.gauss[0] = (float)(x - mmc_data.offset[0]) / MMC5983_LSB_PER_GAUSS;
-    mmc_data.gauss[1] = (float)(y - mmc_data.offset[1]) / MMC5983_LSB_PER_GAUSS;
-    mmc_data.gauss[2] = (float)(z - mmc_data.offset[2]) / MMC5983_LSB_PER_GAUSS;
+    /* 扣除橋偏與環境硬鐵偏移 → Gauss */
+    mmc_data.gauss[0] = (float)(x - mmc_data.offset[0] - mmc_data.hard_iron_offset[0]) / MMC5983_LSB_PER_GAUSS;
+    mmc_data.gauss[1] = (float)(y - mmc_data.offset[1] - mmc_data.hard_iron_offset[1]) / MMC5983_LSB_PER_GAUSS;
+    mmc_data.gauss[2] = (float)(z - mmc_data.offset[2] - mmc_data.hard_iron_offset[2]) / MMC5983_LSB_PER_GAUSS;
 
     float h = atan2f(mmc_data.gauss[1], mmc_data.gauss[0]) * (180.0f / 3.14159265f);
     if (h < 0.0f) {
@@ -241,10 +266,10 @@ HAL_StatusTypeDef MMC5983_Read_Continuous(void)
     mmc_data.raw[1] = y;
     mmc_data.raw[2] = z;
 
-    /* 扣除偏移並換算為高斯 (Gauss) */
-    float raw_gx = (float)(x - mmc_data.offset[0]) / MMC5983_LSB_PER_GAUSS;
-    float raw_gy = (float)(y - mmc_data.offset[1]) / MMC5983_LSB_PER_GAUSS;
-    float raw_gz = (float)(z - mmc_data.offset[2]) / MMC5983_LSB_PER_GAUSS;
+    /* 扣除動態橋偏與靜態硬鐵偏移後，換算為高斯 (Gauss) */
+    float raw_gx = (float)(x - mmc_data.offset[0] - mmc_data.hard_iron_offset[0]) / MMC5983_LSB_PER_GAUSS;
+    float raw_gy = (float)(y - mmc_data.offset[1] - mmc_data.hard_iron_offset[1]) / MMC5983_LSB_PER_GAUSS;
+    float raw_gz = (float)(z - mmc_data.offset[2] - mmc_data.hard_iron_offset[2]) / MMC5983_LSB_PER_GAUSS;
 
     mmc_data.gauss[0] = raw_gx;
     mmc_data.gauss[1] = raw_gy;
@@ -284,8 +309,10 @@ void MMC5983_GetFilteredGauss(float *x, float *y, float *z)
 void MMC5983_SetOffsets(const float *offsets)
 {
     if (offsets != NULL) {
-        mmc_data.offset[0] = (int32_t)offsets[0];
-        mmc_data.offset[1] = (int32_t)offsets[1];
-        mmc_data.offset[2] = (int32_t)offsets[2];
+        /* offsets[i] 為開機橋偏與硬鐵偏移的合計值。
+         * 我們在此藉由減去已測得之橋偏，分離並還原出純粹的環境硬鐵偏移。 */
+        mmc_data.hard_iron_offset[0] = (int32_t)offsets[0] - mmc_data.offset[0];
+        mmc_data.hard_iron_offset[1] = (int32_t)offsets[1] - mmc_data.offset[1];
+        mmc_data.hard_iron_offset[2] = (int32_t)offsets[2] - mmc_data.offset[2];
     }
 }

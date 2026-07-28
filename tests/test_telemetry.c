@@ -5,7 +5,8 @@
  *
  * 這份測試「就是」地面站解碼契約的機器驗證：
  *   [1] CRC-16/CCITT-FALSE 黃金向量："123456789" → 0x29B1（crc16.h 單一實作）
- *   [2] TelemetryPacket_t 大小 = 79 bytes（77 + P1 health_bits/sensor_bits）
+ *   [2] TelemetryPacket_t 大小 = 116 bytes（93 + 本板 VF 摘要 8B + peer baro/accel/VF 14B
+ *       + peer_bench_arb 1B）
  *   [3] 每個欄位的 byte offset 逐一鎖定（GroundStation/telemetry_decoder.py
  *       的 struct.unpack 格式依據此表）
  *   [4] CRC 欄位語意：覆蓋前 sizeof-2 bytes
@@ -33,8 +34,8 @@ static void test_crc_golden(void) {
 
 static void test_packet_layout(void) {
     printf("[2] 封包大小與欄位 offset（地面站解碼契約）\n");
-    check("sizeof(TelemetryPacket_t) == 79", sizeof(TelemetryPacket_t) == 79);
-    check("TELEM_PACKET_SIZE == 79",         TELEM_PACKET_SIZE == 79);
+    check("sizeof(TelemetryPacket_t) == 116", sizeof(TelemetryPacket_t) == 116);
+    check("TELEM_PACKET_SIZE == 116",         TELEM_PACKET_SIZE == 116);
 
 #define OFF(field, expect) \
     check("offsetof " #field " == " #expect, offsetof(TelemetryPacket_t, field) == (expect))
@@ -75,7 +76,21 @@ static void test_packet_layout(void) {
     OFF(flags,         74);
     OFF(health_bits,   75);
     OFF(sensor_bits,   76);
-    OFF(crc16,         77);
+    OFF(vf_pos_z_cm,   77);
+    OFF(vf_vel_z_cms,  81);
+    OFF(peer_fsm_state,85);
+    OFF(peer_flags,    86);
+    OFF(peer_h_cm,     87);
+    OFF(peer_v_cms,    91);
+    OFF(peer_baro_cm,  95);
+    OFF(peer_link,     99);
+    OFF(peer_loss_pmil,100);
+    OFF(peer_az_cg,    102);
+    OFF(peer_vf_h_cm,  104);
+    OFF(peer_vf_v_cms, 108);
+    OFF(arm_flags,     112);
+    OFF(peer_bench_arb,113);
+    OFF(crc16,         114);
 #undef OFF
 }
 
@@ -98,7 +113,7 @@ static void test_packet_crc_semantics(void) {
     const uint8_t *raw = (const uint8_t *)&pkt;
     check("sync bytes 位於 [0],[1]", raw[0] == 0xA5 && raw[1] == 0x5A);
     uint16_t crc_calc = crc16_ccitt_false(raw, (uint16_t)(sizeof(pkt) - 2));
-    uint16_t crc_recv = (uint16_t)(raw[77] | ((uint16_t)raw[78] << 8));  /* little-endian */
+    uint16_t crc_recv = (uint16_t)(raw[114] | ((uint16_t)raw[115] << 8));  /* little-endian */
     check("重算 CRC == 封包尾 2 bytes (LE)", crc_calc == crc_recv);
 
     /* 位元翻轉必須被偵測 */

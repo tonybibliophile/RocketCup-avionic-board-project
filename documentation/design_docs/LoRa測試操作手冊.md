@@ -96,7 +96,10 @@ screen /dev/cu.usbserial-XXXX 460800
 | `stats reset` | 清除統計計數器 |
 | `stats auto <sec>` | 每 N 秒自動列印統計（`stats auto 0` 關閉） |
 | `e22 freq <mhz>` | 設 E22 頻率 410–493 MHz（寫入 EEPROM，掉電保留） |
-| `e22 show` | 顯示 E22 目前頻率 / 通道 |
+| `e22 pwr <0-3>` | 設 E22 發射功率（0=30dBm 1=27 2=24 3=21；本板 3V3 用 3） |
+| `e22 air <0-7>` | 設 E22 空中速率（2=2.4k；★兩端必須相同才能通訊） |
+| `e22 show` | 顯示 E22 全部設定暫存器（含 `SubPkt` / `RSSIbyte` / `RSSInoise`） |
+| `e22 dump on\|off` | 逐位元組印出 433 原始 hex（`[E22RAW]`），用來核對 RSSI 位元組落點 |
 | `e80 freq <hz>` | 設 E80 中心頻率（Hz，例 `e80 freq 915000000`） |
 | `e80 sf <7-12>` | 設 E80 展頻因子 |
 | `e80 bw <idx>` | 設 E80 頻寬 index（見 §8） |
@@ -116,7 +119,19 @@ screen /dev/cu.usbserial-XXXX 460800
 [STATS] RSSI: last=-87 min=-95 max=-71 avg=-86 dBm
 [STATS] SNR:  last=36 min=8 max=44 avg=30 (x0.25dB)   ← dB = 數值 ÷ 4
 ```
-> E22 為透傳模式，**無逐包 RSSI/SNR**，只統計封包數 / CRC 錯誤 / 封包率。
+> E22 **無 SNR**（模組不提供）。逐包 RSSI 則取決於 REG3 bit7「RSSI 位元組致能」
+> （韌體以 `lora_e22.c` 的 `E22_RSSI_BYTE_EN` 明確寫入）：開啟後模組會在每一次
+> **無線接收**的酬載之後多吐一個 RSSI 位元組，接收端剝掉它並換算 `-(256-v)` dBm。
+>
+> ⚠ 這個功能對「一個應用封包 = 一個空中子封包」有硬性依賴。E22 是
+> *auto sub-packaging*（datasheet p.12 §5.6.2）：若 116-byte 遙測封包被拆成多個
+> 子封包，模組會**每個子封包各附一個 RSSI 位元組**，等於插進封包中間，
+> CRC 會幾乎全錯。韌體已用兩道措施保證不拆：
+> 1. REG1 bit[7:6] 明確寫成 **240B**（`E22_SUBPKT_CODE`），116 < 240；
+> 2. `LoRaE22_Send()` 走 **UART DMA**，位元組流中間不會因任務被搶佔而出現 idle 空隙。
+>
+> 出問題時先用 `e22 show` 確認 `SubPkt=240B`、再用 `e22 dump on` 確認兩個
+> `A5 5A` 之間剛好 117 bytes（116 酬載 + 1 個尾端 RSSI）。
 
 ---
 
@@ -264,6 +279,7 @@ SF 每 +1、空中時間約 ×2；BW ×2、空中時間約 ÷2。
 | E80 收不到、E22 正常 | LR1121 板級項（RF 開關 / IRQ DIO / TCXO） |
 | E22 收不到、E80 正常 | E22 頻道與 TX 不符（`e22 show`）；UART3 接線；M0/M1 模式 |
 | crc_err 很高 | 訊號弱（看 RSSI/SNR）、頻道干擾（換頻）、兩端參數不完全一致 |
+| 433 只要開 RSSI 就幾乎全 CRC 錯 | E22 auto sub-packaging 把封包拆成多個子封包，模組每個子封包各附一個 RSSI 位元組、插進封包中間。`e22 show` 確認 `SubPkt=240B`；`e22 dump on` 確認兩個 `A5 5A` 之間是 117 bytes。發射端必須用 UART DMA 送出整包（勿改回阻塞傳輸） |
 | 改了參數後反而全斷 | 只改了地面站；火箭 TX 未同步成相同參數 |
 | `deploy` 火箭沒反應 | 先 `arm`？ARM 是否已逾時(30s)？`ping` 先確認上行通 |
 | `ping`/`arm` 火箭收不到 | 上行需命中安靜窗：命令是 ~3s burst，勿中途打斷；E22 兩端同頻同 NETID |

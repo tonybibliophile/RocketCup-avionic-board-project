@@ -2,8 +2,8 @@
  * link_hw.h — 板間鏈路硬體層（USART2 全雙工：DMA/IDLE 收 + IT 送）
  * ===========================================================================
  * 把純邏輯（link_proto / link）接到 HAL：主備兩板程式相同，差別只在角色與接線
- * （板間排線 TX/RX 交叉一次）。收到的封包於 ISR 內更新 LinkPeer_t；main.c 的備板
- * overlay 讀 Link_GetPeer() 的鎖存旗標決定是否抑制點火。
+ * （板間排線 TX/RX 交叉一次）。收到的封包於 ISR 內更新 LinkPeer_t；main.c 讀
+ * Link_GetPeer() 的狀態/鎖存旗標/QoS 供地面監看與加法協同（不抑制自身開傘）。
  *
  * 僅在 FEATURE_LINK 編入。
  */
@@ -26,11 +26,24 @@ void Link_Init(void);
 /* 非阻塞送出一筆自身狀態（IT 傳輸；自動補遞增 seq；上一筆未送完則略過本次）。 */
 void Link_SendStatus(const LinkStatus_t *st);
 
-/* 取得對端狀態（含鎖存的 drogue/main 開傘旗標），供備板 overlay 仲裁。 */
+/* 取得對端狀態（含鎖存的 drogue/main 開傘旗標 + QoS：rx_count/lost_count），
+ * 供地面監看與加法協同讀取。 */
 const LinkPeer_t *Link_GetPeer(void);
+
+/* 取得接收端框架統計（ok/crc_err/resync），供 QoS 下鏈/診斷。 */
+const LinkRx_t *Link_GetRx(void);
 
 /* 對端是否仍在線（valid 且距上次收包 < LINK_PEER_TIMEOUT_MS）。 */
 uint8_t Link_PeerFresh(uint32_t now_ms);
+
+/* 板間鏈路健康狀態位（純觀測；不影響開傘決策）。 */
+#define LINK_STATUS_LOST    0x01U  /* 對端失聯（距上次有效封包 > LINK_PEER_TIMEOUT_MS） */
+#define LINK_STATUS_DESYNC  0x02U  /* 我方狀態改變後對端未於 LINK_SYNC_TIMEOUT_MS 內 echo-ACK */
+
+/* 依「我方目前 FSM 狀態」更新鏈路健康狀態（每 publish tick 呼叫）。 */
+void    Link_UpdateStatus(uint8_t my_fsm_state, uint32_t now_ms);
+/* 取得最近一次 Link_UpdateStatus 計算的 LINK_STATUS_* 位。 */
+uint8_t Link_GetStatus(void);
 
 /* --- 以下由 main.c 的 HAL 回呼依 instance 轉接（ISR context） --- */
 void Link_OnRxEvent(uint16_t Size);   /* HAL_UARTEx_RxEventCallback(USART2) */

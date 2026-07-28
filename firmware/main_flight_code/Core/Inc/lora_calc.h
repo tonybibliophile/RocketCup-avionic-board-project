@@ -79,6 +79,19 @@ static inline void lr1121_freq_to_bytes(uint32_t hz, uint8_t out[4])
     out[3] = (uint8_t)(hz);
 }
 
+/** @brief LR1121 CalibImage(0x0111) 參數位元組（頻段影像校準）。
+ *  以中心頻率 ±10MHz 取一涵蓋頻段，換算成 4MHz 步階的 [freq1(floor), freq2(ceil)]。
+ *  換頻段後（尤其自 LR1121 開機預設 sub-G 跳到 920MHz）須校準一次，否則 RX 影像抑制
+ *  未最佳化、靈敏度下降。與 TCXO 供電方式無關，E80 自供電振盪器亦需此步。 */
+static inline void lr1121_calib_image_bytes(uint32_t center_hz, uint8_t out[2])
+{
+    uint32_t mhz = center_hz / 1000000u;
+    uint32_t lo  = (mhz > 10u) ? (mhz - 10u) : 0u;
+    uint32_t hi  = mhz + 10u;
+    out[0] = (uint8_t)(lo / 4u);          /* floor：對應 ≤ 下界的頻率 */
+    out[1] = (uint8_t)((hi + 3u) / 4u);   /* ceil ：對應 ≥ 上界的頻率 */
+}
+
 /** @brief E22-400 頻率(MHz) → 通道 CH（freq = 410 + CH）。
  *  合法回傳 1 並填 *ch（410~493 MHz / CH 0~83）；超範圍回傳 0。 */
 static inline int e22_mhz_to_ch(uint32_t mhz, uint8_t *ch)

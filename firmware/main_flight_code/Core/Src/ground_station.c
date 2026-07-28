@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "telem_rx.h"
+#include "ack_proto.h"     /* 主航電對上行命令的下行 ACK 幀（與遙測同流並排解析） */
 #include "gs_timesync.h"
 #include "gs_log.h"
 #include "gs_lora_test.h"
@@ -48,10 +49,23 @@ extern uint8_t lora920_ok;         /* E80 920MHz 模組就緒狀態（main.c 定
 /* ---- 狀態 ---- */
 static TelemRx_t     s_rx433;
 static TelemRx_t     s_rx920;
+static AckRx_t       s_ack433;   /* 命令 ACK 解析（與遙測同一位元組流並排，sync 0xAC/0xCA） */
+static AckRx_t       s_ack920;
 static GsTimeSync_t  s_ts;
 static uint32_t      s_last_fix_tick = 0;
 static uint32_t      s_stat_433_cnt = 0;
 static uint32_t      s_stat_920_cnt = 0;
+
+/* ---- 920 靜默看門狗（見 lora_e80.c LoRaE80_ReadPacket 的 DIO1 latch 說明）----
+ * 修好 IRQ 清除與 RxReady() 電平查詢後，理論上 920 不會再永久卡死；這裡再加一層
+ * 「超過 N 毫秒沒收到 920 封包就自己重新 StartRx」，防的是任何未來又漏清 IRQ、
+ * 或 LR1121 本身進入某種需要重新武裝才能脫離的狀態。
+ * s_920_rearm_cnt 一定要印出來（見下方 [GS_STAT]）：火箭沒開機時本來就會一直
+ * 靜默，這個機制會固定每 GS_E80_REARM_MS 觸發一次——不印出來，事後看 log 會分不清
+ * 「鏈路本來就沒訊號」跟「真的卡死被自動救回」，等於用自動復原把真實問題蓋掉。 */
+#define GS_E80_REARM_MS  5000U
+static uint32_t      s_last_920_tick  = 0;   /* 上次成功交付 920 封包的時刻 */
+static uint32_t      s_920_rearm_cnt  = 0;   /* 累計自動重新武裝次數 */
 
 /* 大緩衝置於檔案範圍，降低任務堆疊壓力（地面站單一任務，安全） */
 static char    s_row[GS_LOG_CSV_MAX];
@@ -92,7 +106,16 @@ static void gs_leds_update(uint32_t now, uint8_t gps_fix)
 #define U3_RING_SZ 1024U
 static volatile uint8_t  s_u3_ring[U3_RING_SZ];
 static volatile uint16_t s_u3_head = 0, s_u3_tail = 0;
-static uint8_t           s_u3_rxbuf[96];   /* ReceiveToIdle 暫存 */
+/* USART3 循環 DMA 接收緩衝。
+ * ★舊版是 ReceiveToIdle_IT：每次事件都得在 callback 內重新掛載才能繼續收，重掛期間
+ *   RX 未武裝，該窗內到達的位元組會漏接或觸發 ORE；且緩衝一度小於 TELEM_PACKET_SIZE，
+ *   封包本體會被 HAL 自己攔腰打斷。改成 circular DMA + 位置差分（比照 link_hw.c 的
+ *   Link_OnRxEvent 與 gps.c，專案內已驗證的作法）：DMA 全程武裝、無重掛空檔，
+ *   IDLE 事件只是「來取新位元組」的通知，不再具有任何 framing 意義。
+ * 大小取 2 包餘裕，讓單次事件之間即使延遲數十毫秒也不會被 DMA 追過（覆寫）。 */
+#define U3_RXBUF_SZ (2U * (TELEM_PACKET_SIZE) + 32U)
+static uint8_t           s_u3_rxbuf[U3_RXBUF_SZ];   /* circular DMA 目的緩衝 */
+static volatile uint16_t s_u3_dma_old_pos = 0;      /* 上次已取到的 DMA 寫入位置 */
 static volatile uint32_t s_u3_rx_bytes = 0;  /* USART3(E22 433) 累計收到的原始位元組數（含雜訊） */
 
 static void u3_push(uint8_t b)
@@ -108,14 +131,44 @@ static int u3_pop(uint8_t *b)
     return 1;
 }
 
+/* 循環 DMA 接收事件：Size = 自緩衝起點至目前 DMA 寫入位置的累計位元組數。
+ * 以 s_u3_dma_old_pos 環形差分取出新位元組推進 ring（與 link_hw.c / gps.c 同法）。 */
 void GroundStation_OnUart3RxEvent(uint16_t Size)
 {
-    s_u3_rx_bytes += Size;   /* 統計：診斷「有沒有任何位元組從 E22 進來」 */
-    for (uint16_t i = 0; i < Size; i++) u3_push(s_u3_rxbuf[i]);
-    HAL_UARTEx_ReceiveToIdle_IT(&huart3, s_u3_rxbuf, sizeof(s_u3_rxbuf));  /* 重新掛載 */
+    uint16_t old = s_u3_dma_old_pos;
+    if (Size == old) return;
+
+    if (Size > old) {
+        for (uint16_t i = old; i < Size; i++) u3_push(s_u3_rxbuf[i]);
+        s_u3_rx_bytes += (uint32_t)(Size - old);
+    } else {
+        for (uint16_t i = old; i < U3_RXBUF_SZ; i++) u3_push(s_u3_rxbuf[i]);
+        for (uint16_t i = 0; i < Size; i++)          u3_push(s_u3_rxbuf[i]);
+        s_u3_rx_bytes += (uint32_t)(U3_RXBUF_SZ - old) + Size;
+    }
+    s_u3_dma_old_pos = (Size >= U3_RXBUF_SZ) ? 0U : Size;
 }
 
-/* USART3(E22 433 RX) 錯誤復原：清 ORE/雜訊旗標並重新掛載 ReceiveToIdle。
+/* 位元組流不連續旗標：ISR/設定模式設、任務端消化。位元組流中間缺了一段時，
+ * 解析器極可能卡在半包狀態（idx 停在中途），若不重置會沿著錯誤邊界一直錯下去。
+ * 不在 ISR 內直接 TelemRx_Init：任務可能正在 TelemRx_FeedAny 中途，會 race。 */
+static volatile uint8_t s_u3_rx_desync = 0;
+
+/* 重新掛載 USART3 循環 DMA 接收。兩個呼叫來源：
+ *   1. UART 錯誤復原（ORE）——HAL 會中止 RX 且不會自己重掛。
+ *   2. lora_e22.c 每次離開設定模式後（見 LoRaE22_SetRxRearmCallback）——設定模式
+ *      要改 baud 而呼叫 HAL_UART_Init，那會把 RxState 打回 READY，進行中的
+ *      ReceiveToIdle 就此失效；不重掛的話 `e22 freq/pwr/air` 之後 433 再也收不到。
+ * 兩種情況位元組流都斷過，故一律標記 desync 讓任務端重置解析器。 */
+static void gs_u3_rx_rearm(void)
+{
+    HAL_UART_AbortReceive(&huart3);   /* 確保舊的 DMA 接收確實停掉，否則重掛會回 HAL_BUSY */
+    s_u3_dma_old_pos = 0;
+    s_u3_rx_desync   = 1;             /* 比照 link_hw.c Link_OnError 的 LinkRx_Init */
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart3, s_u3_rxbuf, sizeof(s_u3_rxbuf));
+}
+
+/* USART3(E22 433 RX) 錯誤復原：清 ORE/雜訊旗標並重啟循環 DMA 接收。
  * 由 main.c 的 HAL_UART_ErrorCallback 在 USART3 出錯時轉接。
  * 若不做：收包時 printf/SD 寫入很慢，E22 以 115200 繼續吐下一包 → USART3 溢位(ORE)
  * → HAL 中止 RX 且不會自己重掛 → raw 從此凍結、之後完全收不到。此為地面站
@@ -125,7 +178,15 @@ void GroundStation_OnUart3Error(void)
     __HAL_UART_CLEAR_OREFLAG(&huart3);
     (void)huart3.Instance->SR;
     (void)huart3.Instance->DR;
-    HAL_UARTEx_ReceiveToIdle_IT(&huart3, s_u3_rxbuf, sizeof(s_u3_rxbuf));  /* 重新掛載 */
+    s_u3_rx_desync = 1;   /* 不論哪一種錯誤，位元組流都缺了一段 → 解析器要重置 */
+
+    /* ★DMA 接收下 ORE 屬「非阻斷錯誤」：HAL 只發錯誤回呼，DMA 接收其實還活著。
+     * 這種情況不可重掛（會回 HAL_BUSY），更不可把 s_u3_dma_old_pos 歸零——DMA 的
+     * 寫入位置並沒有跟著回到 0，歸零會讓下一次事件把一整段舊資料當新的重讀一遍。
+     * 只有 HAL 真的把接收停掉（RxState 已非 BUSY_RX）時才需要、也才能重掛。 */
+    if (huart3.RxState != HAL_UART_STATE_BUSY_RX) {
+        gs_u3_rx_rearm();
+    }
 }
 
 /* ---- SD（FatFS CSV） ---- */
@@ -230,8 +291,12 @@ static void gs_handle_packet(uint8_t link, const TelemetryPacket_t *pkt,
 
     /* 更新通訊測試統計 */
     GsLoraTest_UpdateStats(link, rssi, snr, 1 /* crc_ok */);
-    if (link == GS_LINK_920) s_stat_920_cnt++;
-    else s_stat_433_cnt++;
+    if (link == GS_LINK_920) {
+        s_stat_920_cnt++;
+        s_last_920_tick = rx_tick;   /* 920 靜默看門狗計時基準 */
+    } else {
+        s_stat_433_cnt++;
+    }
 
     /* 及時（實時）控制台印出收到的下行遙測封包摘要。
      * vz / pos / galt：GUI 圖表（EKF 垂直速度）與 GPS 地圖（火箭經緯度）需要，
@@ -242,17 +307,88 @@ static void gs_handle_packet(uint8_t link, const TelemetryPacket_t *pkt,
         uint32_t lat_abs = (pkt->gps_lat_1e6 < 0) ? (uint32_t)(-pkt->gps_lat_1e6) : (uint32_t)pkt->gps_lat_1e6;
         uint32_t lon_abs = (pkt->gps_lon_1e6 < 0) ? (uint32_t)(-pkt->gps_lon_1e6) : (uint32_t)pkt->gps_lon_1e6;
         printf("[GS_PKT] link:%uMHz rssi:%d snr:%d seq:%u fsm:%u alt:%dcm vz:%dcms baro:%dcm bat:%dmV "
-               "gps:%u/%u pos:%c%lu.%06lu,%c%lu.%06lu galt:%dm accel:%d,%d,%d\r\n",
+               "vfh:%dcm vfv:%dcms "
+               "gps:%u/%u pos:%c%lu.%06lu,%c%lu.%06lu galt:%dm accel:%d,%d,%d "
+               "peer:%u pflags:0x%02X ph:%dcm pv:%dcms plink:0x%02X ploss:%u "
+               "pbaro:%dcm paz:%d pvfh:%dcm pvfv:%dcms pbarb:%u\r\n",
                (unsigned)((link == GS_LINK_920) ? 920U : 433U),
                (int)rssi, (int)snr, (unsigned)pkt->seq, (unsigned)pkt->fsm_state,
                (int)pkt->ekf_pos_z_cm, (int)pkt->ekf_vel_z_cms, (int)pkt->baro_alt_cm,
                (unsigned)pkt->bat_mv,
+               (int)pkt->vf_pos_z_cm, (int)pkt->vf_vel_z_cms,
                (unsigned)pkt->gps_sats, (unsigned)pkt->gps_fix,
                lat_sign, (unsigned long)(lat_abs / 1000000U), (unsigned long)(lat_abs % 1000000U),
                lon_sign, (unsigned long)(lon_abs / 1000000U), (unsigned long)(lon_abs % 1000000U),
                (int)pkt->gps_alt_m,
-               (int)pkt->imu_ax_mg, (int)pkt->imu_ay_mg, (int)pkt->imu_az_mg);
+               (int)pkt->imu_ax_mg, (int)pkt->imu_ay_mg, (int)pkt->imu_az_mg,
+               (unsigned)pkt->peer_fsm_state, (unsigned)pkt->peer_flags,
+               (int)pkt->peer_h_cm, (int)pkt->peer_v_cms,
+               (unsigned)pkt->peer_link, (unsigned)pkt->peer_loss_pmil,
+               (int)pkt->peer_baro_cm, (int)pkt->peer_az_cg,
+               (int)pkt->peer_vf_h_cm, (int)pkt->peer_vf_v_cms,
+               (unsigned)pkt->peer_bench_arb);
     }
+}
+
+/* ---- 433 收包延後交付（等模組附加的 RSSI 位元組）----------------------------
+ * E22 開啟 REG3 bit7 後，每收一包會在酬載「之後」再吐 1 個 RSSI 位元組。該位元組
+ * 在 UART 上比封包最後一個位元組晚整整一個字元時間才到：9600bps 下約 1.04ms。
+ * 而主迴圈是 tight-drain（while(u3_pop)），封包湊滿的當下環形緩衝通常還沒有它。
+ * ★ 舊寫法在封包湊滿當下「立刻 u3_pop()，拿不到就放棄」——在 9600bps 幾乎必定
+ *   拿不到，只有舊韌體時代 UART=115200bps（模組整包 burst 吐出、87µs/byte，
+ *   湊滿時 RSSI 早已在緩衝裡）才碰巧會成功。實測 log 完全吻合：有效 RSSI 只在
+ *   UART=115200 那段出現過，UART=9600 那段一次都沒有。
+ * 改法：湊滿封包後先暫存不交付，等下一個位元組到達才當 RSSI 取用並一起交付；
+ * 逾時則以 N/A 交付避免卡住。如此與 UART baud 無關，任何速率都正確。 */
+static TelemetryPacket_t s_pend_pkt;        /* 等待 RSSI 位元組的暫存封包 */
+static uint8_t           s_pend_crc_ok = 0; /* 該封包的 CRC 結果 */
+static uint32_t          s_pend_tick   = 0; /* 進入等待的時刻（逾時用） */
+static uint8_t           s_pend_valid  = 0; /* 1 = 有封包正在等 RSSI */
+
+/* ★2026-07-28 修正 #3：只有 CRC 過的封包才進延後交付。
+ * datasheet bit7 是「每一次無線接收」都附加 RSSI byte，不論我們自己的應用層
+ * CRC-16 過不過——CRC 失敗有兩種可能成因：(a) 真的是一筆完整、對齊正確的封包，
+ * 只是空中誤碼幾個位元；(b) sync 對齊本身就是巧合湊出來的假封包（雜訊或壞包
+ * 裡剛好出現 A5 5A），這種情況下「湊滿 116 bytes」跟模組實際的無線接收事件
+ * 邊界根本對不上，此時去吃下一個位元組當 RSSI，吃到的常常是下一筆封包的
+ * sync0，讓一次誤判擴大成連環錯位（正回饋失步）。CRC 失敗一律當場以 N/A 交付、
+ * 不消耗下一個位元組，情願少一筆 RSSI，不要放大既有的錯位。 */
+
+/* ★2026-07-28 修正 #2：命令 ACK 幀也是一次無線接收，bit7 開啟時模組同樣會在
+ * ACK 之後附加一個 RSSI byte，先前沒有任何人消化它，導致下一個位元組（通常是
+ * 下一包遙測的 sync0）被平白吃掉。用一個獨立旗標處理（ACK 不需要用到 RSSI 值，
+ * 純粹丟棄即可），同樣有逾時保護避免卡死。 */
+static uint32_t          s_pend_ack_tick  = 0;
+static uint8_t           s_pend_ack_skip  = 0; /* 1 = 下一個位元組是 ACK 的 RSSI byte，丟棄 */
+
+/* 交付一筆 433 封包：CRC 過 → 正常落地並印 [GS_PKT]；CRC 失敗 → 只印供人工判讀。 */
+static void gs_deliver_433(const TelemetryPacket_t *pkt, uint8_t crc_ok, int16_t rssi)
+{
+    if (crc_ok) {
+        gs_handle_packet(GS_LINK_433, pkt, rssi, GS_SNR_NA);
+    } else {
+        /* ★433 的 CRC 失敗以前從來沒進 [STATS]（gs_handle_packet 永遠傳 crc_ok=1），
+         * 所以 [STATS] 的 433 crc_err 結構上恆為 0、完全看不出鏈路品質。此處補上。 */
+        GsLoraTest_UpdateStats(GS_LINK_433, GS_RSSI_NA, GS_SNR_NA, 0 /* crc_err */);
+        /* CRC 失敗也印（不落地 SD/Flash、不動時間同步），供人工看收到什麼 */
+        printf("[GS_PKT?] link:433MHz CRC_BAD rssi:%d seq:%u fsm:%u alt:%dcm baro:%dcm bat:%dmV\r\n",
+               (int)rssi, (unsigned)pkt->seq, (unsigned)pkt->fsm_state,
+               (int)pkt->ekf_pos_z_cm, (int)pkt->baro_alt_cm, (unsigned)pkt->bat_mv);
+    }
+}
+
+/* ---- 433 原始位元組 hex dump（`e22 dump on`，見 gs_lora_test.c）--------------
+ * 印出 u3_pop() 吐出的每一個原始位元組，不論後續被解析成什麼——用來直接肉眼
+ *核對 RSSI byte 到底是不是「固定一個、在封包尾端」，不必再靠推論或統計反推。
+ * 每 16 個位元組換行，行首標流水序號方便對齊封包邊界。 */
+static void gs_raw_dump_byte(uint8_t b)
+{
+    static uint32_t s_dump_idx = 0;
+    if ((s_dump_idx % 16U) == 0U) {
+        printf("\r\n[E22RAW] %6lu: ", (unsigned long)s_dump_idx);
+    }
+    printf("%02X ", (unsigned)b);
+    s_dump_idx++;
 }
 
 #if GS_USB_SELFTEST
@@ -318,6 +454,9 @@ void GroundStation_Run(void)
 
     TelemRx_Init(&s_rx433);
     TelemRx_Init(&s_rx920);
+    AckRx_Init(&s_ack433);
+    AckRx_Init(&s_ack920);
+    s_last_920_tick = HAL_GetTick();   /* 從現在起算靜默時間，避免開機瞬間誤觸發重新武裝 */
     GsTimeSync_Init(&s_ts);
     gs_sd_open();
     gs_flash_init();
@@ -326,8 +465,12 @@ void GroundStation_Run(void)
 #if GS_USB_SELFTEST
     gs_usb_selftest_loop();   /* 不返回 */
 #else
-    /* 啟動 E22 USART3 中斷接收（E80 已於 main 進入連續 RX） */
-    HAL_UARTEx_ReceiveToIdle_IT(&huart3, s_u3_rxbuf, sizeof(s_u3_rxbuf));
+    /* 設定模式（`e22 freq/pwr/air`）會呼叫 HAL_UART_Init 而讓接收失效，
+     * 註冊重掛回呼讓驅動離開設定模式後自動救回來。必須在啟動接收之前註冊。 */
+    LoRaE22_SetRxRearmCallback(gs_u3_rx_rearm);
+
+    /* 啟動 E22 USART3 循環 DMA 接收（E80 已於 main 進入連續 RX） */
+    gs_u3_rx_rearm();
 
     for (;;) {
         /* GPS：新 fix 時更新地面牆鐘錨點 */
@@ -342,23 +485,72 @@ void GroundStation_Run(void)
          * 用 TelemRx_FeedAny「不過濾」：湊滿一筆就交出，CRC 失敗也印出來供除錯（看訊號品質）。 */
         uint8_t b;
         TelemetryPacket_t pkt;
+        uint8_t dump_on = GsLoraTest_RawDumpEnabled();
+
+        /* UART 溢位後位元組流缺了一段：解析器可能卡在半包，重置回「重找 sync」狀態，
+         * 並丟掉正在等 RSSI 的暫存（那個 RSSI 位元組多半已隨溢位一起掉了）。 */
+        if (s_u3_rx_desync) {
+            s_u3_rx_desync = 0U;
+            TelemRx_Init(&s_rx433);
+            AckRx_Init(&s_ack433);
+            s_pend_valid    = 0U;
+            s_pend_ack_skip = 0U;
+        }
+
         while (u3_pop(&b)) {
-            uint8_t crc_ok = 0;
-            if (TelemRx_FeedAny(&s_rx433, b, &pkt, &crc_ok)) {
-                int16_t rssi = GS_RSSI_NA;
-                uint8_t rssi_byte;
-                if (u3_pop(&rssi_byte)) {
-                    rssi = (int16_t)(-(256 - (int)rssi_byte));
-                }
-                if (crc_ok) {
-                    gs_handle_packet(GS_LINK_433, &pkt, rssi, GS_SNR_NA);   /* CRC 過：正常落地 + 印 [GS_PKT] */
-                } else {
-                    /* CRC 失敗也印（不落地 SD/Flash、不動時間同步），供人工看收到什麼 */
-                    printf("[GS_PKT?] link:433MHz CRC_BAD rssi:%d seq:%u fsm:%u alt:%dcm baro:%dcm bat:%dmV\r\n",
-                           (int)rssi, (unsigned)pkt.seq, (unsigned)pkt.fsm_state,
-                           (int)pkt.ekf_pos_z_cm, (int)pkt.baro_alt_cm, (unsigned)pkt.bat_mv);
+            if (dump_on) gs_raw_dump_byte(b);
+
+            /* 上一輪湊滿的封包正在等它的 RSSI 位元組：這個位元組就是了。
+             * 取用後 continue —— 它是模組附加的頻外資料，不可餵進任何解析器。 */
+            if (s_pend_valid) {
+                s_pend_valid = 0U;
+                gs_deliver_433(&s_pend_pkt, s_pend_crc_ok,
+                               (int16_t)(-(256 - (int)b)));
+                continue;
+            }
+            /* 上一輪的 ACK 幀正在等它的 RSSI 位元組：丟棄即可，ACK 不需要 RSSI 值。 */
+            if (s_pend_ack_skip) {
+                s_pend_ack_skip = 0U;
+                continue;
+            }
+            /* 命令 ACK（sync 0xAC/0xCA）與遙測（0xA5/0x5A）並排解析：AckRx 忽略非自身 sync
+             * 位元組，互不干擾。解出即印 [ACK]（走地面 printf→USART2，GUI 看得到）。 */
+            {
+                uint8_t aseq = 0, ast = 0, alen = 0;
+                char    atext[ACK_TEXT_MAX + 1];
+                if (AckRx_Feed(&s_ack433, b, &aseq, &ast, atext, &alen)) {
+                    printf("[ACK] link:433 seq:%u status:%s cmd:\"%s\"\r\n",
+                           (unsigned)aseq, ack_status_str(ast), atext);
+                    if (LoRaE22_RssiByteEnabled()) {
+                        s_pend_ack_tick  = HAL_GetTick();
+                        s_pend_ack_skip  = 1U;
+                    }
                 }
             }
+            uint8_t crc_ok = 0;
+            if (TelemRx_FeedAny(&s_rx433, b, &pkt, &crc_ok)) {
+                if (crc_ok && LoRaE22_RssiByteEnabled()) {
+                    /* ★ 延後交付：RSSI 位元組還沒到，先把封包暫存起來（見 s_pend_pkt 註解）。
+                     * 只對 CRC 過的封包延後——CRC 失敗的湊滿事件不保證是真的無線接收
+                     * 邊界，見上方修正 #3 註解。 */
+                    s_pend_pkt    = pkt;
+                    s_pend_crc_ok = crc_ok;
+                    s_pend_tick   = HAL_GetTick();
+                    s_pend_valid  = 1U;
+                } else {
+                    gs_deliver_433(&pkt, crc_ok, GS_RSSI_NA);   /* CRC 失敗，或模組未附加 RSSI：直接交付 */
+                }
+            }
+        }
+        /* 逾時保護：模組該吐的 RSSI 位元組沒來（訊號中斷/模組狀態異常）時，
+         * 不能讓暫存封包/ACK 永遠卡著不交付 —— 逾時就以 N/A 交付或直接放棄等待。
+         * 50ms 遠大於任何 baud 下的單一字元時間（9600bps 約 1.04ms），不會誤觸發。 */
+        if (s_pend_valid && (HAL_GetTick() - s_pend_tick) > 50U) {
+            s_pend_valid = 0U;
+            gs_deliver_433(&s_pend_pkt, s_pend_crc_ok, GS_RSSI_NA);
+        }
+        if (s_pend_ack_skip && (HAL_GetTick() - s_pend_ack_tick) > 50U) {
+            s_pend_ack_skip = 0U;
         }
 
         /* E80 920：DIO1 觸發則讀封包，payload 餵入同步FSM（含 RSSI/SNR） */
@@ -368,6 +560,14 @@ void GroundStation_Run(void)
             HAL_StatusTypeDef rx_st = LoRaE80_ReadPacket(s_e80buf, &el, &rssi, &snr);
             if (rx_st == HAL_OK) {
                 for (uint8_t i = 0; i < el; i++) {
+                    {
+                        uint8_t aseq = 0, ast = 0, alen = 0;
+                        char    atext[ACK_TEXT_MAX + 1];
+                        if (AckRx_Feed(&s_ack920, s_e80buf[i], &aseq, &ast, atext, &alen)) {
+                            printf("[ACK] link:920 seq:%u status:%s cmd:\"%s\"\r\n",
+                                   (unsigned)aseq, ack_status_str(ast), atext);
+                        }
+                    }
                     uint8_t crc_ok = 0;
                     if (TelemRx_FeedAny(&s_rx920, s_e80buf[i], &pkt, &crc_ok)) {
                         if (crc_ok) {
@@ -416,12 +616,25 @@ void GroundStation_Run(void)
         static uint32_t s_last_stat_report_tick = 0;
         if (now_tick - s_last_stat_report_tick >= 2000U) {
             s_last_stat_report_tick = now_tick;
-            printf("[GS_STAT] HW:433=%s 920=%s | 433 raw=%lu ok=%lu crc=%lu rsync=%lu | 920 ok=%lu crc=%lu rsync=%lu | pkts 433=%lu 920=%lu\r\n",
+            printf("[GS_STAT] HW:433=%s 920=%s | 433 raw=%lu ok=%lu crc=%lu rsync=%lu | 920 ok=%lu crc=%lu rsync=%lu | pkts 433=%lu 920=%lu | 920rearm=%lu\r\n",
                    lora433_ok ? "OK" : "OFF", lora920_ok ? "OK" : "OFF",
                    (unsigned long)s_u3_rx_bytes,
                    (unsigned long)s_rx433.ok, (unsigned long)s_rx433.crc_err, (unsigned long)s_rx433.resync,
                    (unsigned long)s_rx920.ok, (unsigned long)s_rx920.crc_err, (unsigned long)s_rx920.resync,
-                   (unsigned long)s_stat_433_cnt, (unsigned long)s_stat_920_cnt);
+                   (unsigned long)s_stat_433_cnt, (unsigned long)s_stat_920_cnt,
+                   (unsigned long)s_920_rearm_cnt);
+        }
+
+        /* 920 靜默看門狗：見上方 s_920_rearm_cnt 宣告處註解。
+         * 不用等 2 秒節流的 [GS_STAT] 區塊，每輪都檢查（成本只是一次 tick 比較），
+         * 但重新武裝本身每 GS_E80_REARM_MS 只會真的觸發一次（見下方對
+         * s_last_920_tick 的更新）。 */
+        if (lora920_ok && (now_tick - s_last_920_tick) >= GS_E80_REARM_MS) {
+            s_last_920_tick = now_tick;   /* 先重置計時，避免 StartRx 本身耗時導致連續觸發 */
+            s_920_rearm_cnt++;
+            printf("[GS_E80] 920 靜默 >=%lums，重新 StartRx（第 %lu 次）\r\n",
+                   (unsigned long)GS_E80_REARM_MS, (unsigned long)s_920_rearm_cnt);
+            (void)LoRaE80_StartRx();
         }
 
         /* 指示燈：心跳 / GPS fix / 接收活動 */

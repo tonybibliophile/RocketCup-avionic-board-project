@@ -33,7 +33,9 @@ extern "C" {
 /* === 參數（理由見 改進計劃.md P0-C 表） === */
 #define EKF_GUARD_BARO_GATE_SIGMA  5.0f     /* 5σ 標準卡方閘 */
 #define EKF_GUARD_BARO_GATE_MIN_M  25.0f    /* 絕對下限：防收斂後(5σ≈3m)誤拒真實氣壓暫態 */
-#define EKF_GUARD_BARO_REJECT_N    200U     /* 連續拒收 200 次（@200Hz ≈1.0s）→ DIVERGE */
+#define EKF_GUARD_BARO_REJECT_N    200U     /* 連續拒收 200 次（BMP388 現為 50Hz ODR，@50Hz ≈4.0s；
+                                              * 原註解假設的 200Hz 已隨 S4 改動不再成立，此值本身
+                                              * 是否要retune 待 S7 實測 σ 後一併決定，暫不變動） → DIVERGE */
 #define EKF_GUARD_BARO_TIMEOUT_MS  500U     /* 無接受 baro 逾時 */
 #define EKF_GUARD_P_POS_MAX        1.0e4f   /* 位置共變異數上限（σ=100m） */
 #define EKF_GUARD_P_VEL_MAX        2.5e3f   /* 速度共變異數上限（σ=50m/s） */
@@ -48,12 +50,17 @@ extern "C" {
 #define EKF_GUARD_NAN_STICKY_MS    5000U    /* NaN 重建後黏滯 5s（提示地面站） */
 #define EKF_GUARD_DIVERGE_RESET_MS 3000U    /* P1：DIVERGE 持續 3s → 垂直通道自救重置 */
 
-/* baro 創新值閘控：永遠接受更新（停用拒收機制，以氣壓為基準） */
+/* baro 創新值閘控：|y| > max(5·sqrt(S), 25m) 拒收（回傳 0）。
+ * 場測期間曾改為「永遠接受」（電梯測試以氣壓為唯一基準）；恢復飛行版行為 ——
+ * 單筆 ±10km 壞值不得直接餵進濾波器，連續拒收由 ekf.c 的 DIVERGE 機制接手
+ * （P1 垂直通道自救亦依賴本閘的拒收計數，停用時整條鏈為死碼）。 */
 static inline uint8_t ekf_guard_baro_accept(float y, float S)
 {
-    (void)y;
-    (void)S;
-    return 1U;   /* 停用氣壓拒收，永遠信任氣壓計 */
+    float gate = EKF_GUARD_BARO_GATE_SIGMA * sqrtf(S);
+    if (gate < EKF_GUARD_BARO_GATE_MIN_M) {
+        gate = EKF_GUARD_BARO_GATE_MIN_M;   /* 絕對下限：防收斂後(5σ≈3m)誤拒真實氣壓暫態 */
+    }
+    return (fabsf(y) <= gate) ? 1U : 0U;
 }
 
 /* 協方差對角夾限。回傳 1 = 有夾限發生（僅診斷用）。 */

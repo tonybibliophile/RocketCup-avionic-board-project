@@ -1,0 +1,34 @@
+==================================================
+       ROCKETCOM GPS ACCURACY METRICS REPORT      
+==================================================
+Session Mode   : Live Serial Monitor
+Source         : /dev/cu.usbserial-0001
+Report Time    : 2026-07-17 01:54:42
+
+• Start Time          : 01:54:34.653
+• End Time            : 01:54:41.650
+• First Fix Time      : 01:54:34.653
+• Time to First Fix   : 0.00 seconds
+• Total Data Packets  : 8
+• Fix Ratio           : 100.0%
+
+--------------------------------------------------
+             STATIC DRIFT STATISTICS              
+--------------------------------------------------
+• Average Latitude    : 22.99464802 deg
+• Average Longitude   : 120.21917276 deg
+• Valid GPS Fix Points: 46
+• CEP 50% Error Radius : 15.097 meters
+• 95% Error Circle     : 52.675 meters
+• Max Drift Distance   : 57.334 meters
+• Horizontal Std (N-S) : 6.483 meters
+• Horizontal Std (E-W) : 23.911 meters
+• Vertical Std (Alt)   : 1.052 meters
+• Altitude Range       : 159.0m to 163.0m
+
+--------------------------------------------------
+           COMPARISON TO REFERENCE GPS            
+--------------------------------------------------
+• Ref Coordinates     : 22.99510500, 120.21870300
+• Ref Source          : Manual Input
+• Distance to Reference: 69.923 meters

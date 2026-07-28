@@ -5,6 +5,8 @@
 #    make flash      — compile + upload via ST-Link
 #    make monitor    — open serial monitor, auto-detect port (Ctrl+A K to quit)
 #    make all        — compile + flash + monitor
+#    make flash-ground     — 地面站 RX-only（只收下行遙測，不可發射上行指令）
+#    make flash-ground-tx  — 地面站 TX-capable（可發射 arm/deploy/bench/... 等上行指令）
 #    make host-test  — run all host unit tests (no board needed)
 #    make clean      — remove build artifacts
 # ============================================================
@@ -22,6 +24,7 @@ BUILD_DIR  := firmware/main_flight_code/Debug
 ELF        := $(BUILD_DIR)/Main_AV_F407.elf
 BACKUP_ELF := $(BUILD_DIR)/Main_AV_F407_backup.elf
 GROUND_ELF := $(BUILD_DIR)/Main_AV_F407_ground.elf
+GROUND_TX_ELF := $(BUILD_DIR)/Main_AV_F407_ground_tx.elf
 BOARD_CFG  := firmware/main_flight_code/Core/Inc/board_config.h
 
 # ---- 版本標頭（開機橫幅顯示 git 版次 + 建置時間；語意化版號在 board_config.h::FIRMWARE_VERSION）----
@@ -34,9 +37,14 @@ FW_BUILD    := $(shell date '+%Y-%m-%d_%H:%M:%S')
 PORT      :=
 BAUD      := 460800
 
+# ---- 雙板燒錄：用 ST-Link 序號分辨主板/備板（同時插兩顆時 -c port=SWD 會無法分辨要接哪顆）----
+# 序號請在 local.mk 設定（不進版控），可用 `make list-stlinks` 查詢目前插著的 ST-Link SN
+PRIMARY_SN ?=
+BACKUP_SN  ?=
+
 # ============================================================
 
-.PHONY: build build-primary build-backup build-ground flash flash-primary flash-backup flash-ground flash-primary-only flash-ground-only monitor all clean host-test gen-version
+.PHONY: build build-primary build-backup build-ground build-ground-tx flash flash-primary flash-backup flash-ground flash-ground-tx flash-primary-only flash-ground-only flash-ground-tx-only flash-both list-stlinks monitor all clean host-test gen-version
 
 ## 產生版本標頭（git 版次 + 建置時間），供開機橫幅顯示；每次建置前自動更新。
 gen-version:
@@ -86,30 +94,70 @@ flash-backup: build-backup
 	@test -n "$(CUBEPROG)" || (echo "STM32_Programmer_CLI 未找到，請確認已安裝 STM32CubeIDE"; exit 1)
 	"$(CUBEPROG)" -c port=SWD mode=UR -w "$(CURDIR)/$(BACKUP_ELF)" -rst
 
-## 編譯地面站（BOARD_ROLE=ROLE_GROUND）
+## 編譯地面站 RX-only 版（BOARD_ROLE=ROLE_GROUND, GS_LORA_TX_ENABLE=0）：
+## 只能「接收」下行遙測；上行發射類指令（arm/deploy/bench/...）由韌體拒絕，非 GUI 攔截。
 build-ground: gen-version
 	@test -n "$(GCC_PATH)" || (echo "STM32CubeIDE 工具鏈未找到，請確認已安裝 STM32CubeIDE"; exit 1)
 	@sed -i '' 's|ROLE_[A-Z]*   /\* MAKE_ROLE_LINE|ROLE_GROUND   /* MAKE_ROLE_LINE|' "$(BOARD_CFG)"
-	@echo "[build-ground] BOARD_ROLE = ROLE_GROUND"
+	@sed -i '' 's|GS_LORA_TX_ENABLE [01]   /\* MAKE_GS_TX_LINE|GS_LORA_TX_ENABLE 0   /* MAKE_GS_TX_LINE|' "$(BOARD_CFG)"
+	@echo "[build-ground] BOARD_ROLE = ROLE_GROUND, GS_LORA_TX_ENABLE = 0（RX-only，不可發射）"
 	@export PATH="$(GCC_PATH):$$PATH" && $(MAKE) -C $(BUILD_DIR) all; STATUS=$$?; \
 	  sed -i '' 's|ROLE_[A-Z]*   /\* MAKE_ROLE_LINE|ROLE_PRIMARY   /* MAKE_ROLE_LINE|' "$(BOARD_CFG)"; touch "$(BOARD_CFG)"; \
 	  if [ $$STATUS -ne 0 ]; then echo "[build-ground] 建置失敗"; exit $$STATUS; fi
 	@cp "$(ELF)" "$(GROUND_ELF)" && echo "[build-ground] -> $(GROUND_ELF)"
 
-## 燒錄地面站 binary（會先 build-ground）
+## 燒錄地面站 RX-only binary（會先 build-ground）
 flash-ground: build-ground
 	@test -n "$(CUBEPROG)" || (echo "STM32_Programmer_CLI 未找到，請確認已安裝 STM32CubeIDE"; exit 1)
 	"$(CUBEPROG)" -c port=SWD mode=UR -w "$(CURDIR)/$(GROUND_ELF)" -rst
+
+## 編譯地面站 TX-capable 版（BOARD_ROLE=ROLE_GROUND, GS_LORA_TX_ENABLE=1）：
+## 完整功能，可發射上行指令（ping/arm/disarm/bench/recalib/recovery/deploy/tx）。
+build-ground-tx: gen-version
+	@test -n "$(GCC_PATH)" || (echo "STM32CubeIDE 工具鏈未找到，請確認已安裝 STM32CubeIDE"; exit 1)
+	@sed -i '' 's|ROLE_[A-Z]*   /\* MAKE_ROLE_LINE|ROLE_GROUND   /* MAKE_ROLE_LINE|' "$(BOARD_CFG)"
+	@sed -i '' 's|GS_LORA_TX_ENABLE [01]   /\* MAKE_GS_TX_LINE|GS_LORA_TX_ENABLE 1   /* MAKE_GS_TX_LINE|' "$(BOARD_CFG)"
+	@echo "[build-ground-tx] BOARD_ROLE = ROLE_GROUND, GS_LORA_TX_ENABLE = 1（可發射上行指令）"
+	@export PATH="$(GCC_PATH):$$PATH" && $(MAKE) -C $(BUILD_DIR) all; STATUS=$$?; \
+	  sed -i '' 's|ROLE_[A-Z]*   /\* MAKE_ROLE_LINE|ROLE_PRIMARY   /* MAKE_ROLE_LINE|' "$(BOARD_CFG)"; \
+	  sed -i '' 's|GS_LORA_TX_ENABLE [01]   /\* MAKE_GS_TX_LINE|GS_LORA_TX_ENABLE 0   /* MAKE_GS_TX_LINE|' "$(BOARD_CFG)"; \
+	  touch "$(BOARD_CFG)"; \
+	  if [ $$STATUS -ne 0 ]; then echo "[build-ground-tx] 建置失敗"; exit $$STATUS; fi
+	@cp "$(ELF)" "$(GROUND_TX_ELF)" && echo "[build-ground-tx] -> $(GROUND_TX_ELF)"
+
+## 燒錄地面站 TX-capable binary（會先 build-ground-tx；⚠可發射上行指令，僅限授權操作者）
+flash-ground-tx: build-ground-tx
+	@test -n "$(CUBEPROG)" || (echo "STM32_Programmer_CLI 未找到，請確認已安裝 STM32CubeIDE"; exit 1)
+	"$(CUBEPROG)" -c port=SWD mode=UR -w "$(CURDIR)/$(GROUND_TX_ELF)" -rst
 
 ## 僅燒錄主航電 binary（不重新編譯，直接燒錄現有 ELF）
 flash-primary-only:
 	@test -n "$(CUBEPROG)" || (echo "STM32_Programmer_CLI 未找到，請確認已安裝 STM32CubeIDE"; exit 1)
 	"$(CUBEPROG)" -c port=SWD mode=UR -w "$(CURDIR)/$(ELF)" -rst
 
-## 僅燒錄地面站 binary（不重新編譯，直接燒錄現有 ELF）
+## 僅燒錄地面站 RX-only binary（不重新編譯，直接燒錄現有 ELF）
 flash-ground-only:
 	@test -n "$(CUBEPROG)" || (echo "STM32_Programmer_CLI 未找到，請確認已安裝 STM32CubeIDE"; exit 1)
 	"$(CUBEPROG)" -c port=SWD mode=UR -w "$(CURDIR)/$(GROUND_ELF)" -rst
+
+## 僅燒錄地面站 TX-capable binary（不重新編譯，直接燒錄現有 ELF）
+flash-ground-tx-only:
+	@test -n "$(CUBEPROG)" || (echo "STM32_Programmer_CLI 未找到，請確認已安裝 STM32CubeIDE"; exit 1)
+	"$(CUBEPROG)" -c port=SWD mode=UR -w "$(CURDIR)/$(GROUND_TX_ELF)" -rst
+
+## 列出目前接上的 ST-Link 序號（用來填 local.mk 的 PRIMARY_SN / BACKUP_SN）
+list-stlinks:
+	@test -n "$(CUBEPROG)" || (echo "STM32_Programmer_CLI 未找到，請確認已安裝 STM32CubeIDE"; exit 1)
+	@"$(CUBEPROG)" --list 2>&1 | grep -A2 "ST-LINK SN"
+
+## 主板+備板兩顆一起燒（依序：先編譯兩份 binary，再各自對指定 SN 的 ST-Link 燒錄一次）
+## 用法：兩板 ST-Link 都插上後，在 local.mk 設定 PRIMARY_SN / BACKUP_SN 再執行 `make flash-both`
+flash-both: build-primary build-backup
+	@test -n "$(CUBEPROG)" || (echo "STM32_Programmer_CLI 未找到，請確認已安裝 STM32CubeIDE"; exit 1)
+	@test -n "$(PRIMARY_SN)" -a -n "$(BACKUP_SN)" || \
+	  (echo "[ERROR] 請先在 local.mk 設定 PRIMARY_SN / BACKUP_SN（可用 make list-stlinks 查詢兩顆 ST-Link 的序號）"; exit 1)
+	"$(CUBEPROG)" -c port=SWD sn=$(PRIMARY_SN) mode=UR -w "$(CURDIR)/$(ELF)" -rst
+	"$(CUBEPROG)" -c port=SWD sn=$(BACKUP_SN) mode=UR -w "$(CURDIR)/$(BACKUP_ELF)" -rst
 
 
 ## Open serial monitor (auto-detect USB serial port; quit with Ctrl+A then K)

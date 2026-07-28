@@ -19,6 +19,7 @@
 #include "w25qxx.h"
 #include "spi3_bus.h"   /* SPI3 與 E80 920MHz LoRa 共用，CS 期間須持互斥鎖 */
 #include "crc16.h"      /* P1：CRC-16/CCITT-FALSE 單一實作 */
+#include "cmsis_os2.h"  /* WaitForReady 讓出 CPU 用 osDelay（排程器啟動後） */
 #include <stdarg.h>
 #include <stddef.h>     /* offsetof：Flash_DumpAll 欄位解析 */
 #include <stdio.h>
@@ -39,6 +40,10 @@
 #define W25QXX_WRITE_TIMEOUT_MS     500U
 /* Sector Erase 最長等待 */
 #define W25QXX_SECTOR_ERASE_TIMEOUT 400U
+/* 64KB Block Erase 最長等待。W25Q128JV datasheet max ~2s；設 2000 等於零餘裕，
+ * 晶片老化/高溫 + WaitForReady 1ms poll 粒度會偶發 ERR_TIMEOUT（進而害 FlashRing_Init
+ * 被跳過、留下髒寫入頭），故留 2× 餘裕。 */
+#define W25QXX_BLOCK64_ERASE_TIMEOUT 4000U
 /* Chip Erase 最長等待 (100 秒) */
 #define W25QXX_CHIP_ERASE_TIMEOUT   100000U
 
@@ -96,12 +101,31 @@ W25QXX_StatusTypeDef W25QXX_ReadStatusReg1(uint8_t *status)
     return W25QXX_OK;
 }
 
+/* 緊輪詢次數上限：約 1ms（每次輪詢含一次 SPI 交易，遠快於此）。
+ * page program 典型 tPP ~0.4-0.7ms，在此階段內就會結束，不再被 HAL_Delay(1) 的
+ * tick 量化成 1~2ms（HAL_Delay 內部多加 1 tick 保證最小等待）。
+ * sector/block erase 等真正需要毫秒級的操作，超過本上限後落入 w25qxx_yield_1ms()。 */
+#define W25QXX_WAIT_SPIN_POLLS 200U
+
+/* 排程器啟動前（W25QXX_Init 於 main.c 開機序列呼叫，早於 osKernelStart）osDelay 無效，
+ * 須 fallback 到 HAL_Delay；判斷方式與 main.c 既有的 printf retarget 同一套慣例
+ * （osKernelGetState()==osKernelRunning && __get_IPSR()==0，即排程器已跑且非中斷內）。 */
+static inline void w25qxx_yield_1ms(void)
+{
+    if (osKernelGetState() == osKernelRunning && __get_IPSR() == 0U) {
+        osDelay(1);
+    } else {
+        HAL_Delay(1);
+    }
+}
+
 /* ============================================================
  *  W25QXX_WaitForReady
  * ============================================================ */
 W25QXX_StatusTypeDef W25QXX_WaitForReady(uint32_t timeout_ms)
 {
     uint32_t start = HAL_GetTick();
+    uint32_t spins = 0;
     uint8_t  status;
 
     while (1)
@@ -115,8 +139,11 @@ W25QXX_StatusTypeDef W25QXX_WaitForReady(uint32_t timeout_ms)
         if ((HAL_GetTick() - start) >= timeout_ms)
             return W25QXX_ERR_TIMEOUT;
 
-        /* 短暫讓出 CPU，在 FreeRTOS 環境下可改為 osDelay(1) */
-        HAL_Delay(1);
+        /* 前 W25QXX_WAIT_SPIN_POLLS 次緊迴圈直接重讀 SR1（無延遲）；
+         * 短操作（page program）在此階段結束，長操作（erase）才讓出 CPU。 */
+        if (++spins > W25QXX_WAIT_SPIN_POLLS) {
+            w25qxx_yield_1ms();
+        }
     }
 }
 
@@ -314,6 +341,32 @@ W25QXX_StatusTypeDef W25QXX_EraseSector(uint32_t sectorAddr)
 }
 
 /* ============================================================
+ *  W25QXX_EraseBlock64K (64 KB)
+ * ============================================================ */
+W25QXX_StatusTypeDef W25QXX_EraseBlock64K(uint32_t blockAddr)
+{
+    W25QXX_StatusTypeDef st;
+
+    st = W25QXX_WaitForReady(W25QXX_WRITE_TIMEOUT_MS);
+    if (st != W25QXX_OK) return st;
+
+    st = send_write_enable();
+    if (st != W25QXX_OK) return st;
+
+    uint8_t cmd[4];
+    cmd[0] = W25QXX_CMD_BLOCK_ERASE_64KB;
+    cmd[1] = (uint8_t)((blockAddr >> 16) & 0xFF);
+    cmd[2] = (uint8_t)((blockAddr >>  8) & 0xFF);
+    cmd[3] = (uint8_t)( blockAddr        & 0xFF);
+
+    CS_LOW();
+    if (spi_transmit(cmd, 4) != HAL_OK) { CS_HIGH(); return W25QXX_ERR_SPI; }
+    CS_HIGH();
+
+    return W25QXX_WaitForReady(W25QXX_BLOCK64_ERASE_TIMEOUT);
+}
+
+/* ============================================================
  *  W25QXX_EraseChip
  * ============================================================ */
 W25QXX_StatusTypeDef W25QXX_EraseChip(void)
@@ -456,6 +509,7 @@ static uint32_t s_ring_packet_count = 0;
 static uint16_t s_ring_seq          = 0;
 static volatile uint8_t  s_ring_erase_allowed = 1;  /* P0-E：0 = 飛行中禁同步擦除 */
 static volatile uint32_t s_ring_drop_count    = 0;  /* P0-E：池耗盡丟棄計數 */
+static volatile uint8_t  s_ring_erase_pct     = 0;  /* 預擦即時進度百分比 0..100 */
 
 /* P0-E：目前預擦池大小（bytes）。位址數學統一在 flash_ring_math.h（host 已測）；
  * erased_end 採正規化語意（恆 ∈ [BASE, END]），修復舊版 END+1 瞬時態在寫入指標
@@ -470,7 +524,7 @@ uint16_t ring_crc16(const uint8_t *data, uint16_t len)
     return crc16_ccitt_false(data, len);   /* P1：統一至 crc16.h 單一實作（符號保留，多處引用） */
 }
 
-void FlashRing_Init(void)
+void FlashRing_InitEx(void (*progress_cb)(uint32_t current, uint32_t total))
 {
     printf("[FLASH_RING] Init start...\r\n");
 
@@ -515,12 +569,19 @@ void FlashRing_Init(void)
         printf("[FLASH_RING] Resumed from 0x%06lX\r\n", s_ring_write_addr);
     }
 
-    /* --- 預擦 FLASH_RING_PREERASE_N 個 Sector --- */
+    /* --- 預擦 FLASH_RING_PREERASE_TARGET 個 Sector --- */
     uint32_t erase_addr = s_ring_write_addr & ~((uint32_t)(W25QXX_SECTOR_SIZE - 1));
-    for (int i = 0; i < FLASH_RING_PREERASE_N; i++) {
+    for (int i = 0; i < FLASH_RING_PREERASE_TARGET; i++) {
         W25QXX_EraseSector(erase_addr);
         HAL_IWDG_Refresh(&hiwdg);
-        printf("[FLASH_RING] Pre-erase %2d/%d @ 0x%06lX\r\n", i + 1, FLASH_RING_PREERASE_N, erase_addr);
+        s_ring_erase_pct = (uint8_t)(((uint32_t)(i + 1) * 100U) / FLASH_RING_PREERASE_TARGET);
+        if (progress_cb) {
+            progress_cb(i + 1, FLASH_RING_PREERASE_TARGET);
+        } else {
+            if ((i + 1) % 96 == 0 || (i + 1) == FLASH_RING_PREERASE_TARGET) {
+                printf("[FLASH_RING] Pre-erase %4d/%d @ 0x%06lX\r\n", i + 1, FLASH_RING_PREERASE_TARGET, erase_addr);
+            }
+        }
         erase_addr = ring_erase_advance(erase_addr);
     }
     s_ring_erased_end   = erase_addr;
@@ -529,6 +590,36 @@ void FlashRing_Init(void)
 
     printf("[FLASH_RING] Ready. Write: 0x%06lX, Erased to: 0x%06lX\r\n",
            s_ring_write_addr, s_ring_erased_end);
+}
+
+void FlashRing_Init(void)
+{
+    FlashRing_InitEx(NULL);
+}
+
+/* 只擦除環形緩衝區（Block 1..255, 0x010000~0xFFFFFF），保留 Sector 0（校準/mag/LoRa）
+ * 與任務總結區（皆位於 Block 0）。以 64KB Block Erase 逐塊擦除（255 次，遠快於 4080 次
+ * Sector Erase），每塊擦完餵一次狗。每次 SPI 交易經 CS_LOW/CS_HIGH 自行鎖/解鎖 SPI3，
+ * 呼叫端不需另包外層鎖（見 main.c flash erase 指令處說明）；呼叫端應放寬 IWDG 視窗。
+ * 擦完由呼叫端跑 FlashRing_Init() 重掃寫入頭。 */
+W25QXX_StatusTypeDef FlashRing_EraseAll(void)
+{
+    uint32_t addr = FLASH_RINGBUF_ADDR;   /* 0x010000，64KB 對齊 */
+    uint32_t block_idx = 0;
+    while (addr <= FLASH_RINGBUF_END) {
+        W25QXX_StatusTypeDef st = W25QXX_EraseBlock64K(addr);
+        if (st != W25QXX_OK) {
+            printf("[FLASH_RING] EraseAll FAILED @ 0x%06lX, err=%d\r\n", addr, (int)st);
+            return st;
+        }
+        HAL_IWDG_Refresh(&hiwdg);
+        if ((++block_idx & 0x1F) == 0) {
+            printf("[FLASH_RING] Erasing... %lu/255 blocks\r\n", (unsigned long)block_idx);
+        }
+        addr += W25QXX_BLOCK_SIZE_64K;
+    }
+    printf("[FLASH_RING] Ring buffer erased (%lu blocks).\r\n", (unsigned long)block_idx);
+    return W25QXX_OK;
 }
 
 W25QXX_StatusTypeDef FlashRing_WritePacket(FlashRingPacket_t *pkt)
@@ -613,6 +704,11 @@ uint8_t FlashRing_PreEraseOne(void)
 uint32_t FlashRing_GetPoolSectors(void)
 {
     return ring_pool_bytes() / W25QXX_SECTOR_SIZE;
+}
+
+uint8_t FlashRing_GetErasePct(void)
+{
+    return s_ring_erase_pct;
 }
 
 uint32_t FlashRing_GetDropCount(void)
@@ -827,7 +923,7 @@ void Flash_DumpAll(void)
     }
 
     /* === [3] Ring Buffer：前 3 封包 + 空滿判斷 === */
-    const uint16_t ring_preview = (uint16_t)(FLASH_RING_PACKET_SIZE * 3);  /* 240 bytes */
+    const uint16_t ring_preview = (uint16_t)(FLASH_RING_PACKET_SIZE * 3);  /* 384 bytes */
     printf("\r\n[3] Ring Buffer  0x%06X ~ 0x%06X  (%u MB)\r\n",
            (unsigned int)FLASH_RINGBUF_ADDR,
            (unsigned int)FLASH_RINGBUF_END,

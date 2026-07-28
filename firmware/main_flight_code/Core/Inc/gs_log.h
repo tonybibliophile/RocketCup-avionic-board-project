@@ -3,7 +3,7 @@
  * ===========================================================================
  * 地面站每收到一筆有效下行遙測（TelemetryPacket_t），就組一筆 GsLogRecord_t：
  *   原始火箭封包（完整保留，後處理可解所有欄位）
- *   + 鏈路來源/品質（E22 433 透傳無 RSSI；E80 920 有 RSSI/SNR）
+ *   + 鏈路來源/品質（E22 433：開 REG3 bit7 才有逐包 RSSI、恆無 SNR；E80 920 有 RSSI/SNR）
  *   + 地面接收/對齊時間（rx tick、GPS 紀律當日 UTC、對齊後 UTC、rocket↔ground 偏移）
  *   + 地面站自身 GPS。
  *
@@ -30,7 +30,8 @@ extern "C" {
 #define GS_LINK_433   0U   /* E22 433MHz（UART3 透傳） */
 #define GS_LINK_920   1U   /* E80 920MHz（SX126x SPI3） */
 
-/* 433 透傳無逐包 RSSI/SNR → 填哨兵 */
+/* 沒有該項資訊時填哨兵。433 恆無 SNR；433 的 RSSI 只在 E22 開啟 REG3 bit7
+ * （lora_e22.c E22_RSSI_BYTE_EN）且成功剝到那個附加位元組時才有值。 */
 #define GS_RSSI_NA   ((int16_t)-32768)
 #define GS_SNR_NA    ((int16_t)-32768)
 
@@ -64,8 +65,9 @@ typedef struct __attribute__((packed)) {
 #define GS_LOG_MAGIC0  0x47U
 #define GS_LOG_MAGIC1  0x53U
 
-/* CSV 一行建議緩衝大小（含結尾 \r\n\0 餘量）。 */
-#define GS_LOG_CSV_MAX  320U
+/* CSV 一行建議緩衝大小（含結尾 \r\n\0 餘量）。含本板 VF + 主/副協同 peer 欄
+ * （baro/accel/VF 全量）後再放寬（表頭實測 411 bytes，512 留餘裕）。 */
+#define GS_LOG_CSV_MAX  512U
 
 /**
  * @brief 組一筆紀錄：填 magic、各欄位、原始封包，並算 CRC16。

@@ -11,6 +11,8 @@
 #include "usbd_cdc_if.h"
 #include "usb_device.h"
 
+#include "gs_lora_test.h"
+
 /* 收/送使用者緩衝 */
 static uint8_t UserRxBufferFS[APP_RX_DATA_SIZE];
 static uint8_t UserTxBufferFS[APP_TX_DATA_SIZE];
@@ -79,8 +81,8 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t *pbuf, uint16_t length)
 
 static int8_t CDC_Receive_FS(uint8_t *Buf, uint32_t *Len)
 {
-    /* 地面站不處理 PC→板資料，但仍重新掛載接收以免 OUT 端點停滯 */
-    (void)Len;
+    /* 將 PC 傳入的 USB CDC 資料餵入指令緩衝區（地面站與航電板皆支援 USB CDC CLI） */
+    GsLoraTest_FeedRxBuffer(Buf, *Len);
     USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
     USBD_CDC_ReceivePacket(&hUsbDeviceFS);
     return (int8_t)USBD_OK;
@@ -103,6 +105,19 @@ uint8_t CDC_Transmit_FS(uint8_t *Buf, uint16_t Len)
     }
     USBD_CDC_SetTxBuffer(&hUsbDeviceFS, Buf, Len);
     return USBD_CDC_TransmitPacket(&hUsbDeviceFS);
+}
+
+uint8_t CDC_TxBusy(void)
+{
+    /* 前一筆 CDC 傳輸是否仍在進行（非同步，經 IN 端點中斷清除 TxState）。
+     * 未列舉/未連線（pClassData 為 NULL）視為「不忙」，讓呼叫端據此直接放行/交由
+     * CDC_Transmit_FS 回 USBD_FAIL。printf 直通 USB（見 main.c _write）用它判斷共用
+     * 靜態緩衝是否可安全覆寫。 */
+    USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
+    if (hcdc == NULL) {
+        return 0U;
+    }
+    return (hcdc->TxState != 0U) ? 1U : 0U;
 }
 
 #endif /* FEATURE_USB_CDC */

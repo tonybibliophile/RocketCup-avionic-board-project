@@ -71,6 +71,7 @@ typedef struct {
     uint8_t  ok;            /* 1 = Init/通訊正常 */
     int32_t  raw[3];        /* 最近一次 18-bit 原始計數 X/Y/Z */
     int32_t  offset[3];     /* SET/RESET 估計之橋路偏移 (counts) */
+    int32_t  hard_iron_offset[3]; /* Flash 載入的環境硬鐵偏移 (counts) */
     float    gauss[3];      /* 校準後磁場 (Gauss) X/Y/Z */
     float    heading_deg;   /* 水平假設下的粗略磁航向 (deg, 0..360)；僅供診斷 */
     uint32_t reads_ok;      /* 成功量測次數 */

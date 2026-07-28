@@ -21,6 +21,9 @@ extern USBD_CDC_ItfTypeDef USBD_Interface_fops_FS;
 /** @brief 經 CDC 傳一段資料給 PC。回傳 USBD_OK / USBD_BUSY（前一筆未送完）。 */
 uint8_t CDC_Transmit_FS(uint8_t *Buf, uint16_t Len);
 
+/** @brief 前一筆 CDC 傳輸是否仍在進行中（未連線視為不忙，回 0）。 */
+uint8_t CDC_TxBusy(void);
+
 #ifdef __cplusplus
 }
 #endif

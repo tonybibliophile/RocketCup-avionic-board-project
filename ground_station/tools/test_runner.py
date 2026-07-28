@@ -50,13 +50,16 @@ TEST_DURATION = 30  # 完整 HIL 測試監聽時間 (秒)
 MONITOR_DURATION = 0   # --monitor 模式持續時間 (秒，0 = 無限)
 
 # HIL 斷言門檻
-EXPECTED_MIN_BMI088_A = 1550.0
-EXPECTED_MIN_BMI088_G = 1950.0
-EXPECTED_MIN_ADXL375  = 3100.0
-EXPECTED_MIN_BMP388   = 140.0
-EXPECTED_MIN_MMC5983  = 80.0
-EXPECTED_MIN_GPS      = 1.0
-EXPECTED_MIN_RING_PACKETS = 300
+# ±5% 區間、含上界（不只下界）：舊版只查下限，抓不到定時器暴走（例如某感測器
+# 意外跑到 2 倍速率仍會「通過」）。這批數字對應 S4/S5 韌體改動後的實際目標速率
+# （陀螺 1000Hz、加速度/ADXL 400Hz、BMP388 50Hz、MMC5983/GPS 未變）；舊值
+# （1550/1950/3100/140）編碼的是已作廢的 1.6/2.0/3.2kHz 設計，早已對不上現況。
+EXPECTED_BMI088_A = (380.0, 420.0)
+EXPECTED_BMI088_G = (950.0, 1050.0)
+EXPECTED_ADXL375  = (380.0, 420.0)
+EXPECTED_BMP388   = (47.0, 53.0)
+EXPECTED_MMC5983  = (95.0, 105.0)
+EXPECTED_MIN_GPS  = 1.0   # GPS 未變動，維持只查下限（無精確上界可查）
 # ==================================================
 
 def run_command(cmd, cwd=None, env=None):
@@ -388,6 +391,9 @@ def monitor_serial_and_verify():
     health_bad_lines = []     # 開機 5s 寬限後出現的非零 [HEALTH] 行
     loop_max_us_seen = 0      # [LOOP] max_us 全程最大值
     flash_pool_first = None   # [FLASH] pool 首見值
+    flash_pool_target = None  # [FLASH] pool=N/target 的 target（動態解析，不寫死；
+                               # FLASH_RING_PREERASE_TARGET 本身已改過好幾次，硬編數字
+                               # 只會再度過時，直接讀韌體印出的分母才是唯一真相來源）
     flash_pool_last  = None   # [FLASH] pool 最後值
     stack_min = {}            # [STACK] 各任務歷史最低剩餘 bytes
     t0_boot = time.time()
@@ -437,10 +443,11 @@ def monitor_serial_and_verify():
                 if ml:
                     loop_max_us_seen = max(loop_max_us_seen, int(ml.group(1)))
 
-                # ── P1：[FLASH] pool=N/64 背景預擦進度 ──
+                # ── P1：[FLASH] pool=N/target 背景預擦進度（target 動態解析，見上方註解） ──
                 mp = re.search(r"\[FLASH\]\s*pool=(\d+)/(\d+)", line)
                 if mp:
                     val = int(mp.group(1))
+                    flash_pool_target = int(mp.group(2))
                     if flash_pool_first is None: flash_pool_first = val
                     flash_pool_last = val
 
@@ -470,25 +477,36 @@ def monitor_serial_and_verify():
         return False
 
     avg = lambda lst: sum(lst)/len(lst)
-    results = {
-        "BMI088 Accel": (avg(bmi_acc_rates), EXPECTED_MIN_BMI088_A),
-        "BMI088 Gyro" : (avg(bmi_gyro_rates), EXPECTED_MIN_BMI088_G),
-        "ADXL375"     : (avg(adxl_rates),     EXPECTED_MIN_ADXL375),
-        "BMP388"      : (avg(bmp_rates),       EXPECTED_MIN_BMP388),
-        "MMC5983MA"   : (avg(mmc_rates),       EXPECTED_MIN_MMC5983),
-        "GPS"         : (avg(gps_rates),       EXPECTED_MIN_GPS),
+    range_results = {
+        "BMI088 Accel": (avg(bmi_acc_rates),  EXPECTED_BMI088_A),
+        "BMI088 Gyro" : (avg(bmi_gyro_rates), EXPECTED_BMI088_G),
+        "ADXL375"     : (avg(adxl_rates),     EXPECTED_ADXL375),
+        "BMP388"      : (avg(bmp_rates),      EXPECTED_BMP388),
+        "MMC5983MA"   : (avg(mmc_rates),      EXPECTED_MMC5983),
     }
     failures = []
-    for name, (val, thr) in results.items():
-        ok = val >= thr
+    for name, (val, (lo, hi)) in range_results.items():
+        ok = lo <= val <= hi
         sym = "[OK]" if ok else "[ERROR]"
-        print(f"  {sym} {name}: {val:.1f} Hz (>= {thr})")
-        if not ok: failures.append(f"{name} 過低 ({val:.1f}Hz)")
+        print(f"  {sym} {name}: {val:.1f} Hz (應在 [{lo}, {hi}] 區間)")
+        if not ok: failures.append(f"{name} 超出預期區間 ({val:.1f}Hz，應為 [{lo},{hi}])")
 
-    print(f"\n  Flash Ring: {'[OK]' if flash_ring_ready else '[ERROR]'} ready | pkt={flash_ring_final_pkt} (>= {EXPECTED_MIN_RING_PACKETS})")
-    if not flash_ring_ready: failures.append("Flash Ring 未就緒")
-    if flash_ring_final_pkt < EXPECTED_MIN_RING_PACKETS:
-        failures.append(f"Flash pkt 不足 ({flash_ring_final_pkt})")
+    gps_val = avg(gps_rates)
+    gps_ok = gps_val >= EXPECTED_MIN_GPS
+    print(f"  {'[OK]' if gps_ok else '[ERROR]'} GPS: {gps_val:.1f} Hz (>= {EXPECTED_MIN_GPS})")
+    if not gps_ok: failures.append(f"GPS 過低 ({gps_val:.1f}Hz)")
+
+    # Flash Ring：S3.1（PAD/PAD_ARMED 完全不寫入，整池保留給飛行）落地後，本 HIL 腳本
+    # 是純被動監聽、不主動送 ARM/模擬起飛，全程停在 PAD → 飛行封包數本該恆為 0，這是
+    # 新的預期行為（正面驗證），不是待補的舊 EXPECTED_MIN_RING_PACKETS 下限失效。
+    # flash_ring_ready（開機 bulk 預擦是否完成，見 main.c FlashRing_InitEx）才是這裡
+    # 唯一還有意義的硬性檢查——若要驗證飛行中真的會寫入，需改走能驅動 FSM 進 BOOST
+    # 的測試路徑（例如上行測試指令模擬起飛），不在本腳本範圍內。
+    print(f"\n  Flash Ring: {'[OK]' if flash_ring_ready else '[ERROR]'} ready")
+    if not flash_ring_ready: failures.append("Flash Ring 未就緒（開機預擦未完成或逾時，見 TEST_DURATION 是否 > ~48s）")
+    print(f"  Flash pkt（PAD 態應恆為 0，S3.1）: {flash_ring_final_pkt}")
+    if flash_ring_final_pkt != 0:
+        failures.append(f"Flash pkt 非 0 ({flash_ring_final_pkt})——PAD/PAD_ARMED 不應寫入，檢查是否已進入 BOOST 或 S3.1 邏輯回歸")
 
     # ── P1：健康位斷言（開機 5s 寬限後必須全程 sens=0 ekf=0） ──
     if health_bad_lines:
@@ -510,15 +528,21 @@ def monitor_serial_and_verify():
     else:
         print("  [WARNING] 未收到 [LOOP] 行（韌體版本過舊?）")
 
-    # ── P1：[FLASH] pool 背景預擦進度（30s 內應自 ~10 持續增長） ──
+    # ── P1：[FLASH] pool 背景預擦進度 ──
+    # 開機 bulk 預擦（main.c FlashRing_InitEx，~target×50ms，例如 960 sectors≈48s）已在
+    # 主迴圈啟動前把池子一次擦滿；主迴圈裡殘留的背景 PreEraseOne 只在 INIT/PAD 且池未達標
+    # 時才印 [FLASH] pool 行（P0-E 安全網，見 main.c）。故本監聽視窗完全收不到這行是新
+    # 設計下的正常情況（代表 bulk 預擦已完成、沒有缺口要補），不再代表韌體版本過舊。
     if flash_pool_first is not None:
-        grew = flash_pool_last >= flash_pool_first + 5 or flash_pool_last >= 64
+        target = flash_pool_target or flash_pool_last  # 保底：萬一沒解析到分母，退化用最後觀測值當基準
+        grew = flash_pool_last >= flash_pool_first + 5 or flash_pool_last >= target
         sym = "[OK]" if grew else "[WARNING]"
-        print(f"  {sym} [FLASH] pool {flash_pool_first} → {flash_pool_last}/64"
+        print(f"  {sym} [FLASH] pool {flash_pool_first} → {flash_pool_last}/{target}"
               f"{'' if grew else '（增長停滯，檢查背景預擦）'}")
         if not grew: failures.append(f"[FLASH] pool 增長停滯 ({flash_pool_first}→{flash_pool_last})")
     else:
-        print("  [WARNING] 未收到 [FLASH] pool 行（韌體版本過舊?）")
+        print("  [INFO] 監聽期間未收到 [FLASH] pool 行——開機 bulk 預擦通常已在主迴圈啟動前"
+              "把池子一次擦滿，背景安全網無缺口可補、不會印這行，屬正常（非韌體版本過舊）")
 
     # ── P1：[STACK] 任務堆疊餘裕（歷史最低剩餘 ≥256 bytes，逼近 0 = 溢位前兆） ──
     if stack_min:
@@ -535,7 +559,8 @@ def monitor_serial_and_verify():
         print(col(RED, "\n[ERROR] FAILED"))
         for f in failures: print(f"  [WARNING] {f}")
         return False
-    print(col(GREEN, f"\n[PASS] PASSED — 所有感測器正常，Flash 寫入 {flash_ring_final_pkt} 筆"))
+    print(col(GREEN, f"\n[PASS] PASSED — 所有感測器正常，Flash pool ready={flash_ring_ready}"
+                      f"（PAD 態飛行封包=0 為預期值，S3.1）"))
     return True
 
 # ─────────────────────────────────────────────────────────────

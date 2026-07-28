@@ -41,18 +41,28 @@ def list_candidate_ports():
 
 
 def auto_port():
-    """自動偵測：優先實測過的橋接器，其次直接返回第一個非藍牙之可用串口（已關閉白名單）。"""
+    """自動偵測：優先回傳當前實體連接的 USB CDC / USB Serial 裝置。"""
+    candidates = list_candidate_ports()
+    # 1. 優先匹配線上現存的 USB CDC / USB-Serial 裝置
+    for dev in candidates:
+        dev_low = dev.lower()
+        if any(ignore in dev_low for ignore in ("bluetooth", "incoming-port", "wlan-debug", "debug-console")):
+            continue
+        if any(kw in dev_low for kw in _USB_KEYWORDS):
+            return dev
+
+    # 2. 次之：任何非虛擬串口
+    for dev in candidates:
+        dev_low = dev.lower()
+        if not any(ignore in dev_low for ignore in ("bluetooth", "incoming-port", "wlan-debug", "debug-console")):
+            return dev
+
+    # 3. 備用首選
     import os
     if os.path.exists(PREFERRED_PORT):
         return PREFERRED_PORT
-    candidates = list_candidate_ports()
-    # 排除明顯的藍牙虛擬串口以防 macOS serial open() 發生超時阻塞
-    for dev in candidates:
-        if "bluetooth" not in dev.lower():
-            return dev
-    if candidates:
-        return candidates[0]
-    return None
+
+    return candidates[0] if candidates else None
 
 
 def resolve_port(port=None):

@@ -22,6 +22,16 @@ uint16_t LinkProto_Build(uint8_t *out, const LinkStatus_t *st)
     pkt.v_est_cms   = st->v_est_cms;
     pkt.baro_alt_cm = st->baro_alt_cm;
     pkt.a_z_cg      = st->a_z_cg;
+    pkt.ack_state   = st->ack_state;
+    pkt.q_w         = st->q_w;
+    pkt.q_x         = st->q_x;
+    pkt.q_y         = st->q_y;
+    pkt.q_z         = st->q_z;
+    pkt.main_arb    = st->main_arb;
+    pkt.flash_ready = st->flash_ready;
+    pkt.erase_pct   = st->erase_pct;
+    pkt.vf_h_cm     = st->vf_h_cm;
+    pkt.vf_v_cms    = st->vf_v_cms;
 
     /* CRC 覆蓋除最後 2 bytes(crc16 本身) 外的全部內容 */
     pkt.crc16 = crc16_ccitt_false((const uint8_t *)&pkt, (uint16_t)(sizeof(pkt) - 2));
@@ -32,7 +42,7 @@ uint16_t LinkProto_Build(uint8_t *out, const LinkStatus_t *st)
 
 void LinkRx_Init(LinkRx_t *rx)
 {
-    rx->idx = 0U;
+    memset(rx, 0, sizeof(*rx));   /* idx=0 + 統計歸零 */
 }
 
 uint8_t LinkRx_Feed(LinkRx_t *rx, uint8_t b, LinkPacket_t *out)
@@ -56,6 +66,7 @@ uint8_t LinkRx_Feed(LinkRx_t *rx, uint8_t b, LinkPacket_t *out)
                 rx->idx = 1U;
             } else {
                 rx->idx = 0U;
+                rx->resync++;          /* sync0 後遇非法 byte → 重新對齊 */
             }
             return 0U;
 
@@ -67,9 +78,11 @@ uint8_t LinkRx_Feed(LinkRx_t *rx, uint8_t b, LinkPacket_t *out)
                 uint16_t crc_recv = (uint16_t)(rx->buf[SIZE - 2] |
                                     ((uint16_t)rx->buf[SIZE - 1] << 8));
                 if (crc_calc == crc_recv) {
+                    rx->ok++;
                     memcpy(out, rx->buf, SIZE);
                     return 1U;
                 }
+                rx->crc_err++;
             }
             return 0U;
     }

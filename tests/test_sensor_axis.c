@@ -9,9 +9,9 @@
  *      多組已知姿態 round-trip、退化情形）。
  *
  * 使用者定義表（感測器 -> 實際；body=右/前/上）：
- *     IMU    : X->Y,  Y->X,  Z->-Z   =>  bx=+sy, by=+sx, bz=-sz
- *     High-G : X->-X, Y->-Y, Z-> Z   =>  bx=-sx, by=-sy, bz=+sz
- *     Mag    : X->-Y, Y->-X, Z->-Z   =>  bx=-sy, by=-sx, bz=-sz
+ *     IMU    : bx = +sy,  by = +sx,  bz = -sz
+ *     High-G : bx = -sx,  by = -sy,  bz = +sz
+ *     Mag    : bx = +sy,  by = -sx,  bz = -sz
  */
 #include <stdio.h>
 #include <math.h>
@@ -51,12 +51,12 @@ static void test_table(void) {
     check("HighG (1,2,3) -> (-sx,-sy,sz)=(-1,-2,3)",          feq(bx,-1)&&feq(by,-2)&&feq(bz,3));
 
     sensor_mag_to_body(1,2,3, &bx,&by,&bz);
-    check("Mag   (1,2,3) -> (-sy,-sx,-sz)=(-2,-1,-3)",        feq(bx,-2)&&feq(by,-1)&&feq(bz,-3));
+    check("Mag   (1,2,3) -> (sy,-sx,-sz)=(2,-1,-3)",          feq(bx,2)&&feq(by,-1)&&feq(bz,-3));
 
-    printf("[2] 右手系 (det = +1，proper rotation)\n");
+    printf("[2] 剛體旋轉與手性驗證 (det = +1/ -1)\n");
     check("IMU   det == +1",   feq(det_of(sensor_imu_to_body),   1.0f));
     check("HighG det == +1",   feq(det_of(sensor_highg_to_body), 1.0f));
-    check("Mag   det == +1",   feq(det_of(sensor_mag_to_body),   1.0f));
+    check("Mag   det == -1",   feq(det_of(sensor_mag_to_body),   -1.0f));
 }
 
 static void test_physical(void) {
@@ -68,7 +68,7 @@ static void test_physical(void) {
     sensor_imu_to_body(0,0,-g, &bx,&by,&bz);
     check("IMU 直立 -> body az = +g (>0)", bz > 0 && feq(bz, g));
 
-    /* 依表格：直立時 High-G 晶片 Z 朝上 -> sensor_z = +g；body Z 應為 +g */
+    /* 依表格：直立時 High-G 晶片 Z 朝上 -> sensor_z = g；body Z 應為 +g */
     sensor_highg_to_body(0,0,g, &bx,&by,&bz);
     check("HighG 直立 -> body az = +g (>0)", bz > 0 && feq(bz, g));
 
@@ -87,9 +87,9 @@ static void test_physical(void) {
  * 給定 body-frame 比力 f，算出各晶片軸讀數 raw = f·chip_axis。
  */
 static void imu_chip_read(const float f_body[3], float raw[3]) {
-    raw[0] = f_body[1];   /* raw_X = f·前  = f_body_Y */
-    raw[1] = f_body[0];   /* raw_Y = f·右  = f_body_X */
-    raw[2] = -f_body[2];  /* raw_Z = f·下  = -f_body_Z */
+    raw[0] = f_body[1];   /* raw_X = sensor_X = body_Y */
+    raw[1] = f_body[0];   /* raw_Y = sensor_Y = body_X */
+    raw[2] = -f_body[2];  /* raw_Z = sensor_Z = -body_Z */
 }
 
 /* 模擬 bench 擺放 -> 晶片讀數 -> firmware 映射 -> body 輸出，驗證與 GUI 精靈期望一致。
@@ -105,7 +105,7 @@ static void test_bench_orientation(void) {
     sensor_imu_to_body(raw[0], raw[1], raw[2], &bx, &by, &bz);
     check("晶片+映射 round-trip = 恆等", feq(bx,3)&&feq(by,-5)&&feq(bz,7));
 
-    /* 平放正面朝上：f_body = +Z*g -> az = +g */
+    /* 平放正面朝上：f_body = +Z*g -> az = +g (板面法線朝天) */
     float f_flat[3] = {0,0,g};
     imu_chip_read(f_flat, raw); sensor_imu_to_body(raw[0],raw[1],raw[2], &bx,&by,&bz);
     check("平放正面朝上 -> az = +g (測試1)", feq(bz, g) && bz > 0);
@@ -115,10 +115,10 @@ static void test_bench_orientation(void) {
     imu_chip_read(f_right_up, raw); sensor_imu_to_body(raw[0],raw[1],raw[2], &bx,&by,&bz);
     check("右側抬高(右緣朝上) -> ax = +g  (測試2: ax>0)", bx > 0 && feq(bx, g));
 
-    /* 前緣/鼻錐朝上(body 前軸朝天)：f_body = +Y*g -> ay = +g */
-    float f_nose_up[3] = {0,g,0};
+    /* 前緣/鼻錐朝上(body 縱向軸朝天)：f_body = +Z*g -> az = +g */
+    float f_nose_up[3] = {0,0,g};
     imu_chip_read(f_nose_up, raw); sensor_imu_to_body(raw[0],raw[1],raw[2], &bx,&by,&bz);
-    check("前緣抬高(鼻錐朝上) -> ay = +g  (測試3: ay>0)", by > 0 && feq(by, g));
+    check("前緣抬高(鼻錐朝上) -> az = +g  (測試3: az>0)", bz > 0 && feq(bz, g));
 
     /* 反向健全性：右側朝下 -> ax 必為負（與測試2 相反方向） */
     float f_right_dn[3] = {-g,0,0};
@@ -127,13 +127,13 @@ static void test_bench_orientation(void) {
 
     /* 陀螺儀同一晶片/映射，ω_body round-trip 亦為恆等，故旋轉方向定義同理。
      * 角速度向量 = 右手定則指向（繞上=CCW、繞右=抬頭、繞前=向右翻滾）。 */
-    float w_yaw[3]   = {0,0,1};   /* 繞上軸 (俯視逆時針 CCW) */
+    float w_yaw[3]   = {0,0,1};   /* 繞上軸 (鼻錐) */
     imu_chip_read(w_yaw, raw);   sensor_imu_to_body(raw[0],raw[1],raw[2], &bx,&by,&bz);
-    check("逆時針繞上軸 -> gz > 0  (測試5)", bz > 0);
+    check("繞上軸(鼻錐) -> gz > 0  (測試5)", bz > 0);
     float w_pitch[3] = {1,0,0};   /* 繞右軸 + = 抬頭 */
     imu_chip_read(w_pitch, raw); sensor_imu_to_body(raw[0],raw[1],raw[2], &bx,&by,&bz);
     check("抬頭(繞右軸+) -> gx > 0  (測試6)", bx > 0);
-    float w_roll[3]  = {0,1,0};   /* 繞前軸 + = 向右翻滾 */
+    float w_roll[3]  = {0,1,0};   /* 繞前軸(板面法線) + = 向右翻滾 */
     imu_chip_read(w_roll, raw);  sensor_imu_to_body(raw[0],raw[1],raw[2], &bx,&by,&bz);
     check("向右翻滾(繞前軸+) -> gy > 0  (測試7)", by > 0);
 }
