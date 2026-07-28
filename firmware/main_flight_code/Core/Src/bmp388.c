@@ -124,9 +124,15 @@ HAL_StatusTypeDef BMP388_Init(SPI_HandleTypeDef *hspi, BMP388_Data_t *data)
     struct bmp3_settings settings = { 0 };
     settings.press_en = BMP3_ENABLE;
     settings.temp_en = BMP3_ENABLE;
-    settings.odr_filter.press_os   = BMP3_NO_OVERSAMPLING;    // 氣壓無過採樣 (1x)
-    settings.odr_filter.temp_os    = BMP3_NO_OVERSAMPLING;    // 溫度無過採樣 (1x)
-    settings.odr_filter.odr        = BMP3_ODR_200_HZ;         // 200Hz 最高 ODR (1x OS 轉換時間 4.94ms < 5ms 週期)
+    /* 50Hz ODR + 8x 壓力過採樣：高度是低頻資訊，200Hz/1x 純屬浪費且雜訊大，換成
+     * 低速高精度直接改善頂點/開傘判定品質。合法性驗算（bmp3.c:verify_meas_time_and_odr_duration）：
+     * meas_t = 234 + (392+8×2000) + (313+1×2000) = 18939µs < 20000µs(50Hz 週期)，餘裕 1.06ms。
+     * ⚠️ temp_os 必須維持 1x：若提到 2x，meas_t=20939µs > 20000µs，驅動會回傳
+     * BMP3_E_INVALID_ODR_OSR_SETTINGS，BMP388_Init 整個回 HAL_ERROR，bmp388_ok=0，
+     * 整條氣壓鏈無聲失效（無 log 提示原因）。 */
+    settings.odr_filter.press_os   = BMP3_OVERSAMPLING_8X;    // 氣壓 8x 過採樣
+    settings.odr_filter.temp_os    = BMP3_NO_OVERSAMPLING;    // 溫度必須維持 1x，見上方註解
+    settings.odr_filter.odr        = BMP3_ODR_50_HZ;          // 50Hz ODR
     settings.odr_filter.iir_filter = BMP3_IIR_FILTER_COEFF_3;
     
     uint16_t settings_sel = BMP3_SEL_PRESS_EN | 
@@ -150,8 +156,21 @@ HAL_StatusTypeDef BMP388_Init(SPI_HandleTypeDef *hspi, BMP388_Data_t *data)
     }
     
     HAL_Delay(20);
-    
+
     return HAL_OK;
+}
+
+/* 讀取率(main.c 100Hz 輪詢) > ODR(50Hz) 時，晶片內部時鐘與 MCU 各自獨立計時，若不看
+ * drdy 直接讀，會偶爾在同一顆轉換結果上重複讀到兩次（拍頻），人為壓低量測噪聲、
+ * 也讓 EKF/VF 誤以為餵入了新資訊。呼叫端應在 drdy=1 時才呼叫 BMP388_ReadData()——
+ * 該呼叫走 bmp3_get_sensor_data() 讀資料暫存器，會一併清除本旗標。 */
+uint8_t BMP388_IsDataReady(void)
+{
+    struct bmp3_status st = {0};
+    if (bmp3_get_status(&st, &bmp_dev) != BMP3_OK) {
+        return 0U;
+    }
+    return st.intr.drdy ? 1U : 0U;
 }
 
 HAL_StatusTypeDef BMP388_ReadData(SPI_HandleTypeDef *hspi, BMP388_Data_t *data)

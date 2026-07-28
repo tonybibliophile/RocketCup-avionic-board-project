@@ -39,6 +39,8 @@ extern "C" {
 #define UPLINK_CMD_DEPLOY_BOTH    0x22U  /* 手動同時開副傘 + 主傘（須先 ARM） */
 #define UPLINK_CMD_BENCH          0x30U  /* 桌面測試：跑一次 pyro/servo 自測後回歸（須先 ARM
                                           * ＋僅限未起飛 STATE_PAD/INIT，見 uplink_cmd.c） */
+#define UPLINK_CMD_RECALIBRATE    0x40U  /* EKF 重新校準（須先 ARM＋僅限未起飛 STATE_PAD/INIT） */
+#define UPLINK_CMD_RECOVERY       0x50U  /* 尋回指令：落地後停止蜂鳴器與數據記錄（SD/Flash） */
 
 /** @brief 該命令是否為開傘類（需武裝才生效）。 */
 static inline int uplink_cmd_is_deploy(uint8_t cmd)

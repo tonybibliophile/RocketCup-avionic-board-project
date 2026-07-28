@@ -41,8 +41,11 @@ static uint8_t           s_u2_rxbuf[64];   /* ReceiveToIdle 暫存 */
 
 static void u2_push(uint8_t b)
 {
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
     uint16_t nh = (uint16_t)((s_u2_head + 1U) % U2_RING_SZ);
     if (nh != s_u2_tail) { s_u2_ring[s_u2_head] = b; s_u2_head = nh; }
+    __set_PRIMASK(primask);
 }
 static int u2_pop(uint8_t *b)
 {
@@ -71,6 +74,10 @@ static uint8_t  s_auto_stats   = 0;       /* 自動列印統計開關 */
 static uint32_t s_auto_period_ms = 5000U;
 static uint32_t s_auto_last_ms = 0;
 
+static uint8_t  s_e22_raw_dump = 0;       /* 433 原始位元組 hex dump 開關（`e22 dump on`） */
+
+uint8_t GsLoraTest_RawDumpEnabled(void) { return s_e22_raw_dump; }
+
 static void stats_reset_all(void)
 {
     lora_stats_reset(&s_stat[0]);
@@ -93,6 +100,7 @@ static void print_help(void)
            "  e22 pwr  <0-3>    設 E22 功率 0=30 1=27 2=24 3=21dBm（3V3 供電建議 3）\r\n"
            "  e22 air  <0-7>    設 E22 空速 0=0.3k 1=1.2k 2=2.4k ... 7=62.5k（兩端須一致）\r\n"
            "  e22 show          顯示 E22 目前頻率\r\n"
+           "  e22 dump on/off   433 原始位元組 hex dump（診斷 RSSI byte 位置/數量，預設關閉）\r\n"
            "  e80 freq <hz>     設 E80 中心頻率 Hz (e.g. 915000000)\r\n"
            "  e80 sf   <7-12>   設 E80 展頻因子\r\n"
            "  e80 bw   <idx>    設 E80 頻寬 (3=62.5k 4=125k 5=250k 6=500k)\r\n"
@@ -103,6 +111,7 @@ static void print_help(void)
            "  e80 init          重新初始化 E80 並進入接收\r\n"
            "  e80 rxstart       重新進入連續接收\r\n"
            "  e80 airtime <len> 估算指定 payload 長度的空中時間\r\n"
+#if GS_LORA_TX_ENABLE
            "  --- 遠端指令中繼到主航電（433 反向）---\r\n"
            "  tx <指令>         把整串原文送給主航電執行（複用其命令台：role/help/\r\n"
            "                    e22.../e80.../CMD_MAG_CAL:.../CMD_MAG_YAW_LOCK:...），\r\n"
@@ -115,6 +124,14 @@ static void print_help(void)
            "  deploy main       手動開主傘（須先 arm）\r\n"
            "  deploy both       手動同時開副傘+主傘（須先 arm）\r\n"
            "  bench             桌面測試：跑一次 pyro/servo 自測後回歸（須先 arm＋僅限未起飛）\r\n"
+           "  recalib           重新校準 EKF（須先 arm＋僅限未起飛）\r\n"
+           "  recovery          尋回指令（落地後停止蜂鳴器與數據記錄）\r\n"
+#else
+           "  --- 遠端指令中繼 / 上行手動開傘（本機為 RX-only 版本，以下指令一律被拒） ---\r\n"
+           "  tx / ping / arm / disarm / deploy / bench / recalib / recovery\r\n"
+           "                    本機 make flash-ground 為純接收版，不接受發射；\r\n"
+           "                    如需發射請改燒 make flash-ground-tx\r\n"
+#endif
            "=====================================================\r\n");
 }
 
@@ -135,15 +152,20 @@ static void print_one_stat(int i, const char *name)
         printf("[STATS] rate=-- pkt/s\r\n");
     }
 
-    if (i == GS_LINK_920 && s->rssi_cnt > 0) {
-        printf("[STATS] RSSI: last=%d min=%d max=%d avg=%d dBm\r\n",
+    /* ★433 也可能有 RSSI：E22 開啟 REG3 bit7 後每包附加一個 RSSI 位元組
+     * （見 lora_e22.c 的 E22_RSSI_BYTE_EN），舊版寫死「透傳模式無此資訊」已過時。
+     * E22 沒有 SNR，故只有 920 印 SNR。 */
+    if (s->rssi_cnt > 0) {
+        printf("[STATS] RSSI: last=%d min=%d max=%d avg=%d dBm  (n=%lu)\r\n",
                (int)s->rssi_last, (int)s->rssi_min, (int)s->rssi_max,
-               (int)lora_stats_rssi_avg(s));
+               (int)lora_stats_rssi_avg(s), (unsigned long)s->rssi_cnt);
+    } else {
+        printf("[STATS] RSSI: N/A\r\n");
+    }
+    if (i == GS_LINK_920) {
         printf("[STATS] SNR:  last=%d min=%d max=%d avg=%d (x0.25dB)\r\n",
                (int)s->snr_last, (int)s->snr_min, (int)s->snr_max,
                (int)lora_stats_snr_avg(s));
-    } else if (i == GS_LINK_433) {
-        printf("[STATS] RSSI/SNR: N/A (E22 透傳模式無此資訊)\r\n");
     }
 }
 
@@ -203,10 +225,29 @@ static void apply_e80_reconfig(void)
 }
 
 /* ============================================================
+ *  上行發射權限檢查（GS_LORA_TX_ENABLE，見 board_config.h）
+ *  刻意不由 GUI 攔截：RX-only binary 一律照樣解析／回應，只是在真正呼叫
+ *  LoRaE22_Send 前擋下並印出拒絕訊息，讓地面站操作者從 console 就能看到
+ *  「這台是收機」，不必依賴 GUI 是否正確禁用按鈕。
+ * ============================================================ */
+static uint8_t gs_tx_allowed(const char *label)
+{
+#if GS_LORA_TX_ENABLE
+    (void)label;
+    return 1U;
+#else
+    printf("[UPLINK] REJECTED: 本機為 RX-only 地面站（make flash-ground），不接受發射 '%s'。"
+           "如需發射請改燒 make flash-ground-tx 版本。\r\n", label);
+    return 0U;
+#endif
+}
+
+/* ============================================================
  *  上行命令發送（手動開傘等，經 E22 433 反向打給火箭）
  * ============================================================ */
 static void uplink_send(uint8_t cmd, uint8_t arg, const char *label)
 {
+    if (!gs_tx_allowed(label)) return;
     uint8_t f[UPLINK_FRAME_SIZE];
     uint8_t seq = s_uplink_seq++;
     UplinkProto_Build(f, cmd, arg, seq);
@@ -226,6 +267,7 @@ static void uplink_send_text(const char *text)
 {
     uint8_t len = (uint8_t)strlen(text);
     if (len == 0U) { printf("[UPLINK] tx 需要指令內容，例：tx role / tx e80 sf 9\r\n"); return; }
+    if (!gs_tx_allowed("tx")) return;
     if (len > UPLINK_TEXT_MAX) {
         printf("[UPLINK] 指令過長 %u > %u，已截斷\r\n", (unsigned)len, (unsigned)UPLINK_TEXT_MAX);
         len = UPLINK_TEXT_MAX;
@@ -278,8 +320,9 @@ static void dispatch_cmd(char *line)
         print_help();
 
     } else if (strcmp(tok[0], "role") == 0) {
-        /* 與航電端 main.c Parse_Serial_Command 同格式（GUI 三角色自動偵測共用） */
-        printf("[ROLE_ID] role=GROUND fw=%s\r\n", FIRMWARE_VERSION);
+        /* 與航電端 main.c Parse_Serial_Command 同格式（GUI 三角色自動偵測共用）；
+         * tx=0/1 供 GUI 顯示 RX-only / TX-capable 徽章（僅顯示用，非攔截用）。 */
+        printf("[ROLE_ID] role=GROUND fw=%s tx=%d\r\n", FIRMWARE_VERSION, (int)GS_LORA_TX_ENABLE);
 
     } else if (strcmp(tok[0], "ping") == 0) {
         uplink_send(UPLINK_CMD_PING, 0, "PING");
@@ -293,6 +336,14 @@ static void dispatch_cmd(char *line)
     } else if (strcmp(tok[0], "bench") == 0) {
         /* 桌面測試：跑一次 pyro/servo 自測後回歸。火箭端須先 arm ＋僅限未起飛才會執行。 */
         uplink_send(UPLINK_CMD_BENCH, 0, "BENCH");
+
+    } else if (strcmp(tok[0], "recalib") == 0) {
+        /* 重新校準 EKF。火箭端須先 arm ＋僅限未起飛才會執行。 */
+        uplink_send(UPLINK_CMD_RECALIBRATE, 0, "RECALIB");
+
+    } else if (strcmp(tok[0], "recovery") == 0) {
+        /* 尋回指令：落地後停止蜂鳴器與數據記錄（SD/Flash） */
+        uplink_send(UPLINK_CMD_RECOVERY, 0, "RECOVERY");
 
     } else if (strcmp(tok[0], "deploy") == 0 && n >= 2) {
         if (strcmp(tok[1], "drogue") == 0) {
@@ -359,6 +410,16 @@ static void dispatch_cmd(char *line)
             HAL_StatusTypeDef st = LoRaE22_SetAirRate((uint8_t)ar);
             if (st == HAL_OK) printf("[E22] air rate set %lu OK（兩端須一致）\r\n", (unsigned long)ar);
             else              printf("[E22] air rate set FAIL (st=%d)\r\n", (int)st);
+        } else if (strcmp(tok[1], "dump") == 0 && n >= 3) {
+            if (strcmp(tok[2], "on") == 0) {
+                s_e22_raw_dump = 1U;
+                printf("[E22] raw dump ON —— 433 原始位元組將以 hex 印出（記得測完關掉，很洗版）\r\n");
+            } else if (strcmp(tok[2], "off") == 0) {
+                s_e22_raw_dump = 0U;
+                printf("[E22] raw dump OFF\r\n");
+            } else {
+                printf("[E22] dump 子命令：on / off\r\n");
+            }
         } else {
             printf("[E22] 未知子命令，輸入 help\r\n");
         }
@@ -447,11 +508,21 @@ void GsLoraTest_OnUart2RxEvent(uint16_t size)
     HAL_UARTEx_ReceiveToIdle_IT(&huart2, s_u2_rxbuf, sizeof(s_u2_rxbuf));
 }
 
+void GsLoraTest_FeedRxBuffer(const uint8_t *buf, uint32_t len)
+{
+    for (uint32_t i = 0; i < len; i++) {
+        u2_push(buf[i]);
+    }
+}
+
 void GsLoraTest_UpdateStats(uint8_t link, int16_t rssi_dbm, int16_t snr_q, uint8_t crc_ok)
 {
     if (link > 1U) return;
-    int has_rssi = (link == GS_LINK_920) && (rssi_dbm != GS_RSSI_NA);
-    int has_snr  = (link == GS_LINK_920) && (snr_q   != GS_SNR_NA);
+    /* ★433 也可能帶 RSSI（E22 REG3 bit7 每包附加一個 RSSI 位元組），舊版把 433 硬擋掉，
+     * 導致 bit7 修好之後 [STATS] 仍恆顯示 N/A、無從驗收。改成看值是否為哨兵即可。
+     * SNR 仍只有 920 有（E80/LR1121 由晶片給；E22 無此資訊）。 */
+    int has_rssi = (rssi_dbm != GS_RSSI_NA);
+    int has_snr  = (link == GS_LINK_920) && (snr_q != GS_SNR_NA);
     lora_stats_on_packet(&s_stat[link], crc_ok ? 1 : 0,
                          has_rssi, rssi_dbm, has_snr, snr_q, HAL_GetTick());
 }
@@ -487,3 +558,45 @@ void GsLoraTest_Tick(void)
 }
 
 #endif /* IS_GROUND */
+
+/* ============================================================
+ *  航電板 USB CDC CLI 橋接
+ *  IS_GROUND 下由完整 GsLoraTest 模組提供；航電板提供同名 stub，
+ *  將 USB 鍵入的文字透傳進 UART2（PA2）的環形緩衝，令 DiagTask
+ *  裡的 arm / disarm / help 等文字命令同樣能透過 USB 觸發。
+ * ============================================================ */
+#if !IS_GROUND && FEATURE_USB_CDC
+
+#include "gs_lora_test.h"   /* 僅為宣告；實體於此提供 */
+#include <string.h>
+
+/* 小型線性緩衝：USB CDC 中斷路徑 → DiagTask 輪詢消費 */
+#define _USB_CLI_BUF_SZ 256U
+static uint8_t  s_usb_cli_buf[_USB_CLI_BUF_SZ];
+static volatile uint16_t s_usb_cli_head = 0U;
+static volatile uint16_t s_usb_cli_tail = 0U;
+
+void GsLoraTest_FeedRxBuffer(const uint8_t *buf, uint32_t len)
+{
+    for (uint32_t i = 0U; i < len; i++) {
+        uint16_t next = (s_usb_cli_head + 1U) % _USB_CLI_BUF_SZ;
+        if (next != s_usb_cli_tail) {       /* 防溢位 */
+            s_usb_cli_buf[s_usb_cli_head] = buf[i];
+            s_usb_cli_head = next;
+        }
+    }
+}
+
+/**
+ * @brief 航電板：從 USB CLI 環形緩衝取出一個字元；無資料回傳 0。
+ *        由 DiagTask（gs_lora_test 地面站版的 u2_pop 等效）透過此 API 消費。
+ */
+int GsLoraTest_PopUsbByte(uint8_t *out)
+{
+    if (s_usb_cli_head == s_usb_cli_tail) return 0;
+    *out = s_usb_cli_buf[s_usb_cli_tail];
+    s_usb_cli_tail = (s_usb_cli_tail + 1U) % _USB_CLI_BUF_SZ;
+    return 1;
+}
+
+#endif /* !IS_GROUND && FEATURE_USB_CDC */

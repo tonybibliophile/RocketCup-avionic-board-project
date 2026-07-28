@@ -261,9 +261,74 @@ static void test_end_to_end(void)
     check("fix_valid = 1", d.fix_valid == 1);
 }
 
+static void test_ubx_pvt(void)
+{
+    printf("[9] UBX-NAV-PVT 二進位解包與解析\n");
+    GpsUbxAsm_t asm_ubx;
+    GPS_Data_t d;
+    gps_ubx_asm_init(&asm_ubx);
+    memset(&d, 0, sizeof(d));
+
+    UbxNavPvt_t raw_pvt;
+    memset(&raw_pvt, 0, sizeof(raw_pvt));
+    raw_pvt.fixType = 3;         /* 3D Fix */
+    raw_pvt.flags = 0x01;        /* gnssFixOK */
+    raw_pvt.numSV = 14;
+    raw_pvt.lat = 229464840;     /* 22.946484 deg (*1e7) */
+    raw_pvt.lon = 1202057610;    /* 120.205761 deg (*1e7) */
+    raw_pvt.height = 592300;     /* mm */
+    raw_pvt.hMSL = 545400;       /* 545.4 m in mm */
+    raw_pvt.gSpeed = 11520;      /* 11.52 m/s in mm/s */
+    raw_pvt.headMot = 8440000;   /* 84.4 deg in 1e-5 deg */
+    raw_pvt.hour = 12;
+    raw_pvt.min = 35;
+    raw_pvt.sec = 19;
+
+    uint8_t pkt[100];
+    pkt[0] = 0xB5;
+    pkt[1] = 0x62;
+    pkt[2] = 0x01; /* Class NAV */
+    pkt[3] = 0x07; /* ID PVT */
+    pkt[4] = 0x5C; /* Len LSB (92) */
+    pkt[5] = 0x00; /* Len MSB */
+    memcpy(&pkt[6], &raw_pvt, sizeof(raw_pvt));
+
+    /* 計算 Checksum Over Class, ID, Len, Payload */
+    uint8_t cka = 0, ckb = 0;
+    for (size_t i = 2; i < 98; i++) {
+        cka = (uint8_t)(cka + pkt[i]);
+        ckb = (uint8_t)(ckb + cka);
+    }
+    pkt[98] = cka;
+    pkt[99] = ckb;
+
+    /* 逐位元組餵入狀態機 */
+    int ok = 0;
+    for (size_t i = 0; i < sizeof(pkt); i++) {
+        if (gps_ubx_feed(&asm_ubx, pkt[i])) {
+            ok = 1;
+            UbxNavPvt_t *p = (UbxNavPvt_t*)asm_ubx.payload_buf;
+            gps_parse_ubx_pvt(&d, p, 12345);
+        }
+    }
+
+    check("UBX-NAV-PVT 二進位解包成功", ok == 1);
+    check("fix_valid = 1", d.fix_valid == 1);
+    check("fix_quality = 3 (3D)", d.fix_quality == 3);
+    check("satellites = 14", d.satellites == 14);
+    check("lat_1e6 轉換正確", d.lat_1e6 == 22946484);
+    check("lon_1e6 轉換正確", d.lon_1e6 == 120205761);
+    check("altitude_m = 545.4m", feq(d.altitude_m, 545.4f, 0.01f));
+    check("geoid_sep_m = 46.9m", feq(d.geoid_sep_m, 46.9f, 0.01f));
+    check("speed_mps = 11.52m/s", feq(d.speed_mps, 11.52f, 0.01f));
+    check("course_deg = 84.4°", feq(d.course_deg, 84.4f, 0.01f));
+    check("utc_hhmmss = 123519", d.utc_hhmmss == 123519);
+    check("last_fix_tick = 12345", d.last_fix_tick == 12345);
+}
+
 int main(void)
 {
-    printf("=== test_gps：GPS NMEA 純解析邏輯（P1 加固） ===\n");
+    printf("=== test_gps：GPS UBX 二進位與 NMEA 解析 ===\n");
     test_line_asm();
     test_truncation();
     test_checksum();
@@ -272,8 +337,10 @@ int main(void)
     test_rmc();
     test_dispatch();
     test_end_to_end();
+    test_ubx_pvt();
     printf("----------------------------------------\n");
     if (g_fail == 0) printf("ALL PASS：%d/%d 通過\n", g_total, g_total);
     else             printf("FAILED：%d/%d 失敗\n", g_fail, g_total);
     return g_fail ? 1 : 0;
 }
+

@@ -61,6 +61,8 @@ extern SPI_HandleTypeDef hspi1;
 extern SPI_HandleTypeDef hspi2;
 extern SPI_HandleTypeDef hspi3;
 extern DMA_HandleTypeDef hdma_usart2_rx;
+extern DMA_HandleTypeDef hdma_usart3_tx;
+extern DMA_HandleTypeDef hdma_usart3_rx;
 extern DMA_HandleTypeDef hdma_usart6_rx;
 extern DMA_HandleTypeDef hdma_i2c1_rx;
 extern I2C_HandleTypeDef hi2c1;
@@ -185,6 +187,25 @@ void EXTI4_IRQHandler(void)
 
   /* USER CODE END EXTI4_IRQn 1 */
 }
+
+/* USER CODE BEGIN DMA1_Stream1_3 */
+/**
+  * @brief This function handles DMA1 stream1 global interrupt (USART3_RX, E22 433).
+  * 手改（非 CubeMX 生成），見 stm32f4xx_hal_msp.c USART3 區段註解。
+  */
+void DMA1_Stream1_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_usart3_rx);
+}
+
+/**
+  * @brief This function handles DMA1 stream3 global interrupt (USART3_TX, E22 433).
+  */
+void DMA1_Stream3_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_usart3_tx);
+}
+/* USER CODE END DMA1_Stream1_3 */
 
 /**
   * @brief This function handles DMA1 stream5 global interrupt.

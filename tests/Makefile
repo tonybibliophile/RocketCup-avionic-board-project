@@ -5,7 +5,13 @@ CC      ?= cc
 CFLAGS  := -I../firmware/main_flight_code/Core/Inc -Wall -Wextra -O2 -std=c11
 LDLIBS  := -lm
 
-BINS := test_sensor_axis test_fsm test_fsm_elevator test_ekf_guard test_sensor_health test_telemetry test_telem_rx test_gs_timesync test_gs_log test_gps test_flash_ring test_link_proto test_link test_lora_calc test_uplink_proto test_ack_proto test_vertical_filter
+# test_openrocket_fsm.c / test_fsm_stress_suite.c 刻意不列入 BINS：兩者是手動診斷工具
+# （main() 恆 return 0，PASS/FAIL 只是印出來的文字、不反映在 exit code），不是本清單其餘
+# 檔案那種 g_fail/exit(1) 把關的黃金測試。加進 `run:` 的 ./$$b || exit 1 迴圈只會製造
+# 「一定綠燈」的假訊號，且前者依賴專案根目錄相對路徑讀 simulation_and_data/ 下的 CSV，
+# 從 tests/ 執行會找錯檔案、靜默印錯誤後仍回傳 0。需要時手動執行：
+#   cd .. && cc -Ifirmware/main_flight_code/Core/Inc -o /tmp/t_or tests/test_openrocket_fsm.c firmware/main_flight_code/Core/Src/fsm.c -lm && /tmp/t_or
+BINS := test_sensor_axis test_fsm test_fsm_elevator test_ekf_guard test_sensor_health test_telemetry test_telem_rx test_gs_timesync test_gs_log test_gps test_flash_ring test_flash_ring_watchdog_flight test_flash_ring_watchdog_elevator test_link_proto test_link test_servo_arb test_lora_calc test_uplink_proto test_ack_proto test_vertical_filter test_imu_raw_log
 
 .PHONY: run clean
 
@@ -56,11 +62,21 @@ test_gps: test_gps.c ../firmware/main_flight_code/Core/Inc/gps_parse.h
 test_flash_ring: test_flash_ring.c ../firmware/main_flight_code/Core/Inc/flash_ring_math.h
 	$(CC) $(CFLAGS) -o $@ test_flash_ring.c $(LDLIBS)
 
+# 池子是否覆蓋飛安看門狗視窗，兩種 profile 各驗一次（見 test_flash_ring_watchdog.c 頂部註解）。
+test_flash_ring_watchdog_flight: test_flash_ring_watchdog.c ../firmware/main_flight_code/Core/Inc/flash_ring_math.h ../firmware/main_flight_code/Core/Inc/fsm.h ../firmware/main_flight_code/Core/Inc/board_config.h
+	$(CC) $(CFLAGS) -DFLIGHT_PROFILE_ELEVATOR=0 -o $@ test_flash_ring_watchdog.c $(LDLIBS)
+
+test_flash_ring_watchdog_elevator: test_flash_ring_watchdog.c ../firmware/main_flight_code/Core/Inc/flash_ring_math.h ../firmware/main_flight_code/Core/Inc/fsm.h ../firmware/main_flight_code/Core/Inc/board_config.h
+	$(CC) $(CFLAGS) -DFLIGHT_PROFILE_ELEVATOR=1 -o $@ test_flash_ring_watchdog.c $(LDLIBS)
+
 test_link_proto: test_link_proto.c ../firmware/main_flight_code/Core/Src/link_proto.c ../firmware/main_flight_code/Core/Inc/link_proto.h ../firmware/main_flight_code/Core/Inc/crc16.h ../firmware/main_flight_code/Core/Inc/telemetry.h
 	$(CC) $(CFLAGS) -o $@ test_link_proto.c ../firmware/main_flight_code/Core/Src/link_proto.c $(LDLIBS)
 
 test_link: test_link.c ../firmware/main_flight_code/Core/Src/link.c ../firmware/main_flight_code/Core/Src/link_proto.c ../firmware/main_flight_code/Core/Inc/link.h ../firmware/main_flight_code/Core/Inc/board_config.h
 	$(CC) $(CFLAGS) -o $@ test_link.c ../firmware/main_flight_code/Core/Src/link.c ../firmware/main_flight_code/Core/Src/link_proto.c $(LDLIBS)
+
+test_servo_arb: test_servo_arb.c ../firmware/main_flight_code/Core/Src/servo_arb.c ../firmware/main_flight_code/Core/Inc/servo_arb.h ../firmware/main_flight_code/Core/Inc/board_config.h
+	$(CC) $(CFLAGS) -DFLIGHT_PROFILE_ELEVATOR=0 -o $@ test_servo_arb.c ../firmware/main_flight_code/Core/Src/servo_arb.c $(LDLIBS)
 
 test_lora_calc: test_lora_calc.c ../firmware/main_flight_code/Core/Inc/lora_calc.h
 	$(CC) $(CFLAGS) -o $@ test_lora_calc.c $(LDLIBS)
@@ -73,6 +89,9 @@ test_ack_proto: test_ack_proto.c ../firmware/main_flight_code/Core/Inc/ack_proto
 
 test_vertical_filter: test_vertical_filter.c ../firmware/main_flight_code/Core/Inc/vertical_filter.h
 	$(CC) $(CFLAGS) -o $@ test_vertical_filter.c $(LDLIBS)
+
+test_imu_raw_log: test_imu_raw_log.c ../firmware/main_flight_code/Core/Inc/imu_raw_log.h ../firmware/main_flight_code/Core/Inc/crc16.h
+	$(CC) $(CFLAGS) -o $@ test_imu_raw_log.c $(LDLIBS)
 
 clean:
 	rm -f $(BINS)

@@ -43,6 +43,16 @@ extern "C" {
 #define TELEM_FLAG_FAILSAFE       0x40U  /* 失效保護計時器強制點火（P0-B；地面站需特別標示） */
 #define TELEM_FLAG_HOTSTART       0x80U  /* 空中斷電熱啟動恢復成功（P0-F） */
 
+/* arm_flags 位元定義（flags 8 位已滿，ARM 被擋原因獨立一個 byte，供地面站顯示） */
+#define TELEM_ARM_BLOCKED_FLASH_POOL 0x01U  /* ARM 已送出但 flash 預擦池未達標，仍留 STATE_PAD
+                                              * （fail-open：flash 停用/未偵測到/未記錄時不會設此位） */
+
+/* peer_link 位（主/副協同下鏈：主板把副板鏈路健康中繼給地面，供雙板監看） */
+#define TELEM_PEER_EVER    0x01U  /* 曾收過對端封包（valid） */
+#define TELEM_PEER_FRESH   0x02U  /* 對端在線（LINK_PEER_TIMEOUT_MS 內收過） */
+#define TELEM_PEER_LOST    0x04U  /* 曾失聯（Phase B 設定） */
+#define TELEM_PEER_DESYNC  0x08U  /* 狀態失同步（Phase B 設定） */
+
 /* 下行遙測封包（packed，固定長度）。欄位順序即為地面端解碼契約。 */
 typedef struct __attribute__((packed)) {
     uint8_t  sync0;          /* 0xA5 同步字 */
@@ -87,6 +97,31 @@ typedef struct __attribute__((packed)) {
 
     uint8_t  health_bits;    /* P1：EKF_HB_*（ekf_guard.h；0=EKF 全健康） */
     uint8_t  sensor_bits;    /* P1：SH_BIT_*（sensor_health.h；0=感測器全健康） */
+
+    /* --- 本板垂直濾波器 (VF, vertical_filter.h)：與 EKF 並列輸出，供地面站
+     *     同屏比對「EKF vs VF」估計差異（VF 為開傘決策實際採用之估計器）。 --- */
+    int32_t  vf_pos_z_cm;    /* VF 高度 (cm) */
+    int32_t  vf_vel_z_cms;   /* VF 垂直速度 (cm/s) */
+
+    /* --- 主/副協同：主板中繼「對端(副板)摘要」，供地面站雙板監看（Phase A/B/C）。
+     *     來源為板間鏈路 LinkPeer_t；無對端時全 0、peer_link=0。 --- */
+    uint8_t  peer_fsm_state; /* 對端 FlightState_t 飛行狀態碼 */
+    uint8_t  peer_flags;     /* 對端 TELEM_FLAG_* 子集 */
+    int32_t  peer_h_cm;      /* 對端 EKF 高度 (cm) */
+    int32_t  peer_v_cms;     /* 對端 EKF 垂直速度 (cm/s) */
+    int32_t  peer_baro_cm;   /* 對端 baro 相對高度 (cm) */
+    uint8_t  peer_link;      /* TELEM_PEER_* 鏈路健康位 */
+    uint16_t peer_loss_pmil; /* 對端封包丟失率 (‰，0..1000) */
+    int16_t  peer_az_cg;     /* 對端 高G 垂直加速度 (cg = 0.01g) */
+    int32_t  peer_vf_h_cm;   /* 對端 VF 高度 (cm) */
+    int32_t  peer_vf_v_cms;  /* 對端 VF 垂直速度 (cm/s) */
+
+    uint8_t  arm_flags;      /* TELEM_ARM_* 位元（ARM 被擋下的原因，供地面站顯示） */
+
+    /* 對端(副板) D2 主傘舵機/BENCH 桌測握手狀態（servo_arb.h SERVO_ARB_MSG_*：
+     * 0=NONE 1=INTENT 2=DRIVING 3=DONE 4=BENCH_PRI_FIRE 5=BENCH_SEC_FIRE 6=BENCH_BOTH_FIRE）。
+     * 讓地面站不必接對端板 USB 也能經 LoRa 看到副板舵機驅動進度（見 Link_BuildOwnStatus）。 */
+    uint8_t  peer_bench_arb;
 
     uint16_t crc16;          /* CRC-16/CCITT-FALSE，覆蓋本封包前面所有位元組 */
 } TelemetryPacket_t;

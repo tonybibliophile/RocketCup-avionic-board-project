@@ -95,6 +95,8 @@ static void test_is_deploy(void)
     check("BOTH 屬 deploy",   uplink_cmd_is_deploy(UPLINK_CMD_DEPLOY_BOTH));
     check("ARM 非 deploy",   !uplink_cmd_is_deploy(UPLINK_CMD_ARM));
     check("PING 非 deploy",  !uplink_cmd_is_deploy(UPLINK_CMD_PING));
+    check("RECALIB 非 deploy", !uplink_cmd_is_deploy(UPLINK_CMD_RECALIBRATE));
+    check("RECOVERY 非 deploy", !uplink_cmd_is_deploy(UPLINK_CMD_RECOVERY));
 }
 
 static void test_two_frames(void)

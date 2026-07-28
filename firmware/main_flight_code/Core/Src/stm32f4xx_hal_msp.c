@@ -27,6 +27,10 @@ extern DMA_HandleTypeDef hdma_sdio;
 
 extern DMA_HandleTypeDef hdma_usart2_rx;
 
+extern DMA_HandleTypeDef hdma_usart3_tx;
+
+extern DMA_HandleTypeDef hdma_usart3_rx;
+
 extern DMA_HandleTypeDef hdma_usart6_rx;
 
 extern DMA_HandleTypeDef hdma_i2c1_rx;
@@ -975,6 +979,56 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
     GPIO_InitStruct.Alternate = GPIO_AF7_USART3;
     HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
+    /* USART3(E22 433) DMA Init —— 手改，非 CubeMX 生成。
+     * DMA1 佔用現況：Stream0=I2C1_RX(ch1)、Stream5=USART2_RX(ch4)，Stream1/Stream3 皆空。
+     * STM32F407 請求對應：USART3_RX=DMA1_Stream1 ch4、USART3_TX=DMA1_Stream3 ch4。 */
+    /* USART3_TX Init：★發送必須走 DMA。E22 透傳是 "Auto sub-packaging"（datasheet
+     * p.12 §5.6.2），UART 位元組流中間只要出現 idle 空隙，模組就提前收尾送出子封包；
+     * 開啟 RSSI 位元組後每個子封包各附一個 RSSI，等於插進應用封包中間 → CRC 全錯。
+     * 舊版阻塞輪詢傳輸由 osPriorityLow 的 LoRaTelemetry_Task 呼叫，必被搶佔而產生空隙。 */
+    hdma_usart3_tx.Instance = DMA1_Stream3;
+    hdma_usart3_tx.Init.Channel = DMA_CHANNEL_4;
+    hdma_usart3_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
+    hdma_usart3_tx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_usart3_tx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_usart3_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart3_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_usart3_tx.Init.Mode = DMA_NORMAL;
+    hdma_usart3_tx.Init.Priority = DMA_PRIORITY_HIGH;
+    hdma_usart3_tx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_usart3_tx) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    __HAL_LINKDMA(huart,hdmatx,hdma_usart3_tx);
+
+    /* USART3_RX Init：circular DMA + ReceiveToIdle 位置差分（比照 USART2/USART6 既有作法）。
+     * 舊版 ReceiveToIdle_IT 每次事件都要在 callback 內重新掛載，重掛期間 RX 未武裝，
+     * 該窗內到達的位元組會漏接或觸發 ORE。circular DMA 全程武裝、無重掛空檔。 */
+    hdma_usart3_rx.Instance = DMA1_Stream1;
+    hdma_usart3_rx.Init.Channel = DMA_CHANNEL_4;
+    hdma_usart3_rx.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_usart3_rx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_usart3_rx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_usart3_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart3_rx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_usart3_rx.Init.Mode = DMA_CIRCULAR;
+    hdma_usart3_rx.Init.Priority = DMA_PRIORITY_HIGH;
+    hdma_usart3_rx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_usart3_rx) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    __HAL_LINKDMA(huart,hdmarx,hdma_usart3_rx);
+
+    /* DMA1_Stream1/Stream3 interrupt Init（HAL 的 DMA 完成/半滿回呼需要） */
+    HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 6, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
+    HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 6, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Stream3_IRQn);
+
     /* USART3 interrupt Init */
     HAL_NVIC_SetPriority(USART3_IRQn, 6, 0);
     HAL_NVIC_EnableIRQ(USART3_IRQn);
@@ -1075,6 +1129,10 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* huart)
     PD9     ------> USART3_RX
     */
     HAL_GPIO_DeInit(GPIOD, GPIO_PIN_8|GPIO_PIN_9);
+
+    /* USART3 DMA DeInit */
+    HAL_DMA_DeInit(huart->hdmatx);
+    HAL_DMA_DeInit(huart->hdmarx);
 
     /* USART3 interrupt DeInit */
     HAL_NVIC_DisableIRQ(USART3_IRQn);

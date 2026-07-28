@@ -36,6 +36,7 @@ typedef struct {
 /* --- Function Prototypes --- */
 HAL_StatusTypeDef BMP388_Init(SPI_HandleTypeDef *hspi, BMP388_Data_t *data);
 HAL_StatusTypeDef BMP388_ReadData(SPI_HandleTypeDef *hspi, BMP388_Data_t *data);
+uint8_t BMP388_IsDataReady(void);            /* 50Hz ODR 下供讀取端 drdy 閘，避免拍頻重複讀 */
 void BMP388_SetReferenceTemp(float temp_c);  /* Item H: 以實測發射台溫度鎖定高度換算 T0 */
 
 #ifdef __cplusplus

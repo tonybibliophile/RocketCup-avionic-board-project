@@ -40,6 +40,22 @@
 #define IS_BACKUP    (BOARD_ROLE == ROLE_BACKUP)
 #define IS_GROUND    (BOARD_ROLE == ROLE_GROUND)
 
+/* === 地面站上行發射權限（僅 IS_GROUND 有意義；`make build-ground` 與
+ * `make build-ground-tx` 共用同一份原始碼，靠這個旗標切出兩種 binary）===
+ *   0 = RX-only（預設，`make flash-ground`）：地面站只能「接收」下行遙測。
+ *       gs_lora_test.c 命令列裡會經 LoRa 發射的指令（ping/arm/disarm/bench/
+ *       recalib/recovery/deploy/tx）一律被韌體拒絕並回傳提示——刻意不透過
+ *       GUI 擋（GUI 一律照送，是否接受由韌體決定，與 BENCH/RECOVERY 既有
+ *       的「GUI 不做本地攔截」原則一致），故按鈕仍會顯示、仍可點擊。
+ *       本地 flash 清除、e22/e80 RF 參數調整、stats/help/role 等純本地
+ *       命令不受影響，兩種 binary 都可用。
+ *   1 = TX-capable（`make flash-ground-tx`）：完整功能，可發射上行指令。
+ * `role` 命令回覆會附上 tx=0/1，供 GUI 顯示徽章區分兩種地面站（顯示用，
+ * 非攔截用）。 */
+#ifndef GS_LORA_TX_ENABLE
+#define GS_LORA_TX_ENABLE 0   /* MAKE_GS_TX_LINE */
+#endif
+
 /* === 功能閘（main.c 以 #if FEATURE_* 包住對應驅動 init / task） ===
  * 備板關閉 GPS(UART6) / 磁力計(I2C1) / LoRa(E22 UART3 + E80 SPI3)。
  * 地面站：開 GPS + LoRa(改 RX) + USB-CDC；關 磁力計 + 整個飛控管線(FEATURE_FLIGHT)。
@@ -60,18 +76,23 @@
 /* === 飛行 profile：場測（電梯）與真實飛行的門檻/降級鏈切換 ===
  * 電梯場測（垂直電梯井道，無法完整重現彈道）沿用真實飛行同一份 FSM，但頂樓僅
  * 30m、全程等速 1g、不具備真實加速度剖面，因此需要一組縮放後的門檻（見
- * fsm.h 內以本旗標分組的 #if/#else 常數表）並強制走純氣壓降級鏈（電梯無法讓
- * EKF 觀察到有意義的水平/垂直運動特徵，硬套用 EKF 路徑只會誤判）。
- *   0 = 飛行 profile（預設，真實彈道門檻 + EKF 路徑正常參與）
- *   1 = 電梯測試 profile（門檻縮放 + 強制 baro 降級鏈） */
+ * fsm.h 內以本旗標分組的 #if/#else 常數表）。
+ *   0 = 飛行 profile（預設，真實彈道門檻 + 估計器路徑正常參與）
+ *   1 = 電梯測試 profile（門檻縮放） */
 #ifndef FLIGHT_PROFILE_ELEVATOR
 #define FLIGHT_PROFILE_ELEVATOR 1
 #endif
 
-/* FEATURE_FORCE_BARO_ONLY 由 FLIGHT_PROFILE_ELEVATOR 推導：電梯 profile 全程強制
- * 狀態機使用純氣壓降級鏈（全靠 Baro，忽略 EKF 的高度/速度判定）；飛行 profile
- * 則讓 EKF 三路徑正常參與（P0-C 健康降級照常以 EKF_GetHealthBits() 判斷）。 */
-#define FEATURE_FORCE_BARO_ONLY FLIGHT_PROFILE_ELEVATOR
+/* FEATURE_FORCE_BARO_ONLY：改為固定 0，不再由 FLIGHT_PROFILE_ELEVATOR 推導。
+ * 原設計電梯 profile 全程強制純氣壓降級鏈，理由是「電梯無法讓估計器觀察到有意義的
+ * 運動特徵，硬套用動態路徑只會誤判」——但這個「誤判」的真正根因只在 fsm.c COAST
+ * 頂點判定的路徑1（動態預測）：其 decel fallback 假設「v_est 隨時間由大降到0」，僅
+ * 真實彈道成立，電梯全程近似等速違反此假設（實測：爬升第 40ms 即誤判「快到頂點」
+ * 而誤點副傘）。已改用 fsm.h 的 FSM_APOGEE_DYNAMIC_PREDICT_ENABLED 精準關掉電梯的
+ * 路徑1（僅此一條），其餘依賴估計器 h_est/v_est 的路徑（頂點路徑2/3、主傘動態高度、
+ * 下降/落地判定）對電梯剖面本身並無此問題，不需要整條強制降級——故電梯 profile
+ * 現在也讓估計器（VF）路徑正常參與，僅動態預測路徑保持關閉。 */
+#define FEATURE_FORCE_BARO_ONLY 0
 
 /* === 垂直通道 Kalman 濾波器（vertical_filter.h，Schultz 火箭高度計架構） ===
  *   FEATURE_VFILTER      = 1：編譯並執行濾波器，1Hz 與 EKF 對照列印（供 A/B 比較）。
@@ -87,10 +108,29 @@
 #define FEATURE_PYRO_SELFTEST 0
 #endif
 
+/* === 433 純發送實驗開關（台面診斷用，★飛行前務必設回 0）=========================
+ * 設 1 → 主航電只發 433 下行、完全不讀 433 上行：
+ *   ① 不呼叫 UplinkCmd_Init()，USART3 從頭到尾不掛 ReceiveToIdle（MCU 不讀 RX）
+ *   ② 遙測任務走無上行分支：取消每 10 槽空出 1 槽的接收窗 → 433 發送密度略增 ~10%
+ *   ③ 不發 ACK 幀（ACK 本來就是回應上行命令用的）
+ * 用途：排除「同一顆 E22 邊收邊發 / 上行接收窗」是否干擾下行品質。
+ * ⚠ 注意這只是「MCU 不讀 UART3」，不是「模組不收」——E22 透傳模式在不發射時
+ *   硬體上仍在監聽，要真正停掉射頻接收得進 WOR/睡眠模式，那會連發射一起停掉。
+ *   模組收到的雜訊仍會吐進 USART3、觸發 ORE，但無人讀取亦無人處理，無副作用。
+ * ⚠⚠ 安全：設 1 時地面站的 ARM / DEPLOY / RECOVERY 遠端指令「全部失效」，
+ *     火箭只剩 FSM 自動開傘。純台面測試用，絕對不可帶著這個設定飛行。 */
+#ifndef LORA433_TX_ONLY
+#define LORA433_TX_ONLY 0
+#endif
+
 /* 上行手動開傘：地面站經 433 反向打命令，火箭在下行之外空出 1/10 時槽接收。
  * 僅主航電（有 E22 TX/RX + 飛控點火輸出）；地面站送命令端走 IS_GROUND 的 gs_lora_test。
  * 安全：兩段式 ARM→DEPLOY + ARM 逾時自動解除（見 uplink_cmd.c / uplink_proto.h）。 */
+#if LORA433_TX_ONLY
+#define FEATURE_UPLINK_DEPLOY  0
+#else
 #define FEATURE_UPLINK_DEPLOY  IS_PRIMARY
+#endif
 
 /* 飛控管線（IMU/baro/highG → EKF → FSM → 點火/傘控）：主 + 備皆跑，地面站關閉省資源。 */
 #define FEATURE_FLIGHT (!IS_GROUND)
@@ -101,8 +141,14 @@
  * 即可看 log。best-effort（PC 未讀取即丟棄），不阻塞飛控路徑。
  * ★飛行前務必改回 0——純台面除錯用，不是飛行設計的一部分（會多出 USB 列舉與常駐
  * CPU 佔用，見下方 FEATURE_USB_CDC 註解）。 */
+/* ★7/26：曾一度懷疑 MX_USB_DEVICE_Init()（本旗標=1 時掛進主航電開機序列）是
+ * 「開機完全無反應」的元兇而暫時關過（見 git log）。後以 ST-Link mode=HOTPLUG
+ * 不重置直接 attach 讀 PC，抓到真正根因是 BOOT0 腳位被拉到 System Memory
+ * bootloader（PC 落在 0x1FFFxxxx，不在 flash）——每次真重置（含實體 RESET 鍵）
+ * 都直接跳 ROM bootloader，跟這顆旗標無關；USB 初始化本身未被證實有問題。
+ * 確認 BOOT0 修正、板子已能跑進 FreeRTOS idle task 後，此處改回 1。 */
 #ifndef FEATURE_USB_DEBUG_LOG
-#define FEATURE_USB_DEBUG_LOG 0
+#define FEATURE_USB_DEBUG_LOG 1
 #endif
 
 /* USB 虛擬序列埠（CDC）：地面站固定啟用，串流接收到的遙測 + 自身 GPS 給 PC；
@@ -120,13 +166,22 @@
 /* === 板間鏈路參數（USART2 硬體全雙工） === */
 #define LINK_BAUD             38400U /* 主備兩板 USART2 同此值；短排線餘裕充足 */
 #define LINK_TX_PERIOD_MS     50U    /* 自身狀態廣播週期（20 Hz；飛控 100 Hz 每 5 次送一次） */
-#define LINK_PEER_TIMEOUT_MS  300U   /* 超過此值無有效封包 → 對端視為失聯（備板轉全自主） */
+#define LINK_PEER_TIMEOUT_MS  300U   /* 超過此值無有效封包 → 對端視為失聯（LINK_STATUS_LOST） */
+#define LINK_SYNC_TIMEOUT_MS  300U   /* 我方狀態改變後，對端未於此時間內 echo-ACK → 失同步（DESYNC） */
 
-/* === 備援航電開傘偏壓（不對稱：主決策、備補位） ===
- * 備板獨立跑自己的 FSM；判到開傘條件後不立即輸出，先等 BACKUP_GRACE_MS 觀察主板是否
- * 送來開傘通知（flags 帶 DROGUE_FIRED / MAIN_DEPLOYED）。若收到 → 抑制（主板已點，
- * 二極體 OR 同一點火頭）；若 grace 到期仍未收到（主板漏點 / 失聯）→ 備板自行點火。 */
-#define BACKUP_GRACE_MS       300U   /* 備板判到開傘後給主板的寬限期 */
+/* === D2 主傘舵機時間錯開互斥握手（servo_arb.h） ===
+ * 主傘 PD14 為 PWM、diode-OR 同時驅動有害 → 同一時間只能一板驅動。主先→副後：
+ * 主板取得後驅動 SERVO_MAIN_DRIVE_MS，副板見主板 DONE 後才接手；主板失效則副板經
+ * SERVO_ARB_GUARD_MS guard 自行接手（主傘冗餘仍開）。 */
+#define SERVO_ARB_GUARD_MS    1000U  /* WANT 讓位/聆聽 guard：對端未擋且逾此時間即取得舵機 */
+#define SERVO_MAIN_DRIVE_MS   4000U  /* 單板舵機驅動窗（使用者：主先驅 4s 後通知副板） */
+
+/* === 主/副協同（對稱獨立冗餘；協同只做加法、不否決自身開傘） ===
+ * 兩板跑同一份 FSM、各依自身感測器獨立開傘；板間鏈路廣播狀態（LinkPacket_t）供
+ * 地面監看與加法協同。共用開傘板、以 diode 做 OR-in gate：
+ *   - 副傘 PD13（DC 馬達經 MOSFET，準位訊號）：兩板同時拉高無妨 → 加法 OR 互救。
+ *   - 主傘舵機 PD14（TIM4_CH3 PWM）：兩路 PWM 同時驅動會在 diode-OR 產生破壞性合併
+ *     脈衝 → 必須時間錯開，由 servo_arb 互斥握手（主先→副後；主板失效副板補驅）。 */
 
 /* === GPS-ONLY 隔離除錯開關 ════════════════════════════════════════════════
  * 1 = 關閉「除 GPS 外」的所有射頻/匯流排活動（LoRa 433+920、IMU/baro/highG 飛控管線、

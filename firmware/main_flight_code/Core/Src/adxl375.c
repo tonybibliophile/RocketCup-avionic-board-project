@@ -7,6 +7,12 @@
 #include "adxl375.h"
 #include <stdio.h>   /* ADXL375_DumpDiag 開機診斷列印 */
 
+/* 本檔的診斷/校正迴圈總阻塞 ~680ms，且全部落在開機序列「IWDG 已啟動但主迴圈尚未
+ * 進入」的視窗內（main.c：MX_IWDG_Init 之後、GPS_Init 的第一次餵狗之前，全段無人餵狗）。
+ * 必須自行餵狗，否則與其他開機延遲累加即撐爆 IWDG(~2.05s) → 開機無限重啟。
+ * 慣例同 gps.c（同樣位於該視窗內的驅動）。 */
+extern IWDG_HandleTypeDef hiwdg;
+
 /* 軟體零點偏移補償（g）：硬體 OFS 暫存器 1.56 g/LSB 太粗，修不了百 mG 等級的
  * 封裝應力偏移（見 ADXL375_CalibrateAgainstRef）。ReadData 每筆疊加，全解析度
  * 不受暫存器格數限制。開機預設 0（未校正時原樣輸出，行為不變）。 */
@@ -112,6 +118,7 @@ void ADXL375_DumpDiag(SPI_HandleTypeDef *hspi)
     }
     printf("\r\n");
     for (int s = 0; s < 4; s++) {
+        HAL_IWDG_Refresh(&hiwdg);
         ADXL375_Data_t d;
         if (ADXL375_ReadData(hspi, &d) == HAL_OK) {
             printf("[HIGHG_DIAG] raw hex x=%04X y=%04X z=%04X\r\n",
@@ -129,17 +136,20 @@ void ADXL375_DumpDiag(SPI_HandleTypeDef *hspi)
         ADXL375_Data_t d;
         int32_t z_off = 0, z_on = 0;
         for (int s = 0; s < 80; s++) {
+            HAL_IWDG_Refresh(&hiwdg);
             if (ADXL375_ReadData(hspi, &d) == HAL_OK) z_off += d.z_raw;
             HAL_Delay(2);
         }
         ADXL375_Reg_Write(hspi, ADXL375_DATA_FORMAT_REG, 0x8B);
         HAL_Delay(50);
         for (int s = 0; s < 80; s++) {
+            HAL_IWDG_Refresh(&hiwdg);
             if (ADXL375_ReadData(hspi, &d) == HAL_OK) z_on += d.z_raw;
             HAL_Delay(2);
         }
         ADXL375_Reg_Write(hspi, ADXL375_DATA_FORMAT_REG, 0x0B);
         HAL_Delay(20);
+        HAL_IWDG_Refresh(&hiwdg);
         printf("[HIGHG_DIAG] selftest z_off=%ld z_on=%ld delta=%ld LSB (正品期望 +100~+160)\r\n",
                (long)(z_off / 80), (long)(z_on / 80), (long)((z_on - z_off) / 80));
     }
@@ -164,6 +174,7 @@ void ADXL375_CalibrateAgainstRef(SPI_HandleTypeDef *hspi, float ref_ax, float re
     float sum_ax = 0.0f, sum_ay = 0.0f, sum_az = 0.0f;
     int n = 0;
     for (int s = 0; s < 40; s++) {
+        HAL_IWDG_Refresh(&hiwdg);
         if (ADXL375_ReadData(hspi, &d) == HAL_OK) {
             sum_ax += d.ax; sum_ay += d.ay; sum_az += d.az;
             n++;

@@ -331,20 +331,33 @@ class LiveGpsAnalyzer:
         while not self.data_queue.empty():
             ts, line = self.data_queue.get()
             
-            if "[GPS]" in line:
-                fix_match = re.search(r"fix:(\d+)", line)
-                sat_match = re.search(r"sat:(\d+)", line)
-                
-                if fix_match and sat_match:
-                    fix_val = int(fix_match.group(1))
-                    sats_val = int(sat_match.group(1))
-                    
+            if "[GPS]" in line or "[GS_PKT]" in line:
+                if "[GPS]" in line:
+                    fix_match = re.search(r"fix:(\d+)", line)
+                    sat_match = re.search(r"sat:(\d+)", line)
+                    coord_match = re.search(r"([\+\-]\d+\.\d+),([\+\-]\d+\.\d+)", line)
+                    alt_match = re.search(r"alt:(\-?\d+)m", line)
                     ok_match = re.search(r"ok:(\d+)", line)
                     ok_val = int(ok_match.group(1)) if ok_match else 0
-                    
+                else:
+                    # [GS_PKT] format: gps:8/1 pos:+22.991234,+120.211234 galt:45m
+                    m_gps = re.search(r"gps:(\d+)/(\d+)", line)
+                    sat_match = m_gps if m_gps else None
+                    fix_val = int(m_gps.group(2)) if m_gps else 0
+                    sats_val = int(m_gps.group(1)) if m_gps else 0
+                    fix_match = True
+                    coord_match = re.search(r"pos:([\+\-]\d+\.\d+),([\+\-]\d+\.\d+)", line)
+                    alt_match = re.search(r"galt:(\-?\d+)m", line)
+                    ok_val = 0
+
+                if fix_match and sat_match:
+                    if "[GPS]" in line:
+                        fix_val = int(fix_match.group(1))
+                        sats_val = int(sat_match.group(1))
+
                     with self.lock:
                         # 1. Detect Reset (ok count decreases)
-                        if self.prev_ok is not None and ok_val < self.prev_ok - 100:
+                        if "[GPS]" in line and self.prev_ok is not None and ok_val < self.prev_ok - 100:
                             print(f"\n🔄 [{ts}] Reset detected! Re-aligning timeline (retaining accumulated drift stats)...")
                             self.times.clear()
                             self.timestamps.clear()
@@ -357,7 +370,8 @@ class LiveGpsAnalyzer:
                             self.start_sys_time = None
                             self.first_fix_time_str = None
                             self.ttff = None
-                        self.prev_ok = ok_val
+                        if "[GPS]" in line:
+                            self.prev_ok = ok_val
                         
                         # 2. Reset time offset
                         t_sec = self.parse_time_str(ts)
@@ -374,35 +388,36 @@ class LiveGpsAnalyzer:
                         self.sats.append(sats_val)
                         self.fixes.append(fix_val)
                         
-                        # 4. Parse coordinates
-                        coord_match = re.search(r"([\+\-]\d+\.\d+),([\+\-]\d+\.\d+)", line)
-                        alt_match = re.search(r"alt:(\-?\d+)m", line)
-                        
+                        # 4. Parse coordinates & altitude
+                        lat, lon, alt = 0.0, 0.0, 0.0
                         if coord_match and alt_match:
-                            lat = float(coord_match.group(1))
-                            lon = float(coord_match.group(2))
-                            alt = float(alt_match.group(1))
-                            
-                            self.lats.append(lat)
-                            self.lons.append(lon)
-                            self.alts.append(alt)
-                            
-                            # Save drift data only when GPS is fixed and coords are valid
-                            if fix_val > 0 and abs(lat) > 0.01 and abs(lon) > 0.01:
-                                if self.first_fix_time_str is None:
-                                    self.first_fix_time_str = ts
-                                    self.ttff = rel_time
-                                    if not self.is_file_mode:
-                                        print(f"\n[GPS FIXED] TTFF: {self.ttff:.2f} seconds (Time: {ts})")
-                                    # Trigger map download centered at first fix location if no reference is set
-                                    if not self.comp_loc:
-                                        self.trigger_map_download(lat, lon)
-                                    
-                                self.drift_times.append(rel_time)
-                                self.drift_lats.append(lat)
-                                self.drift_lons.append(lon)
-                                self.drift_alts.append(alt)
-                                self.drift_sats.append(sats_val)
+                            try:
+                                lat = float(coord_match.group(1))
+                                lon = float(coord_match.group(2))
+                                alt = float(alt_match.group(1))
+                            except (ValueError, IndexError):
+                                pass
+
+                        self.lats.append(lat)
+                        self.lons.append(lon)
+                        self.alts.append(alt)
+                        
+                        # Save drift data only when GPS is fixed and coords are valid
+                        if fix_val > 0 and abs(lat) > 0.01 and abs(lon) > 0.01:
+                            if self.first_fix_time_str is None:
+                                self.first_fix_time_str = ts
+                                self.ttff = rel_time
+                                if not self.is_file_mode:
+                                    print(f"\n🎉 [GPS 定位成功！] 抓到位置所需時間 (TTFF): {self.ttff:.2f} 秒 (鎖定時刻: {ts})\n")
+                                # Trigger map download centered at first fix location if no reference is set
+                                if not self.comp_loc:
+                                    self.trigger_map_download(lat, lon)
+                                
+                            self.drift_times.append(rel_time)
+                            self.drift_lats.append(lat)
+                            self.drift_lons.append(lon)
+                            self.drift_alts.append(alt)
+                            self.drift_sats.append(sats_val)
 
     def start(self, is_file_mode=False):
         self.running = True
@@ -412,18 +427,26 @@ class LiveGpsAnalyzer:
         self.thread = threading.Thread(target=target_thread, daemon=True)
         self.thread.start()
 
-        # Initialize matplotlib plots using GridSpec (Left 3/4 is Map, Right 1/4 is Sats/Alt/Text)
+        # Initialize matplotlib plots using GridSpec
         fig = plt.figure(figsize=(16, 9))
         mode_str = "Offline File Mode" if is_file_mode else "Live Serial Mode"
         fig.suptitle(f"RocketCom GPS Live TTFF & 3D Static Drift Analyzer [{mode_str}]", fontsize=16, fontweight='bold')
         
         gs = gridspec.GridSpec(3, 4, figure=fig)
-        ax2 = fig.add_subplot(gs[0:3, 0:3]) # Large Map background plot (spans row 0-2, columns 0-2)
-        ax1 = fig.add_subplot(gs[0, 3])     # Sats & Fix vs Time (top-right)
-        ax3 = fig.add_subplot(gs[1, 3])     # Altitude vs Time (middle-right)
-        ax4 = fig.add_subplot(gs[2, 3])     # Text metrics dashboard (bottom-right)
         
-        self.ax1_twin = ax1.twinx() # Create twin axis ONCE
+        # Subplot 1: Map / 2D Drift (Spans 3 rows, 3 columns on left)
+        ax2 = fig.add_subplot(gs[:, :3])
+        
+        # Subplot 2: Satellites & Fix vs Time (Top right)
+        ax1 = fig.add_subplot(gs[0, 3])
+        self.ax1_twin = ax1.twinx()
+        
+        # Subplot 3: Altitude vs Time (Middle right)
+        ax3 = fig.add_subplot(gs[1, 3], sharex=ax1)
+        
+        # Subplot 4: Text metrics dashboard (Bottom right)
+        ax4 = fig.add_subplot(gs[2, 3])
+        ax4.axis('off')
         
         def update_plots(frame):
             self.process_queue()
@@ -575,7 +598,7 @@ class LiveGpsAnalyzer:
             # ----------------------------------------------------
             ax3.clear()
             with self.lock:
-                valid_alt_indices = [i for i, f in enumerate(self.fixes) if f > 0]
+                valid_alt_indices = [i for i, f in enumerate(self.fixes) if f > 0 and i < len(self.alts) and i < len(self.times)]
                 if valid_alt_indices:
                     alt_times = [self.times[i] for i in valid_alt_indices]
                     alt_vals = [self.alts[i] for i in valid_alt_indices]
@@ -707,20 +730,6 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[ERROR] Invalid reference format. Use '--ref lat,lon' (e.g., --ref 22.995,120.218)")
             sys.exit(1)
-    else:
-        # Prompt the user for reference coordinates before starting
-        print("\n--- GPS Reference Coordinates Configuration ---")
-        user_input = input("Enter reference coordinates (lat,lon) or press Enter to skip: ").strip()
-        if user_input:
-            try:
-                lat_str, lon_str = user_input.split(",")
-                ref_loc = (float(lat_str.strip()), float(lon_str.strip()), 0.0, "Manual Input")
-                print(f"[System] Reference set to: {ref_loc[0]:.6f}, {ref_loc[1]:.6f}\n")
-            except Exception:
-                print("[Warning] Invalid format. Reference comparison will be skipped.")
-                print("Expected format: lat,lon (e.g. 22.995,120.218)\n")
-        else:
-            print("[System] Reference comparison skipped.\n")
 
     if args.file:
         # Offline log analysis mode
@@ -730,11 +739,101 @@ if __name__ == "__main__":
         analyzer = LiveGpsAnalyzer(args.file, args.baud, ref_loc=ref_loc)
         analyzer.start(is_file_mode=True)
     else:
-        # Live serial mode
-        port_to_open = serial_link.resolve_port(args.port)
-        if not port_to_open:
-            print("[ERROR] No serial ports found. Make sure USB-to-UART module is plugged in.")
-            sys.exit(1)
+        # Live serial mode - Incremental Hot-Plug Detection for Power-On TTFF Test
+        port_to_open = args.port
+        if str(args.port).upper() == "AUTO":
+            # 1. 抓取啟動時系統已常駐的舊串口快照（全部忽略，避免亂抓舊裝置）
+            initial_candidates = set(p for p in serial_link.list_candidate_ports() if "bluetooth" not in p.lower() and "incoming" not in p.lower())
+            
+            print("\n" + "=" * 62)
+            print("    ⏳ RocketCom GPS Live Analyzer — 上電增量快照追蹤模式")
+            print("=" * 62)
+            if initial_candidates:
+                print("已記錄系統當前常駐串口（連連看測試將自動忽略舊裝置）：")
+                for p in sorted(initial_candidates):
+                    print(f"  • {p}")
+            else:
+                print("系統當前無已連接之 USB 串口裝置。")
+            print("-" * 62)
+            print("👉 請給航電板【上電】或【插上 USB 纜線】...")
+            print("系統將 100% 精準鎖定「上電後全新出現的航電串口」，絕不亂抓！")
+            print("(若航電板早已上電，請直接按下 [Enter] 鍵手動選取串口)\n")
+
+            new_found_port = None
+            dots = [".  ", ".. ", "...", "   "]
+            dot_idx = 0
+            
+            # 非阻塞微輪詢，同時監聽鍵盤 Enter 與熱插拔增量串口
+            try:
+                import select
+                while True:
+                    # 檢查是否有新出現的串口 (New Port = Current - Initial)
+                    current_candidates = set(p for p in serial_link.list_candidate_ports() if "bluetooth" not in p.lower() and "incoming" not in p.lower())
+                    new_ports = current_candidates - initial_candidates
+                    
+                    if new_ports:
+                        # 優先尋找帶有 usbmodem (STM32 USB-CDC) 的新裝置
+                        cdc_new = [p for p in new_ports if "usbmodem" in p.lower() or "usbserial" in p.lower()]
+                        new_found_port = cdc_new[0] if cdc_new else list(new_ports)[0]
+                        print(f"\n\n⚡ [偵測到航電板上電！] 增量捕獲新串口: {new_found_port}")
+                        break
+                    
+                    # 檢查使用者是否按下 Enter 要求手動從舊串口選取
+                    r, _, _ = select.select([sys.stdin], [], [], 0.3)
+                    if r:
+                        line = sys.stdin.readline()
+                        # 按下 Enter 跳出輪詢，轉入列表選單
+                        break
+
+                    sys.stdout.write(f"\r[⏳ 等待航電板上電{dots[dot_idx]}] 正在監控串口增量... (按 Enter 可手動選擇/Ctrl+C退出)")
+                    sys.stdout.flush()
+                    dot_idx = (dot_idx + 1) % 4
+            except (KeyboardInterrupt, EOFError):
+                print("\n\n[System] 被使用者取消。")
+                sys.exit(0)
+            except Exception:
+                # Windows / 相容性 fallback
+                pass
+
+            if new_found_port:
+                port_to_open = new_found_port
+                print(f"🟢 [上電秒連成功] 連接至航電板: {port_to_open} @ {args.baud} baud\n")
+            else:
+                # 若無新串口增量，顯示所有串口讓使用者手動挑選
+                current_candidates = [p for p in serial_link.list_candidate_ports() if "bluetooth" not in p.lower()]
+                if not current_candidates:
+                    print("\n❌ [ERROR] 未找到任何串口。請確認 USB 纜線已插好。")
+                    sys.exit(1)
+                    
+                print("\n" + "=" * 58)
+                print("    🚀 RocketCom GPS Live Analyzer — 串口選擇")
+                print("=" * 58)
+                print("偵測到的可用串口裝置 (Serial Ports)：")
+                for idx, p in enumerate(current_candidates, 1):
+                    tag = "★ [推薦 (USB-CDC/TTL)]" if idx == 1 else ""
+                    print(f"  [{idx}] {p} {tag}")
+                print("-" * 58)
+                
+                try:
+                    user_sel = input(f"請選擇串口編號 [1-{len(current_candidates)}] (按 Enter 預設選 [1]): ").strip()
+                    if user_sel == "":
+                        port_to_open = current_candidates[0]
+                    else:
+                        try:
+                            idx = int(user_sel) - 1
+                            if 0 <= idx < len(current_candidates):
+                                port_to_open = current_candidates[idx]
+                            else:
+                                port_to_open = current_candidates[0]
+                        except ValueError:
+                            port_to_open = user_sel
+                except (KeyboardInterrupt, EOFError):
+                    print("\n[System] 被使用者取消。")
+                    sys.exit(0)
+                
+                print(f"\n🟢 已選擇串口: {port_to_open} @ {args.baud} baud\n")
+        else:
+            port_to_open = serial_link.resolve_port(args.port)
 
         analyzer = LiveGpsAnalyzer(port_to_open, args.baud, ref_loc=ref_loc)
         analyzer.start(is_file_mode=False)

@@ -43,6 +43,16 @@ void UplinkCmd_Poll(uint32_t now_ms);
 uint8_t UplinkCmd_TakeDeploy(uint8_t *want_drogue, uint8_t *want_main);
 
 /**
+ * @brief 直接排入一筆待辦手動開傘請求，繞過 433 幀解析（供本機 USB-CDC 文字命令
+ *  "deploy drogue|main|both" 使用）。與 UPLINK_CMD_DEPLOY_* 走同一組 pending 旗標，
+ *  確保「地面站 LoRa 觸發」與「主航電本機直連觸發」執行路徑完全一致。
+ *  呼叫端須自行做 ARM/in_flight 閘（比照 uplink_cmd.c 對應 case）。
+ * @param want_drogue 1 = 本次要副傘
+ * @param want_main   1 = 本次要主傘
+ */
+void UplinkCmd_ForceDeploy(uint8_t want_drogue, uint8_t want_main);
+
+/**
  * @brief 取出並清除待辦的文字命令（一次性消費）。由診斷任務呼叫 → 餵 Parse_Serial_Command。
  * @param out  緩衝區，須 >= UPLINK_TEXT_MAX+1（含結尾 NUL）。
  * @param sz   out 大小。
@@ -57,6 +67,13 @@ uint8_t UplinkCmd_TakeTextCmd(char *out, uint16_t sz, uint8_t *seq);
  * @return 1 = 有待辦 bench；0 = 無。
  */
 uint8_t UplinkCmd_TakeBench(uint8_t *seq);
+
+/**
+ * @brief 取出並清除待辦的 recovery（尋回指令）請求（一次性消費，停止蜂鳴器與紀錄）。
+ * @param seq 輸出：對應上行幀 seq（供 ACK 回填）。
+ * @return 1 = 有待辦 recovery；0 = 無。
+ */
+uint8_t UplinkCmd_TakeRecovery(uint8_t *seq);
 
 /**
  * @brief 設定一筆待送 ACK（覆蓋前一筆未取走者）。由執行端（診斷任務）於命令執行後呼叫。
@@ -76,9 +93,14 @@ uint8_t UplinkCmd_TakePendingAck(uint8_t *seq, uint8_t *status, char *out_text, 
 /** @brief 目前是否武裝（ARM 窗內）。 */
 uint8_t UplinkCmd_IsArmed(void);
 
+/** @brief 手動設定武裝狀態（供本地串口指令 arm/disarm 同步）。 */
+void UplinkCmd_SetArmedState(uint8_t armed);
+
 /** @brief 診斷統計：有效命令數 / CRC 錯誤數 / 最後命令碼。可傳 NULL。 */
 void UplinkCmd_GetStats(uint32_t *rx_ok, uint32_t *rx_crc_err, uint8_t *last_cmd);
 
+#else
+static inline uint8_t UplinkCmd_IsArmed(void) { return 0U; }
 #endif /* FEATURE_UPLINK_DEPLOY */
 
 #ifdef __cplusplus

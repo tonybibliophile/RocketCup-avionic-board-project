@@ -109,8 +109,10 @@ HAL_StatusTypeDef BMI088_Init(SPI_HandleTypeDef *hspi)
     status = Accel_Reg_Write(hspi, BMI088_ACC_RANGE_REG, 0x03);    // 0x03 = ±24g
     HAL_Delay(10);
     
-    // 設定輸出頻率：1600Hz, OSR4 濾波器
-    status = Accel_Reg_Write(hspi, BMI088_ACC_CONF_REG, 0xAC);
+    // 設定輸出頻率：800Hz ODR, OSR2 濾波器（BW 維持 ~145Hz，同原 0xAA/Normal 模式）。
+    // 原 0xAA(400Hz ODR)恰等於 MCU 讀取率(TIM6 400Hz)，晶片時鐘與 MCU 晶振各自獨立
+    // 會拍頻(dup/skip)；ODR 提到讀取率 2 倍即消除，頻寬不變。
+    status = Accel_Reg_Write(hspi, BMI088_ACC_CONF_REG, 0x9B);
     HAL_Delay(10);
 
     /* ==================== 2. 初始化陀螺儀 ==================== */
@@ -129,8 +131,10 @@ HAL_StatusTypeDef BMI088_Init(SPI_HandleTypeDef *hspi)
     status = Gyro_Reg_Write(hspi, BMI088_GYRO_RANGE_REG, 0x00);    // 0x00 = ±2000 °/s
     HAL_Delay(10);
 
-    // 設定陀螺儀輸出頻率與帶寬：2000Hz ODR, 帶寬 532Hz (官方最高 ODR)
-    status = Gyro_Reg_Write(hspi, BMI088_GYRO_BANDWIDTH_REG, 0x00); // 0x00 = 2000Hz ODR, 532Hz BW
+    // 設定陀螺儀輸出頻率與帶寬：2000Hz ODR, 帶寬 230Hz。
+    // MCU 讀取率(TIM7)同步提升至 1000Hz：頻寬 230Hz < 1000Hz 的 Nyquist(500Hz)，
+    // 無 aliasing；ODR(2000Hz) > 讀取率(1000Hz)保證每次讀取皆為新鮮樣本，無拍頻。
+    status = Gyro_Reg_Write(hspi, BMI088_GYRO_BANDWIDTH_REG, 0x01); // 0x01 = 2000Hz ODR, 230Hz BW
     HAL_Delay(10);
 
     return HAL_OK;
