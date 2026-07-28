@@ -103,7 +103,15 @@ NOMINAL_RATE_HZ = {
     LINK_433: (1.0 / LORA433_AIRTIME_S) * (UPLINK_LISTEN_EVERY - 1) / UPLINK_LISTEN_EVERY,  # ≈2.33 Hz
     LINK_920: 1000.0 / LORA_TELEM_PERIOD_MS,                        # 10 Hz（受空中時間/BUSY 影響）
 }
-SEQ_STEP = {LINK_433: LORA433_TX_EVERY, LINK_920: 1}
+
+# ★2026-07-28：SEQ_STEP 曾誤設成 LORA433_TX_EVERY(=1)——那只代表韌體「每個 tick 都會
+# 嘗試呼叫」LoRaE22_Send()，不代表每個 tick 都真的送得出去。LoRaE22_Send() 遇到 AUX
+# busy（上一包還在空中）會直接跳過、不等待，所以 433 兩次成功發射之間最少要隔
+# ceil(空中時間/tick週期) 個 tick——這才是「單鏈路 RF 到達率丟失」該拿來當基準的
+# 物理下限，不是排程嘗試頻率。用 LORA433_TX_EVERY(=1) 當 step 等於拿「每 tick 都該
+# 收到」這個不可能達到的標準去算丟失率，即使訊號完美無雜訊也會算出巨大假丟包。
+LORA433_MIN_TX_SPACING_TICKS = math.ceil(LORA433_AIRTIME_S / (LORA_TELEM_PERIOD_MS / 1000.0))  # = 4
+SEQ_STEP = {LINK_433: LORA433_MIN_TX_SPACING_TICKS, LINK_920: 1}
 
 # ===========================================================================
 #  即時 Console 逐行規則 (與 ground_station.c / gs_lora_test.c printf 格式同步)
@@ -207,35 +215,37 @@ def unwrap_seq_to_ticks(events: list, period_s: float, t0: float) -> list:
 
 
 def calc_tick_loss(unwrapped_ticks: list, step: int = 1, listen_skip_every: int = None) -> dict:
-    """依展開後的全域 tick 值算丟包率：逐一走訪涵蓋範圍內「每一個該有發送機會的 tick」，
-    直接檢查該 tick 是否出現在實收集合裡——真的用 seq 決定每一筆是否漏掉，而不是拿
-    「範圍大小 - 收到幾筆」的整體統計去反推近似值。不受事件排列順序影響，天生免疫
-    unwrap_seq_to_ticks() 註解描述的跨鏈路時間序倒置問題。
+    """依展開後的全域 tick 值算丟包率。涵蓋範圍 [lo, hi] 內：
 
-    step：此鏈路每隔幾個全域 tick 才有一次發送機會（見 NOMINAL_RATE_HZ 註解；目前
-    433/920 皆為 1，即每個 tick 都嘗試發送——保留此參數以防日後排程再度降速）。
+    1. 先扣掉上行接收窗（listen_skip_every）佔用的 tick——這是「全域 tick」上固定
+       相位的已知排程(main.c listen_slot 判斷式 tick % N == N-1)，逐一列舉是精確值，
+       不是近似值。
+    2. step=1（如 920，每個 tick 都是確定的發送機會）：剩下每個 tick 都直接跟實收
+       集合比對，等同逐一核對每一筆 seq 是否出現——集合運算，不是統計反推。
+    3. step>1（如 433，受空中時間物理限制，兩次成功發射間至少要隔 step 個 tick）：
+       實際成功發射的相位並不固定在 lo, lo+step, lo+2*step,...（取決於 AUX 何時轉
+       閒置，不是固定週期排程），不能假設固定相位逐一列舉，改用「可用機會 tick 數
+       / 最小間隔」估計此範圍內最多能塞進幾次成功發射，這是密度上限，非精確逐筆核對。
 
-    listen_skip_every：433 專屬。UPLINK_LISTEN_EVERY 上行接收窗每 N 個全域 tick 固定
-    空出 1 個(tick % N == N-1)不發射（見 main.c listen_slot 判斷式，這裡直接用同一個
-    條件逐 tick 判斷，不是套用平均折讓），是已知設計行為、該 tick 不計入 expected，
-    否則會被誤算成 433 專屬的假丟包。"""
+    不受事件排列順序影響，天生免疫 unwrap_seq_to_ticks() 註解描述的跨鏈路時間序
+    倒置問題。"""
     if not unwrapped_ticks:
         return {"expected": 0.0, "lost": 0.0, "ratio": 0.0}
     distinct = set(unwrapped_ticks)
     lo, hi = min(distinct), max(distinct)
-    g = lo - (lo % step)
-    if g < lo:
-        g += step
-    expected = 0
-    lost = 0
-    while g <= hi:
-        if not (listen_skip_every and (g % listen_skip_every) == (listen_skip_every - 1)):
-            expected += 1
-            if g not in distinct:
-                lost += 1
-        g += step
-    ratio = (lost / float(expected)) if expected > 0 else 0.0
-    return {"expected": float(expected), "lost": float(lost), "ratio": ratio}
+    total_ticks = hi - lo + 1
+
+    if listen_skip_every:
+        listen_ticks = sum(1 for g in range(lo, hi + 1) if g % listen_skip_every == listen_skip_every - 1)
+    else:
+        listen_ticks = 0
+    opportunity_ticks = total_ticks - listen_ticks
+
+    expected = float(opportunity_ticks) if step <= 1 else opportunity_ticks / float(step)
+    received = float(len(distinct))
+    lost = max(expected - received, 0.0)
+    ratio = (lost / expected) if expected > 0 else 0.0
+    return {"expected": expected, "lost": lost, "ratio": ratio}
 
 
 def merge_dedupe_events(events: list) -> list:
@@ -575,12 +585,14 @@ class GsAnalyzerEngine:
             if len(any_rx) >= 2:
                 ticks = unwrap_seq_to_ticks(any_rx, LORA_TELEM_PERIOD_MS / 1000.0, any_rx[0]["t"])
                 loss = calc_tick_loss(ticks, step=SEQ_STEP[link], listen_skip_every=listen_skip)
+                step_note = (f"每{SEQ_STEP[link]}tick最多1次成功發射(空中時間限制)"
+                             if SEQ_STEP[link] > 1 else "step=1，每tick都是機會")
                 add_check(name, "單鏈路 RF 到達率丟失", loss["ratio"] * 100.0,
                           SPEC_LIMITS["single_link_loss_max_ratio"] * 100.0, "%",
                           "<=", loss["ratio"] > SPEC_LIMITS["single_link_loss_max_ratio"] * 1.5,
                           loss["ratio"] > SPEC_LIMITS["single_link_loss_max_ratio"],
-                          f"已依排程正規化(step={SEQ_STEP[link]}"
-                          f"{f', 已扣除每{listen_skip}槽1次上行接收窗' if listen_skip else ''})、"
+                          f"已依{step_note}"
+                          f"{f'、已扣除每{listen_skip}槽1次上行接收窗' if listen_skip else ''}正規化、"
                           f"CRC 錯誤也算「有到達」："
                           f"預期 {loss['expected']:.1f} 個時槽、遺失 {loss['lost']:.1f} 個"
                           f"（僅此鏈路，未計入另一鏈路補收；純 RF 靜默，非解碼品質）")
@@ -894,8 +906,9 @@ class ReportGenerator:
             "2. **總通訊頻率接近排定值，但 CRC 錯誤率偏高**：代表 RF 前端有收到東西、只是解不出來——"
             "檢查天線接頭/駐波、RF 參數(SF/BW/CR 兩端須一致)，或空中速率與雜訊環境不符。",
             "3. **Resync 比例偏高（433）**：多半是空中位元速率不符或強雜訊源干擾，非單純距離問題。",
-            "4. **單鏈路 RF 到達率丟失偏高**：已扣掉 433 每 UPLINK_LISTEN_EVERY(=10) 個時槽固定"
-            "空出 1 槽讓地面站上行的正常設計行為，剩下的才是真正的 RF 靜默，需查天線/距離/遮蔽。",
+            "4. **單鏈路 RF 到達率丟失偏高**：433 已扣掉每 UPLINK_LISTEN_EVERY(=10) 個時槽固定"
+            "空出 1 槽讓地面站上行、以及每次成功發射至少間隔空中時間(~4 個 100ms tick)這兩項"
+            "正常設計行為，剩下的才是真正的 RF 靜默，需查天線/距離/遮蔽。",
             "5. **合併到達率丟失偏高但單鏈路正常**：檢查是否兩鏈路收到的其實是同一時間窗（火箭端 TX 排程異常）。",
             "6. **紀錄管線停頓**：對應已知 Flash sector erase 阻塞，嚴重時可能造成飛行末段掉包，"
             "建議改用 --csv 對實際 SD 卡 GSLOGnnn.CSV 做離線分析確認真實影響。",
@@ -1006,14 +1019,17 @@ new Chart(document.getElementById('chartGap'), {{
 # ===========================================================================
 def generate_selftest_events(engine: GsAnalyzerEngine):
     """依 main.c LoRaTelemetry_Task 的真實排程模擬：兩鏈路共用同一個每 100ms 遞增的全域
-    seq，920 幾乎每個 tick 都發；433 每個 tick 都嘗試發送(LORA433_TX_EVERY=1)，但每
-    UPLINK_LISTEN_EVERY(=10) 個 tick 固定空出 1 個不發、留給上行接收窗——這個規律間隙
-    是設計行為、不是遺失，calc_tick_loss() 需要用 listen_skip_every 正規化，selftest
-    資料若不照這個排程生成就測不出這項邏輯有沒有壞掉。"""
+    seq，920 幾乎每個 tick 都發；433 每個 tick 都嘗試呼叫 LoRaE22_Send()(LORA433_TX_EVERY=1)，
+    但 AUX busy（上一包空中時間還沒跑完，~4 個 tick）時會直接跳過不等待，所以兩次
+    成功發射之間最少要隔 LORA433_MIN_TX_SPACING_TICKS 個 tick；此外每 UPLINK_LISTEN_EVERY
+    (=10) 個 tick 固定空出 1 個不發、留給上行接收窗。這兩個規律間隙都是設計行為、不是
+    遺失，calc_tick_loss() 用 step/listen_skip_every 正規化，selftest 資料若不照這個
+    排程生成就測不出這項邏輯有沒有壞掉。"""
     import random
     t = time.time() - 60.0
     gs_stat = {"hw433_ok": True, "hw920_ok": True, "raw433": 0, "ok433": 0, "crc433": 0, "rsync433": 0,
                "ok920": 0, "crc920": 0, "rsync920": 0, "pkts433": 0, "pkts920": 0}
+    last_433_tx = -LORA433_MIN_TX_SPACING_TICKS
     for i in range(900):   # 900 個 100ms tick ≈ 90 秒
         t += LORA_TELEM_PERIOD_MS / 1000.0
         if i == 450:
@@ -1030,10 +1046,13 @@ def generate_selftest_events(engine: GsAnalyzerEngine):
             engine.add_pkt_bad(t, LINK_920, global_seq)
             gs_stat["crc920"] += 1
 
-        # 433：每個 tick 都嘗試(LORA433_TX_EVERY=1)，但每 UPLINK_LISTEN_EVERY 個 tick 空出
-        # 最後 1 槽給上行接收窗不發送，稍高雜訊
+        # 433：每個 tick 都嘗試(LORA433_TX_EVERY=1)，但 AUX busy（兩次成功發射至少間隔
+        # LORA433_MIN_TX_SPACING_TICKS 個 tick）與 UPLINK_LISTEN_EVERY 上行接收窗都會
+        # 讓這次嘗試直接被跳過、不真的上空——跳過不佔用下一次的 spacing 起點。
         listen_slot = (i % UPLINK_LISTEN_EVERY) == (UPLINK_LISTEN_EVERY - 1)
-        if (i % LORA433_TX_EVERY) == 0 and not listen_slot:
+        aux_busy = (i - last_433_tx) < LORA433_MIN_TX_SPACING_TICKS
+        if (i % LORA433_TX_EVERY) == 0 and not listen_slot and not aux_busy:
+            last_433_tx = i
             if random.random() > 0.06:
                 engine.add_pkt(t + 0.02, LINK_433, RSSI_SNR_NA, RSSI_SNR_NA, global_seq)
                 gs_stat["ok433"] += 1
