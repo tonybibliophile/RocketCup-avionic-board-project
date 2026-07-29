@@ -93,14 +93,20 @@ LORA433_TX_EVERY = 1
 # 需要用 listen_skip_every 把這個規律間隙扣掉，否則會被誤算成 433 專屬的假丟包。
 UPLINK_LISTEN_EVERY = 10
 
-# 433/E22 實際可達速率不再是「時槽除數」而是空中時間物理上限（見 main.c:2634-2636）：
-# 2400bps、TELEM_PACKET_SIZE=116 bytes → 116*8/2400 ≈ 386.7ms/包 ≈ 2.59 pkt/s，
-# 再扣掉上行接收窗佔用的 1/10 嘗試次數，才是韌體實際會嘗試逼近的速率上限。
-LORA433_AIR_BPS = 2400.0
-LORA433_PACKET_BYTES = 116
-LORA433_AIRTIME_S = LORA433_PACKET_BYTES * 8.0 / LORA433_AIR_BPS
+# 433/E22 實際可達速率不再是「時槽除數」而是空中時間物理上限，但這個空中時間本身
+# ★還沒有實測、只有韌體裡兩份互相矛盾的估計值★：
+#   main.c:2635  ≈386.7ms（116*8bit/2400bps，純位元數/鮑率的天真算法）
+#   lora_e22.c:546 ≈580ms（同一顆模組同一個封包大小，但沒寫算法來源）
+# E22-400T30S 規格書(Datasheets/E22-400T30S_UserManual_EN_v1.8.pdf)證實這顆模組底層
+# 是 LoRa 調變(SX1262)，「air data rate」只是展頻參數的抽象標籤，不是序列埠那種純位元
+# 速率——跟 920(E80/LR1121) 一樣，真實空中時間還要疊加前導碼/表頭等 LoRa 開銷，386.7ms
+# 那個天真算法幾乎必然低估。兩份估計都不可信的情況下，先採用比較保守（考慮了 LoRa 開銷
+# 方向、不是純位元數/鮑率）的 580ms，但這仍然是估計值，不是實測——長遠應該在韌體端
+# 直接量測 AUX 從忙轉閒的實際耗時（例如在 LoRaE22_Send 判定 AUX 轉閒置那一刻打時間戳，
+# 跟上一次成功發送時間戳相減），回填這裡取代猜測值。
+LORA433_AIRTIME_S = 0.580   # ← 估計值，見上方註解；非實測
 NOMINAL_RATE_HZ = {
-    LINK_433: (1.0 / LORA433_AIRTIME_S) * (UPLINK_LISTEN_EVERY - 1) / UPLINK_LISTEN_EVERY,  # ≈2.33 Hz
+    LINK_433: (1.0 / LORA433_AIRTIME_S) * (UPLINK_LISTEN_EVERY - 1) / UPLINK_LISTEN_EVERY,  # ≈1.55 Hz(估計)
     LINK_920: 1000.0 / LORA_TELEM_PERIOD_MS,                        # 10 Hz（受空中時間/BUSY 影響）
 }
 
@@ -110,7 +116,7 @@ NOMINAL_RATE_HZ = {
 # ceil(空中時間/tick週期) 個 tick——這才是「單鏈路 RF 到達率丟失」該拿來當基準的
 # 物理下限，不是排程嘗試頻率。用 LORA433_TX_EVERY(=1) 當 step 等於拿「每 tick 都該
 # 收到」這個不可能達到的標準去算丟失率，即使訊號完美無雜訊也會算出巨大假丟包。
-LORA433_MIN_TX_SPACING_TICKS = math.ceil(LORA433_AIRTIME_S / (LORA_TELEM_PERIOD_MS / 1000.0))  # = 4
+LORA433_MIN_TX_SPACING_TICKS = math.ceil(LORA433_AIRTIME_S / (LORA_TELEM_PERIOD_MS / 1000.0))  # = 6(估計)
 SEQ_STEP = {LINK_433: LORA433_MIN_TX_SPACING_TICKS, LINK_920: 1}
 
 # ===========================================================================
@@ -545,8 +551,9 @@ class GsAnalyzerEngine:
 
             # --- 總通訊頻率（含 CRC 無效）：只要有觸發同步/CRC 檢查就算「有通訊」，不論解碼
             # 是否成功。跟韌體設計排程(見 NOMINAL_RATE_HZ：920≈10Hz，433≈空中時間上限扣上行窗
-            # 後≈2.33Hz)比較，能分辨「RF 前端根本沒收到東西」(總頻率遠低於排定值) 跟「有收到
-            # 但解不出來」(總頻率接近排定值、但有效頻率偏低，即 CRC 錯誤率高) 這兩種完全不同的問題。
+            # 後≈1.55Hz，其中 433 這個空中時間本身是估計值、非實測，見 LORA433_AIRTIME_S 註解)
+            # 比較，能分辨「RF 前端根本沒收到東西」(總頻率遠低於排定值) 跟「有收到但解不出來」
+            # (總頻率接近排定值、但有效頻率偏低，即 CRC 錯誤率高) 這兩種完全不同的問題。
             if len(gs_stats) >= 2:
                 d_total = (gs_stats[-1][ok_key] + gs_stats[-1][crc_key]) - (gs_stats[0][ok_key] + gs_stats[0][crc_key])
                 d_t = gs_stats[-1]["t"] - gs_stats[0]["t"]
@@ -563,9 +570,11 @@ class GsAnalyzerEngine:
                       ">=", total_rate_hz < nominal * SPEC_LIMITS["total_rate_fail_ratio"],
                       total_rate_hz < nominal * SPEC_LIMITS["total_rate_warn_ratio"],
                       f"{total_src}；韌體排定速率≈{nominal:.2f}Hz（920 見 main.c "
-                      f"LORA_TELEM_PERIOD_MS；433 為空中時間物理上限(2400bps/116B)"
-                      f"扣掉 UPLINK_LISTEN_EVERY 上行接收窗後的值）。遠低於排定值代表 "
-                      f"RF 前端可能根本沒收到訊號，而非單純解碼品質問題")
+                      f"LORA_TELEM_PERIOD_MS；433 為空中時間物理上限扣掉 UPLINK_LISTEN_EVERY "
+                      f"上行接收窗後的值，★空中時間本身是估計值(580ms)非實測，見 "
+                      f"LORA433_AIRTIME_S 註解）。遠低於排定值代表 RF 前端可能根本沒收到訊號，"
+                      f"而非單純解碼品質問題——但若持續卡在排定值邊緣，也可能是這個估計值"
+                      f"本身偏樂觀，非真的異常")
 
             # --- CRC 錯誤率：優先用 [GS_STAT] 累計計數（跨整個連線期間，較不受擷取窗切點影響）
             if len(gs_stats) >= 1:
@@ -932,8 +941,9 @@ class ReportGenerator:
         lines.extend([
             "", "---", "",
             "## 排錯建議",
-            "1. **總通訊頻率遠低於排定值(920≈10Hz/433≈2.33Hz)**：RF 前端可能根本沒收到訊號"
-            "（天線/接線/供電/模組未初始化），先查這個再查 CRC，順序不能反。",
+            "1. **總通訊頻率遠低於排定值(920≈10Hz/433≈1.55Hz，433 這個值是估計非實測)**："
+            "RF 前端可能根本沒收到訊號（天線/接線/供電/模組未初始化），先查這個再查 CRC，"
+            "順序不能反；433 若卡在排定值邊緣、CRC 又是 0%，也可能是估計值本身偏樂觀。",
             "2. **總通訊頻率接近排定值，但 CRC 錯誤率偏高**：代表 RF 前端有收到東西、只是解不出來——"
             "檢查天線接頭/駐波、RF 參數(SF/BW/CR 兩端須一致)，或空中速率與雜訊環境不符。",
             "3. **Resync 比例偏高（433）**：多半是空中位元速率不符或強雜訊源干擾，非單純距離問題。",
@@ -1051,8 +1061,8 @@ new Chart(document.getElementById('chartGap'), {{
 def generate_selftest_events(engine: GsAnalyzerEngine):
     """依 main.c LoRaTelemetry_Task 的真實排程模擬：兩鏈路共用同一個每 100ms 遞增的全域
     seq，920 幾乎每個 tick 都發；433 每個 tick 都嘗試呼叫 LoRaE22_Send()(LORA433_TX_EVERY=1)，
-    但 AUX busy（上一包空中時間還沒跑完，~4 個 tick）時會直接跳過不等待，所以兩次
-    成功發射之間最少要隔 LORA433_MIN_TX_SPACING_TICKS 個 tick；此外每 UPLINK_LISTEN_EVERY
+    但 AUX busy（上一包空中時間還沒跑完，見 LORA433_AIRTIME_S 估計值）時會直接跳過不等待，
+    所以兩次成功發射之間最少要隔 LORA433_MIN_TX_SPACING_TICKS 個 tick；此外每 UPLINK_LISTEN_EVERY
     (=10) 個 tick 固定空出 1 個不發、留給上行接收窗。這兩個規律間隙都是設計行為、不是
     遺失，calc_tick_loss() 用 step/listen_skip_every 正規化，selftest 資料若不照這個
     排程生成就測不出這項邏輯有沒有壞掉。"""
