@@ -95,3 +95,11 @@ local.mk
 # Makefile 自動產生的版本標頭與備份檔（每次建置更新，不納版控）
 firmware/main_flight_code/Core/Inc/build_version.h
 firmware/main_flight_code/Core/Inc/board_config.h.rolebak
+
+# --- 地面站工具產出（皆為工具自動產生，可由原始 log 重新生成，不納版控） ---
+# 串列監聽 log 與即時圖表 PNG（動輒數百 MB）
+ground_station/logs/
+# ground_station_analyzer 產出的分析報告（html/json/md，每次執行都新增一份）
+ground_station/reports/
+# gps_live_analyzer / 即時側錄的每場 run 目錄（報告 + plot + raw log）
+ground_station/runs/
