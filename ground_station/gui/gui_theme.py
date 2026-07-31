@@ -503,6 +503,40 @@ def _first_sibling(widget):
     return siblings[0] if siblings else None
 
 
+FLASH_BANNER_TEXT = ("💾 FLASH 尚未擦除 — 已擦池未達標，ARM 會被擋下；"
+                     "請先下 `flash erase`（整環，飛前正規流程）或 `flash pool`（快速填池）")
+
+
+def make_flash_banner(parent):
+    """★2026-07-31：Flash 未擦除橫幅。航電開機不再自動擦除（改為使用者觸發），
+    因此「該擦而沒擦」在地面站端沒有任何自然徵兆——沒有這條橫幅，操作員只會在按下
+    ARM 被擋時才發現。與電梯 profile 橫幅共用同一套顯示/閃爍機制（見
+    _blink_elevator_banner 對 winfo_manager() 的說明）。"""
+    banner = tk.Label(parent, text=FLASH_BANNER_TEXT, font=F_HDR, fg="#000000", bg=YELLOW,
+                       anchor="center", pady=6, cursor="")
+    banner._blinking = False
+    banner._blink_on = False
+    return banner
+
+
+def update_flash_banner(root, banner, active, detail=""):
+    """active=True 顯示（並啟動閃爍）、False 隱藏。detail 例如 "池 320/1500 sectors"。"""
+    if active:
+        banner.config(text=FLASH_BANNER_TEXT + (f"\n（{detail}）" if detail else ""))
+        if not banner.winfo_manager():   # 見 _blink_elevator_banner 註解：不可用 winfo_ismapped()
+            sib = _first_sibling(banner)
+            if sib is not None:
+                banner.pack(side=tk.TOP, fill=tk.X, before=sib)
+            else:
+                banner.pack(side=tk.TOP, fill=tk.X)
+        if not banner._blinking:
+            banner._blinking = True
+            _blink_elevator_banner(root, banner)
+    else:
+        if banner.winfo_manager():
+            banner.pack_forget()
+
+
 def spam_elevator_console_warning(console_widget, who_text="", tag="elevator_warn"):
     """在主控台洗一行醒目警告（呼叫端需先對 console_widget 執行一次
     `console_widget.tag_config("elevator_warn", **gui_theme.ELEVATOR_WARN_TAG_CFG)`）。
