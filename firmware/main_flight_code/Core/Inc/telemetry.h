@@ -46,6 +46,11 @@ extern "C" {
 /* arm_flags 位元定義（flags 8 位已滿，ARM 被擋原因獨立一個 byte，供地面站顯示） */
 #define TELEM_ARM_BLOCKED_FLASH_POOL 0x01U  /* ARM 已送出但 flash 預擦池未達標，仍留 STATE_PAD
                                               * （fail-open：flash 停用/未偵測到/未記錄時不會設此位） */
+#define TELEM_ARM_NEED_ERASE         0x02U  /* ★2026-07-31：池未達標「且尚未按 ARM」——開機不再自動
+                                              * 擦除，此位讓地面站在使用者按 ARM「之前」就看到需要先
+                                              * 擦除（下 `flash erase` 或 `flash pool`）。與 bit0 的差別：
+                                              * bit0 是「已按 ARM 但被擋」，bit1 是「還沒按就先警告」。
+                                              * ★沿用既有 arm_flags 空位，封包長度不變 ⇒ 不需三板同燒。 */
 
 /* peer_link 位（主/副協同下鏈：主板把副板鏈路健康中繼給地面，供雙板監看） */
 #define TELEM_PEER_EVER    0x01U  /* 曾收過對端封包（valid） */

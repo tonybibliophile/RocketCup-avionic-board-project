@@ -37,6 +37,7 @@ extern volatile uint8_t  g_sensor_fault_bits;   /* P0-D：感測器健康彙整�
 extern volatile uint8_t  g_hotstart_restored;   /* P0-F：熱啟動恢復鎖存 */
 extern volatile uint8_t  g_main_deployed;       /* 主傘已部署鎖存（PD14 曾拉高；只高 1.5s 故需鎖存） */
 extern volatile uint8_t  g_arm_blocked_flash;   /* ARM 被 flash pool 未達標擋下（見 FSM_Update） */
+extern volatile uint8_t  g_flash_need_erase;    /* ★池未達標、尚未按 ARM 就先警告（見 main.c） */
 extern volatile float    g_vf_h_m;              /* 垂直濾波器 (VF) 高度 (m)，FEATURE_VFILTER=0 時恆為 0 */
 extern volatile float    g_vf_v_ms;             /* 垂直濾波器 (VF) 垂直速度 (m/s) */
 extern volatile float    g_max_alt_m;           /* 飛行滾動極值：最大相對高度 (m)，ARM 時歸零 */
@@ -187,8 +188,11 @@ uint16_t Telemetry_Build(uint8_t *out)
     pkt.peer_bench_arb = 0U;
 #endif
 
-    /* --- ARM 被擋下原因（fail-open 已在 FSM_Update 組 flash_pool_ready 時處理，這裡只回報） --- */
-    pkt.arm_flags = g_arm_blocked_flash ? TELEM_ARM_BLOCKED_FLASH_POOL : 0U;
+    /* --- ARM 被擋下原因（fail-open 已在 FSM_Update 組 flash_pool_ready 時處理，這裡只回報） ---
+     * ★2026-07-31：加上 NEED_ERASE——開機不再自動擦除，地面站必須在使用者按 ARM「之前」
+     * 就看得到「還沒擦」，否則只會在按下 ARM 被擋時才發現（見 main.c g_flash_need_erase）。 */
+    pkt.arm_flags = (uint8_t)((g_arm_blocked_flash ? TELEM_ARM_BLOCKED_FLASH_POOL : 0U) |
+                              (g_flash_need_erase  ? TELEM_ARM_NEED_ERASE         : 0U));
 
     /* --- 電梯測試 profile 醒目標示：本板依編譯期巨集直填；對端（副板）由板間鏈路中繼
      * （僅主板下鏈才看得到對端，FEATURE_LINK=0 時 pr 已在上面全 0，peer 位自然不會設）。 --- */

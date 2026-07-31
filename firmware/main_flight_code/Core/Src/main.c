@@ -163,6 +163,11 @@ uint32_t g_flash_current_flight_id = 0;         /* Flash ring flight/session ID�
 static uint8_t g_flash_flight_id_active = 0;    /* 1 = 本次 ARM/飛行已分配 flight_id */
 uint32_t g_flash_write_fail_count = 0;          /* Flash 寫入失敗累計（先前完全靜默，現在可觀測） */
 volatile uint8_t g_flash_erase_in_progress = 0; /* 1 = 正在執行 flash erase（阻塞式）；此時 ARM 一律拒絕 */
+/* ★2026-07-31：1 = 已擦池未達 FLASH_RING_PREERASE_TARGET，需要使用者下 `flash erase`／
+ * `flash pool`。開機不再自動擦除（見 StartDefaultTask 開機序列），故此旗標是使用者唯一
+ * 的提醒來源：主迴圈 1Hz 橫幅（USB/LoRa 文字）＋下鏈 arm_flags 的 TELEM_ARM_NEED_ERASE
+ * （地面站 GUI 顯示）。ARM 本身由 fsm.c 既有的 flash_pool_ready 閘擋下，非靠此旗標。 */
+volatile uint8_t g_flash_need_erase = 0;
 
 static void FlashFlight_SetLastId(uint32_t last_id, uint8_t active)
 {
@@ -3359,8 +3364,9 @@ static void cmd_print_help(void)
 #else
            "  （BACKUP 無 LoRa 硬體，無 e22/e80 命令）\r\n"
 #endif
-           "  flash erase [ring]   只清 Ring Buffer 飛行紀錄（保留校準/mag/LoRa/總結）\r\n"
+           "  flash erase [ring]   只清 Ring Buffer 飛行紀錄（保留校準/mag/LoRa/總結）★飛前正規流程，~3min\r\n"
            "  flash erase all      清整顆 Flash（含校準/總結/紀錄，需重新校正）\r\n"
+           "  flash pool           快速填池：只補到 ARM 門檻，不動整環（bench 省時用）\r\n"
            "  flash export         格式化匯出 Flash 數據為 CSV 串流\r\n"
            "  CMD_MAG_CAL:x,y,z（整數 raw ADC counts，非 mG/Gauss）/ CMD_MAG_YAW_LOCK:0|1 / CMD_RESET_CAL（磁力計校正）\r\n"
            "  CMD_MAG_CAL_START / CMD_MAG_CAL_STOP（[MAG] 1Hz<->50Hz，供硬鐵校正腳本快速收集樣本）\r\n"
@@ -3744,6 +3750,32 @@ void Parse_Serial_Command(const char* cmd) {
                     g_parse_status = ACK_REJECTED;
                 }
             }
+        } else if (strcmp(tok[1], "pool") == 0) {
+            /* ★2026-07-31：快速填池。只把已擦池補到 FLASH_RING_PREERASE_TARGET 達標，
+             * 不動整環（已擦部分不重擦）。用途：bench 反覆測試、或飛前已整環全擦過但
+             * 池被寫掉一部分時的省時補救。飛前正規流程仍是 `flash erase`。
+             * 與 `flash erase` 共用同一組保護：擦除期間禁止 ARM 生效（見上方說明）。 */
+            printf("[FLASH] 快速填池：目標 %u sectors（只補不足部分，不動整環）...\r\n",
+                   (unsigned)FLASH_RING_PREERASE_TARGET);
+            g_flash_erase_in_progress = 1U;
+#if FEATURE_LINK
+            uint32_t pool_now = FlashRing_TopUpPool(FlashPreErase_ProgressCallback);
+#else
+            uint32_t pool_now = FlashRing_TopUpPool(NULL);
+#endif
+            g_flash_erase_in_progress = 0U;
+            HAL_IWDG_Refresh(&hiwdg);
+            g_flash_logging_active = 1;
+            g_flash_need_erase = (pool_now < FLASH_RING_PREERASE_TARGET) ? 1U : 0U;
+            if (g_flash_need_erase) {
+                printf("[FLASH] ★填池未達標（%lu/%u）：環內可能有殘留舊資料擋住，"
+                       "請改下 `flash erase` 整環全擦。ARM 仍被擋。\r\n",
+                       (unsigned long)pool_now, (unsigned)FLASH_RING_PREERASE_TARGET);
+                g_parse_status = ACK_REJECTED;
+            } else {
+                printf("[FLASH] 填池完成（%lu/%u），可以 ARM。\r\n",
+                       (unsigned long)pool_now, (unsigned)FLASH_RING_PREERASE_TARGET);
+            }
         } else if (strcmp(tok[1], "dump") == 0) {
             SPI3_Bus_Lock();
             Flash_DumpAll();
@@ -3806,7 +3838,7 @@ void Parse_Serial_Command(const char* cmd) {
             printf("[FLASH] Export finished. Total %lu packets.\r\n", (unsigned long)read_count);
             SPI3_Bus_Unlock();
         } else {
-            printf("[FLASH] 未知指令 (格式: flash dump / flash erase [ring|all] / flash export)\r\n");
+            printf("[FLASH] 未知指令 (格式: flash dump / flash erase [ring|all] / flash pool / flash export)\r\n");
             g_parse_status = ACK_UNKNOWN;
         }
 
@@ -4914,6 +4946,31 @@ void StartDefaultTask(void *argument)
             printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\r\n\r\n");
         }
     }
+
+#if FEATURE_FLASH
+    /* === ★2026-07-31：Flash 池未達標橫幅（1Hz，僅地面狀態）===
+     * 開機不再自動擦除，所以「該擦而沒擦」不會有任何自然徵兆——沒有這行提醒，使用者只會
+     * 在按下 ARM 之後才發現被擋。與電梯 profile 橫幅同一套節奏/條件（飛行中不印，理由同上：
+     * printf 在飛行熱路徑會拖慢主迴圈）。旗標每輪重算，擦完即自動消失。
+     * 注意 fail-open 條件與 FSM_Update 組 flash_pool_ready 時一致：flash 沒偵測到或已停止
+     * 記錄時不擋 ARM，也就不該再喊「需要擦除」。 */
+    if (tick % 1000 == 500 && (current_fsm_state == STATE_INIT ||
+                               current_fsm_state == STATE_PAD  ||
+                               current_fsm_state == STATE_PAD_ARMED)) {
+        uint32_t pool_now = FlashRing_GetPoolSectors();
+        g_flash_need_erase = (flash_ring_hw_ok && g_flash_logging_active &&
+                              pool_now < FLASH_RING_PREERASE_TARGET) ? 1U : 0U;
+        if (g_flash_need_erase) {
+            printf("\r\n**********************************************************************\r\n");
+            printf("*** [FLASH_NOT_READY] 已擦池 %lu/%u sectors —— ARM 已被擋下 ***\r\n",
+                   (unsigned long)pool_now, (unsigned)FLASH_RING_PREERASE_TARGET);
+            printf("*** 飛前請下 `flash erase`（整環全擦 ~3min，正規流程）              ***\r\n");
+            printf("*** 或 `flash pool`（只補不足部分，bench 省時用）                   ***\r\n");
+            printf("*** USB console 與 LoRa 上行文字指令皆可                            ***\r\n");
+            printf("**********************************************************************\r\n\r\n");
+        }
+    }
+#endif
 
     /* === FSM 飛行狀態 LED（每 100ms 更新）—— 電梯/台面測試用肉眼確認狀態機推進 ===
      * STAT1 (PE3) / STAT2 (PE4) 依 current_fsm_state 編碼（active-high；SYS=心跳另計）：
