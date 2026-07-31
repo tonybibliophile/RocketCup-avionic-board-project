@@ -163,11 +163,12 @@ uint32_t g_flash_current_flight_id = 0;         /* Flash ring flight/session ID�
 static uint8_t g_flash_flight_id_active = 0;    /* 1 = 本次 ARM/飛行已分配 flight_id */
 uint32_t g_flash_write_fail_count = 0;          /* Flash 寫入失敗累計（先前完全靜默，現在可觀測） */
 volatile uint8_t g_flash_erase_in_progress = 0; /* 1 = 正在執行 flash erase（阻塞式）；此時 ARM 一律拒絕 */
-/* ★2026-07-31：1 = 已擦池未達 FLASH_RING_PREERASE_TARGET，需要使用者下 `flash erase`／
- * `flash pool`。開機不再自動擦除（見 StartDefaultTask 開機序列），故此旗標是使用者唯一
- * 的提醒來源：主迴圈 1Hz 橫幅（USB/LoRa 文字）＋下鏈 arm_flags 的 TELEM_ARM_NEED_ERASE
- * （地面站 GUI 顯示）。ARM 本身由 fsm.c 既有的 flash_pool_ready 閘擋下，非靠此旗標。 */
-volatile uint8_t g_flash_need_erase = 0;
+/* ★2026-08-01：`flash erase` 跨板中繼。主航電每收到一次擦除命令就 +1，隨 20Hz 狀態封包
+ * 廣播（LinkPacket_t.erase_req）；副航電偵測到值變化就跑同一條 `flash erase`。
+ * 為何是計數器而非鎖存旗標，見 link_proto.h erase_req 欄位註解。 */
+volatile uint8_t g_flash_erase_req_seq = 0;
+/* 副航電端：偵測到主航電 erase_req 變化後排入的待辦（實際擦除在診斷任務執行，見取用處）。 */
+volatile uint8_t g_peer_erase_pending = 0;
 /* ★2026-07-31：1 = 要求飛控主迴圈（StartDefaultTask 的 for(;;)）停在迴圈頂端讓路，
  * 供 flash erase/pool 期間使用。合作式停車，不用 osThreadSuspend——理由見迴圈頂端註解
  * （持 SPI3 鎖時被強制掛起會與擦除端死鎖）。LoRa 遙測任務刻意不停，進度才送得出去。 */
@@ -178,6 +179,11 @@ static void FlashErase_PauseFlightLoop(void)
 {
     if (g_erase_pause_flight_loop) return;   /* 已經停了（巢狀呼叫防呆） */
     g_erase_pause_flight_loop = 1U;
+#if FEATURE_BUZZER
+    /* 命令回覆短嗶由飛控迴圈的 Buzzer_Service 推進；主迴圈一停，正響到一半的那聲就
+     * 沒人關得掉，會整段擦除（~3min）持續叫。停車前直接把 PWM 關掉。 */
+    htim2.Instance->CCR1 = 0;
+#endif
     /* 主迴圈一輪 1ms 級，等 50ms 綽綽有餘；不做確認握手以免多一組狀態要維護。 */
     osDelay(50);
     printf("[FLASH_ERASE] 飛控主迴圈已暫停讓路（LoRa 遙測與指令台照常運作）\r\n");
@@ -359,6 +365,7 @@ void StartDefaultTask(void *argument);
 /* USER CODE BEGIN PFP */
 uint16_t ADC_Read_Battery_mv(void);
 void LoRaTelemetry_Task(void *argument);   /* 5Hz 下行遙測：E22(433) + E80(920) */
+static void FlashArm_ReportStatus(void);   /* ARM 邊緣：印一行雙板 flash 擦除/池確認 */
 #ifdef ENABLE_DIAGNOSTICS
 void StartDiagnosticTask(void *argument);
 #endif
@@ -1930,12 +1937,17 @@ static void Servo_MainHigh(void)
     HAL_GPIO_WritePin(PWM_Servo_GPIO_Port, PWM_Servo_Pin, GPIO_PIN_SET);   /* 純 GPIO 拉高（無 PWM） */
 }
 
+/* 尋標蜂鳴器已停 → 解除 TIM2 獨佔，短嗶回覆（Buzzer_RequestBeeps）可再度生效。
+ * 定義在下方蜂鳴器區塊；此處先宣告，避免為了一行旗標把整段搬到 App_ExecuteRecovery 之前。 */
+static void Buzzer_ClearBeacon(void);
+
 void App_ExecuteRecovery(void)
 {
     printf("[RECOVERY] 執行尋回指令：停止蜂鳴器並安全關閉記錄...\r\n");
 #if FEATURE_BUZZER
     htim2.Instance->CCR1 = 0;
 #endif
+    Buzzer_ClearBeacon();   /* FEATURE_BUZZER=0 時為空函式 */
     if (sd_imu_bin_active) {
         extern FIL SDImuFile;
         if (s_imu_len > 0U) {
@@ -1961,6 +1973,77 @@ void App_ExecuteRecovery(void)
     }
 }
 
+/* === 蜂鳴器：非阻塞短嗶序列（「航電收到地面站命令」的聲音回覆） ===
+ * 台上操作員看不到 console，也不見得盯著地面站畫面；命令有沒有真的進到火箭，靠耳朵最快。
+ * 收到任一筆通過 CRC 的上行命令 → 嗶 3 短聲（副航電則在跟隨對端中繼的手動開傘命令時嗶）。
+ *
+ * ★必須非阻塞：呼叫端是 1kHz 飛控迴圈與遙測任務，3 短聲 ≈ 500ms，用 HAL_Delay 會把
+ *   開傘判定整個延後（開機提示音可以阻塞，那是在 RTOS 起來之前）。故只登記次數，
+ *   由 Buzzer_Service() 於飛控迴圈每週期推進狀態機。
+ * ★與落地尋標蜂鳴器共用 TIM2：尋標一旦啟動就獨佔（那是找火箭用的，不能被短嗶打斷），
+ *   此時嗶聲請求直接丟棄。 */
+#if FEATURE_BUZZER
+#define BUZZ_ACK_ARR      499U   /* TIM2 時基 1MHz → 1e6/(499+1) = 2 kHz，與開機提示音同音高 */
+#define BUZZ_ACK_ON_MS     80U
+#define BUZZ_ACK_OFF_MS    90U
+static volatile uint8_t s_buzz_pending = 0U;  /* 待嗶次數（其他任務寫入） */
+static uint8_t          s_buzz_left    = 0U;  /* 本序列剩餘次數 */
+static uint8_t          s_buzz_on      = 0U;  /* 目前在「響」的半週期 */
+static uint32_t         s_buzz_tick    = 0U;  /* 目前半週期起始 tick */
+static uint8_t          s_buzz_beacon  = 0U;  /* 1 = 落地尋標蜂鳴器已啟動（獨佔 TIM2） */
+#endif
+
+/* 登記 n 短聲（非阻塞，立即返回）。可由任何任務呼叫。 */
+void Buzzer_RequestBeeps(uint8_t n)
+{
+#if FEATURE_BUZZER
+    if (s_buzz_beacon) return;         /* 尋標中：不打斷 */
+    s_buzz_pending = n;
+#else
+    (void)n;
+#endif
+}
+
+static void Buzzer_ClearBeacon(void)
+{
+#if FEATURE_BUZZER
+    s_buzz_beacon = 0U;
+#endif
+}
+
+/* 由飛控迴圈每週期呼叫一次，推進嗶聲狀態機。 */
+static void Buzzer_Service(uint32_t now)
+{
+#if FEATURE_BUZZER
+    if (s_buzz_beacon) { s_buzz_pending = 0U; s_buzz_left = 0U; return; }
+
+    if (s_buzz_left == 0U && s_buzz_pending != 0U) {   /* 起新序列 */
+        s_buzz_left    = s_buzz_pending;
+        s_buzz_pending = 0U;
+        s_buzz_on      = 0U;
+        s_buzz_tick    = now - BUZZ_ACK_OFF_MS;        /* 立刻進入第一聲 */
+    }
+    if (s_buzz_left == 0U) return;
+
+    if (!s_buzz_on) {
+        if ((now - s_buzz_tick) >= BUZZ_ACK_OFF_MS) {
+            htim2.Instance->ARR  = BUZZ_ACK_ARR;
+            htim2.Instance->CCR1 = BUZZ_ACK_ARR / 2U;
+            htim2.Instance->EGR  = TIM_EGR_UG;
+            s_buzz_on   = 1U;
+            s_buzz_tick = now;
+        }
+    } else if ((now - s_buzz_tick) >= BUZZ_ACK_ON_MS) {
+        htim2.Instance->CCR1 = 0;
+        s_buzz_on   = 0U;
+        s_buzz_tick = now;
+        s_buzz_left--;
+    }
+#else
+    (void)now;
+#endif
+}
+
 /* === FSM 包裝層（P0-A）：純邏輯已抽離至 fsm.c/h，由 tests/test_fsm.c 驗證 ===
  * 此處職責：組輸入快照 → FSM_Step() → 執行硬體動作 → 鏡射全域 → 事件列印。
  * 硬體動作（PD13 點火/PD14 主傘/蜂鳴器）嚴格先於 printf：避免 UART 阻塞（~9ms/行）延遲開傘。 */
@@ -1970,6 +2053,19 @@ volatile uint8_t g_fsm_failsafe_fired = 0;   /* 失效保護點火鎖存（telem
 static uint8_t         g_servo_arb_bcast    = SERVO_ARB_MSG_NONE; /* 供 Link_BuildOwnStatus 廣播 */
 static uint8_t         g_servo_want_latched = 0U;                 /* want 一旦成立即鎖存（開傘不撤回） */
 static uint8_t         g_servo_high         = 0U;                 /* 邊緣偵測：目前 PD14 是否拉高中 */
+/* ★手動開傘命令鎖存（LINK_CMD_DEPLOY_*）：本板已知曉的「人下的開傘命令」，來源可為
+ *   (a) 本板 433 上行 / USB 文字（僅主航電有 FEATURE_UPLINK_DEPLOY），或
+ *   (b) 對端經板間鏈路中繼過來。
+ * 由 Link_BuildOwnStatus 以 20Hz 持續廣播 → 「地面站只打給主航電，副航電也一起開」。
+ * 兩板都會把已知曉的命令回廣播（等冪），故任一板中途重開機仍會被對端重新帶起來。
+ * ★DISARM 會整組清掉（Deploy_ResetLatches），否則桌面測試開過一次傘之後這個鎖存會一直
+ *   廣播下去，兩板重新 ARM 時立刻又開一次。 */
+static volatile uint8_t g_manual_deploy_cmd = 0U;
+/* 手動開傘執行狀態（檔案作用域而非函式內 static：Deploy_ResetLatches 要能清掉）。 */
+static uint8_t  g_man_drogue_active = 0U;   /* PD13 手動導通中（限時保護計時中） */
+static uint32_t g_man_drogue_tick   = 0U;
+static uint8_t  g_man_drogue_done   = 0U;   /* 已執行過：鎖存命令會一直在，需邊緣化 */
+static uint8_t  g_man_main_done     = 0U;
 volatile uint8_t g_main_deployed = 0U;       /* 主傘已部署鎖存（PD14 曾拉高）：PD14 只高 1.5s，
                                               * 不能像舊 PWM 那樣由腳位/CCR 現況推導，否則
                                               * 下鏈 TELEM_FLAG_MAIN_DEPLOYED 只會亮 1.5s，
@@ -2015,6 +2111,46 @@ void ExtremaTrack_Reset(void)
     g_max_acc_g    = 0.0f;
     g_drogue_alt_m = TELEM_DEPLOY_ALT_NA;
     g_main_alt_m   = TELEM_DEPLOY_ALT_NA;
+}
+
+/* === DISARM：開傘旗標整組重置 ===
+ * 開傘相關旗標的設計語意都是「一旦成立就鎖存、飛行中不撤回」（開傘不能反悔）。DISARM 是
+ * 宣告「上一次飛行／桌面測試結束」的唯一時機，不在此清乾淨的話：
+ *   - g_manual_deploy_cmd 會一直 20Hz 廣播給對端，兩板下次 ARM 一武裝就立刻又開一次；
+ *   - g_man_*_done / g_servo_want_latched 讓 FSM 以為傘已開，下次飛行不再點火；
+ *   - g_main_deployed / 開傘高度 / peer 鎖存讓地面站顯示上一輪的殘影。
+ * 呼叫點是 FSM_Update 內偵測到「進入 STATE_PAD」的狀態邊緣——四個 DISARM 入口
+ * （uplink_cmd.c 二進制 DISARM、本檔 `disarm` 文字指令、副板鏈路同步、reset）
+ * 全都是直接 FSM_SetState(STATE_PAD)，不會產生 FSM_EVT_DISARMED 事件，掛事件是死碼。 */
+static void Deploy_ResetLatches(void)
+{
+    /* 硬體先歸位：殘留的 PD13 導通會一直燒馬達 */
+    HAL_GPIO_WritePin(FIRE_GPIO_Port, FIRE_Pin, GPIO_PIN_RESET);
+    Servo_HoldLow();
+
+    g_manual_deploy_cmd = 0U;
+    g_man_drogue_active = 0U;
+    g_man_drogue_tick   = 0U;
+    g_man_drogue_done   = 0U;
+    g_man_main_done     = 0U;
+
+    g_servo_want_latched = 0U;
+    g_servo_high         = 0U;
+    g_servo_arb_bcast    = SERVO_ARB_MSG_NONE;
+    ServoArb_Init(&g_servo_arb);          /* HIGH/DONE → IDLE，下次飛行才能再拉高 */
+
+    g_main_deployed      = 0U;
+    g_fsm_failsafe_fired = 0U;
+    g_fsm_ctx.drogue_fired = 0U;
+    g_drogue_alt_m = TELEM_DEPLOY_ALT_NA;
+    g_main_alt_m   = TELEM_DEPLOY_ALT_NA;
+
+#if FEATURE_UPLINK_DEPLOY
+    UplinkCmd_ClearPendingDeploy();       /* 尚未被取走的 pending 開傘請求一併作廢 */
+#endif
+#if FEATURE_LINK
+    Link_ClearPeerDeployLatches();
+#endif
 }
 
 /* 空中熱重啟還原：由 Flash ring 最後一筆封包把飛行摘要接回來。
@@ -2098,15 +2234,16 @@ static void FSM_Update(void)
 #else
     in.peer_drogue_cmd = 0U;
 #endif
-    /* ARM flash-pool 閘（選項 A：fail-open）——flash 停用/未偵測到/未在記錄時恆視為就緒，
-     * 不擋 ARM；只有「flash 確實啟用中且正在記錄」才要求池達 FLASH_RING_PREERASE_TARGET。 */
-#if FEATURE_FLASH
-    in.flash_pool_ready = (!flash_ring_hw_ok || !g_flash_logging_active)
-                          ? 1U
-                          : (FlashRing_GetPoolSectors() >= FLASH_RING_PREERASE_TARGET) ? 1U : 0U;
-#else
+    /* ARM flash-pool 閘：★2026-08-01 使用者決策——不設 ARM 防護，一律放行。開機序列已自動
+     * 補擦到 FLASH_RING_PREERASE_TARGET（見 StartDefaultTask），池未達標不再是會發生的狀態，
+     * 沒有需要擋的對象。
+     *
+     * ★歷史註記：這個閘在此之前也「從未真正擋過」ARM——三個 ARM 入口（uplink_cmd.c 二進制
+     * ARM、本檔 `arm` 文字指令、副板鏈路同步）都是直接 FSM_SetState(STATE_PAD_ARMED)，等
+     * FSM_Step 跑到時 ctx->state 已是 PAD_ARMED，fsm.c 的 `case STATE_PAD` 分支永遠走不到。
+     * 要重啟防護的話，改這裡的值不夠，得同時在那三個入口加閘。
+     * fsm.c 的閘保留為純邏輯層防線（tests/test_fsm.c 仍覆蓋），本層固定餵 1 使其不生效。 */
     in.flash_pool_ready = 1U;
-#endif
 #if defined(FEATURE_FORCE_BARO_ONLY) && FEATURE_FORCE_BARO_ONLY
     in.est_healthy    = 0U;   /* [TEST ONLY] 強制降級使用純氣壓開傘鏈（忽略估計器的高度/速度判定） */
 #else
@@ -2269,40 +2406,80 @@ static void FSM_Update(void)
         }
     }
 
-#if FEATURE_UPLINK_DEPLOY
-    /* 上行手動開傘（地面站 433 命令，uplink_cmd 已經 ARM→DEPLOY 兩段式驗證）。
+#if (FEATURE_UPLINK_DEPLOY || FEATURE_LINK)
+    /* === 手動開傘統一執行點（主/備兩板同一段程式碼）===
+     * 命令來源有二，執行路徑完全相同：
+     *   (a) 本板直接收到（433 上行 / USB 文字；uplink_cmd 已做 ARM→DEPLOY 兩段式驗證）
+     *       —— 只有主航電編入（FEATURE_UPLINK_DEPLOY = IS_PRIMARY）。
+     *   (b) ★對端經板間鏈路中繼（LINK_CMD_DEPLOY_*）—— 地面站只打得到主航電，副航電
+     *       靠這條一起開傘。中繼的是「命令」而非「已開傘事實」，故可直接跟隨；不會被
+     *       主航電提前 4s 的 FSM 動態預測牽走（那條仍只走 flags/peer_drogue_cmd）。
      * 與 FSM 自動點火並存：副傘直接驅動點火輸出並鎖存 drogue_fired（防 FSM 二次點火）；
-     * 主傘改走上方共開路徑（g_servo_want_latched）。下行 DROGUE_FIRED（PD13 現況）/
-     * MAIN_DEPLOYED（g_main_deployed 鎖存）旗標即為地面站確認。 */
+     * 主傘走上方共開路徑（g_servo_want_latched）。下行 DROGUE_FIRED（PD13 現況）/
+     * MAIN_DEPLOYED（g_main_deployed 鎖存）旗標即為地面站確認——兩板各自回報，地面站
+     * 從 peer_flags 就能看出副航電是否真的跟著開了。 */
     {
-        static uint8_t  s_man_drogue_active = 0U;
-        static uint32_t s_man_drogue_tick   = 0U;
         uint8_t man_drogue = 0U, man_main = 0U;
-        if (UplinkCmd_TakeDeploy(&man_drogue, &man_main)) {
-            if (man_drogue) {
-                HAL_GPIO_WritePin(FIRE_GPIO_Port, FIRE_Pin, GPIO_PIN_SET);   // 手動啟動副傘 DC 馬達
-                g_fsm_ctx.drogue_fired = 1U;
-                s_man_drogue_active = 1U;
-                s_man_drogue_tick   = now;
+
+#if FEATURE_UPLINK_DEPLOY
+        (void)UplinkCmd_TakeDeploy(&man_drogue, &man_main);   /* (a) 本板直接收到 */
+#endif
+#if FEATURE_LINK
+        /* (b) 對端中繼。誤觸防護與主航電那側同條件（uplink_cmd.c 的 in_flight || armed）：
+         * 本板須已武裝或已在飛行中。副航電的 ARM 本來就由 Link_PublishTick 於 50ms 內
+         * 自動跟隨主航電，正常時序下這條閘不會擋到任何真命令；若命令早到一步，鎖存值
+         * 仍在，下一個週期閘一開就會補開，不會漏掉。 */
+        {
+            const LinkPeer_t *cmd_peer = Link_GetPeer();
+            uint8_t deploy_allowed = (g_fsm_ctx.state >= STATE_PAD_ARMED &&
+                                      g_fsm_ctx.state <= STATE_MAIN_DEPLOY) ? 1U : 0U;
+            if (deploy_allowed) {
+                if (cmd_peer->cmd_drogue_latched) man_drogue = 1U;
+                if (cmd_peer->cmd_main_latched)   man_main   = 1U;
             }
-            if (man_main) {
-                /* 手動主傘走同一條共開路徑：PD14 拉高 1.5s 後自動回低，並廣播 MAIN_HIGH
-                 * 呼叫對端一起開（單板無鏈路時就只是本板拉高，行為不變）。 */
-                g_servo_want_latched = 1U;
-            }
+        }
+#endif
+        /* 命令鎖存 + 回廣播：讓對端也知道（等冪），任一板重開機可被對方重新帶起來。 */
+        if (man_drogue) g_manual_deploy_cmd |= LINK_CMD_DEPLOY_DROGUE;
+        if (man_main)   g_manual_deploy_cmd |= LINK_CMD_DEPLOY_MAIN;
+
+        if (man_drogue && !g_man_drogue_done) {
+            g_man_drogue_done = 1U;
+            Buzzer_RequestBeeps(3U);     /* 收到開傘命令 → 嗶 3 聲（副航電走中繼時的唯一聲音回覆） */
+            HAL_GPIO_WritePin(FIRE_GPIO_Port, FIRE_Pin, GPIO_PIN_SET);   // 手動啟動副傘 DC 馬達
+            g_fsm_ctx.drogue_fired = 1U;
+            g_man_drogue_active = 1U;
+            g_man_drogue_tick   = now;
+            printf("[MANUAL] *** 手動開副傘 *** PD13 導通 %lu ms (state=%s h=%d cm)\r\n",
+                   (unsigned long)FSM_DROGUE_MOTOR_RUN_MS,
+                   link_fsm_state_name((uint8_t)g_fsm_ctx.state), (int)(in.h_est * 100.0f));
+        }
+        if (man_main && !g_man_main_done) {
+            g_man_main_done = 1U;
+            Buzzer_RequestBeeps(3U);     /* 收到開傘命令 → 嗶 3 聲 */
+            /* 手動主傘走同一條共開路徑：PD14 拉高 1.5s 後自動回低，並廣播 MAIN_HIGH
+             * 呼叫對端一起開（單板無鏈路時就只是本板拉高，行為不變）。 */
+            g_servo_want_latched = 1U;
+            printf("[MANUAL] *** 手動開主傘 *** PD14 拉高 %u ms (state=%s h=%d cm)\r\n",
+                   (unsigned)SERVO_MAIN_HIGH_MS,
+                   link_fsm_state_name((uint8_t)g_fsm_ctx.state), (int)(in.h_est * 100.0f));
         }
         /* 手動副傘導通限時保護：FSM_DROGUE_MOTOR_RUN_MS 後斷開馬達（同 FSM 自身馬達限時）。 */
-        if (s_man_drogue_active && (now - s_man_drogue_tick) >= FSM_DROGUE_MOTOR_RUN_MS) {
+        if (g_man_drogue_active && (now - g_man_drogue_tick) >= FSM_DROGUE_MOTOR_RUN_MS) {
             HAL_GPIO_WritePin(FIRE_GPIO_Port, FIRE_Pin, GPIO_PIN_RESET);
-            s_man_drogue_active = 0U;
+            g_man_drogue_active = 0U;
         }
+    }
 
+#if FEATURE_UPLINK_DEPLOY
+    {
         uint8_t rec_seq = 0;
         if (UplinkCmd_TakeRecovery(&rec_seq)) {
             App_ExecuteRecovery();
         }
     }
 #endif
+#endif /* FEATURE_UPLINK_DEPLOY || FEATURE_LINK */
 
 #if FEATURE_BUZZER
     if (act.start_buzzer) {
@@ -2310,24 +2487,55 @@ static void FSM_Update(void)
         htim2.Instance->ARR  = 999;
         htim2.Instance->CCR1 = 500;
         htim2.Instance->EGR  = TIM_EGR_UG;
+        s_buzz_beacon = 1U;      /* 尋標獨佔 TIM2：短嗶回覆讓位（見 Buzzer_Service） */
     }
 #endif
+    /* 命令回覆短嗶推進（非阻塞；尋標啟動後自動讓位）。 */
+    Buzzer_Service(now);
+
+    /* --- 1b. DISARM：開傘旗標整組重置（見 Deploy_ResetLatches）---
+     * 以「進入 STATE_PAD」的狀態邊緣偵測，而非掛 FSM_EVT_DISARMED 事件：四個 DISARM 入口
+     * 都是直接 FSM_SetState(STATE_PAD)，等 FSM_Step 跑到時 ctx->state 已是 PAD，
+     * fsm.c 的 case STATE_PAD_ARMED 分支走不到，事件永遠不會發（同 flash_pool_ready 的坑）。
+     * 邊緣比較用本地 static，因此不論是哪個任務改的狀態都抓得到。 */
+    {
+        static FlightState_t s_prev_fsm_state = STATE_INIT;
+        FlightState_t st_disarm = g_fsm_ctx.state;
+
+        /* 只認「由 PAD_ARMED 以上退回 PAD」＝真正的 DISARM/reset。
+         * 開機的 INIT→PAD 不算：那裡什麼都還沒鎖存，且熱重啟還原的飛行摘要不可被清掉。 */
+        if (st_disarm == STATE_PAD && s_prev_fsm_state > STATE_PAD) {
+            Deploy_ResetLatches();
+            printf("[DISARM] 開傘旗標已重置：手動開傘命令 / 共開鎖存 / 開傘高度 / 對端鎖存全部清除\r\n");
+        }
+        /* 解除武裝期間持續壓住，不是清一次就好：DISARM 在兩板之間有 ~50ms 傳播差，
+         * 對端可能還在廣播上一輪的手動開傘命令，只清一次會被立刻灌回來，下次 ARM
+         * 當場開傘。兩板都回到 PAD 後對端自然停止廣播，這裡就無事可做。 */
+        if (st_disarm <= STATE_PAD) {
+            g_manual_deploy_cmd = 0U;
+#if FEATURE_LINK
+            Link_ClearPeerDeployLatches();
+#endif
+        }
+
+        /* --- ARM 邊緣：印一行雙板 flash 擦除/池確認（見 FlashArm_ReportStatus）---
+         * 與上面 DISARM 邊緣同理用 static 比較而非 FSM_EVT_ARMED 事件：三個 ARM 入口都是
+         * 直接 FSM_SetState(STATE_PAD_ARMED)，該事件實際永不觸發（見本檔 in.flash_pool_ready
+         * 旁的歷史註記，那支 [FSM] [ARMED] printf 同樣是死碼）。 */
+        if (st_disarm == STATE_PAD_ARMED && s_prev_fsm_state != STATE_PAD_ARMED) {
+            FlashArm_ReportStatus();
+        }
+
+        s_prev_fsm_state = st_disarm;
+    }
 
     /* --- 2. 鏡射回全域（telemetry / flash ring / SD / EKF 既有讀取點不變） --- */
     current_fsm_state = g_fsm_ctx.state;
     flight_start_tick = g_fsm_ctx.flight_start_ms;
 
-    /* ARM 被 flash pool 擋下：鏡射全域供 telemetry.c 下鏈，並限流印出原因（USB/console）。
-     * fail-open（選項 A）已在 in.flash_pool_ready 組裝時處理，這裡只是回報。 */
+    /* ★2026-08-01：in.flash_pool_ready 固定為 1（見上方政策說明）⇒ act.arm_blocked_flash 恆為 0，
+     * 下鏈 TELEM_ARM_BLOCKED_FLASH_POOL 恆不亮。鏡射保留：fsm.c 的閘還在，改回硬擋時不需再動。 */
     g_arm_blocked_flash = act.arm_blocked_flash;
-    if (act.arm_blocked_flash) {
-        static uint32_t s_last_warn_tick = 0;
-        if (now - s_last_warn_tick >= 1000) {
-            printf("[FSM] [ARM BLOCKED] Flash pool 未達標 (%lu/%u sectors)，ARM 被擋下，等待背景預擦完成。\r\n",
-                   (unsigned long)FlashRing_GetPoolSectors(), (unsigned)FLASH_RING_PREERASE_TARGET);
-            s_last_warn_tick = now;
-        }
-    }
     if (act.event == FSM_EVT_TOUCHDOWN) {
         g_touchdown_tick = now;   // 記錄落地時刻：SD 記錄降為 10Hz，逾時（SD_LANDED_LOG_TIMEOUT_MS）後關檔
     }
@@ -2414,9 +2622,53 @@ static void FSM_Update(void)
 #endif
 }
 
+/* ★2026-08-01：ARM 當下把「兩板 flash 擦除/池狀態」印成一行確認 log。
+ * 為什麼要在這個時機再印一次：[FLASH_RING] 進度行只在開機預擦／手動擦除期間出現，等到
+ * 上發射架、操作員實際按下 ARM 時，那些行早已被 1Hz 遙測捲走，GUI 的擦除橫幅也已過期收合
+ * ——「這次飛行的紀錄空間到底備好了沒、副航電是不是真的也擦完了」在最需要確認的一刻反而
+ * 沒有依據。ARM 是每次飛行唯一必經的人為動作，掛在這個邊緣最可靠。
+ * ★不是防護閘：本行只報告不阻擋（ARM 一律放行的政策見本檔 in.flash_pool_ready 註解），
+ *   判讀交給操作員與 GUI 橫幅。
+ * 格式刻意與 FlashErase_FormatDualProgress 的 primary=/backup= 對齊，操作員與 GUI 用同一套
+ * 語意讀兩種行；額外多帶 pool=（本板實際已擦池格數）與 peer 新鮮度。 */
+static void FlashArm_ReportStatus(void)
+{
+#if FEATURE_FLASH
+    uint8_t  self_pct   = FlashRing_GetErasePct();
+    uint32_t pool       = FlashRing_GetPoolSectors();
+    uint8_t  self_ready = (pool >= FLASH_RING_PREERASE_TARGET) ? 1U : 0U;
+#else
+    uint8_t  self_pct   = 100U;
+    uint32_t pool       = 0U;
+    uint8_t  self_ready = 1U;
+#endif
 #if FEATURE_LINK
-/* 對端 fsm_state（FlightState_t 數值）→ 簡短字串，供 [LINK] 診斷行輸出（GUI 監控用）。 */
-static const char *link_fsm_state_name(uint8_t s)
+    const LinkPeer_t *peer = Link_GetPeer();
+    uint8_t peer_valid = peer->valid;
+    uint8_t peer_fresh = peer_valid ? Link_PeerFresh(HAL_GetTick()) : 0U;
+    uint8_t peer_pct   = peer_valid ? peer->peer_erase_pct : 0U;
+    uint8_t peer_ready = peer_valid ? peer->peer_flash_ready : 0U;
+#else
+    uint8_t peer_valid = 0U, peer_fresh = 0U, peer_pct = 0U, peer_ready = 0U;
+#endif
+
+    uint8_t primary_pct   = IS_BACKUP ? peer_pct   : self_pct;
+    uint8_t primary_ready = IS_BACKUP ? peer_ready : self_ready;
+    uint8_t backup_pct    = IS_BACKUP ? self_pct   : peer_pct;
+    uint8_t backup_ready  = IS_BACKUP ? self_ready : peer_ready;
+
+    printf("[FLASH_ARM] armed primary=%u%%%s backup=%u%%%s pool=%lu/%lu self=%s peer=%s\r\n",
+           (unsigned)primary_pct, primary_ready ? "(rdy)" : "",
+           (unsigned)backup_pct,  backup_ready  ? "(rdy)" : "",
+           (unsigned long)pool, (unsigned long)FLASH_RING_PREERASE_TARGET,
+           IS_BACKUP ? "BACKUP" : "PRIMARY",
+           !peer_valid ? "NONE" : (peer_fresh ? "OK" : "STALE"));
+}
+
+#if FEATURE_LINK
+/* 對端 fsm_state（FlightState_t 數值）→ 簡短字串，供 [LINK] 診斷行輸出（GUI 監控用）。
+ * ★非 static：pyro_selftest.c 的 bench 進度行也印同一格式（宣告見 link_hw.h）。 */
+const char *link_fsm_state_name(uint8_t s)
 {
     static const char *const names[] = {
         "INIT", "PAD", "PAD_ARMED", "BOOST", "COAST", "DEP_DROGUE",
@@ -2447,8 +2699,11 @@ static void Boot_BroadcastPrompt(const char *msg)
 
 /* === 板間鏈路：自身狀態組裝 + 週期廣播 ===
  * 注意：Flash 開機預擦期間主迴圈尚未進入，Link_PublishTick 不會跑；
- * 必須在預擦 callback 內主動 Link_SendStatus，否則對端 peer_erase_pct 永遠是 0。 */
-static void Link_BuildOwnStatus(LinkStatus_t *ls)
+ * 必須在預擦 callback 內主動 Link_SendStatus，否則對端 peer_erase_pct 永遠是 0。
+ * ★非 static：pyro_selftest.c 的 bench 廣播也走這支組裝（宣告見 link_hw.h）——bench
+ *   序列與飛控迴圈是兩個 task，兩路都會以 20Hz 廣播，內容必須同源，否則對端收到的
+ *   fsm_state / main_arb 會在兩套值之間跳動（見該檔 bench_bcast 註解）。 */
+void Link_BuildOwnStatus(LinkStatus_t *ls)
 {
     EKF_State_t e = EKF_GetState();
     ls->board_id  = IS_BACKUP ? LINK_BOARD_BACKUP : LINK_BOARD_PRIMARY;
@@ -2475,8 +2730,16 @@ static void Link_BuildOwnStatus(LinkStatus_t *ls)
     ls->q_z         = (int16_t)(e.q[3] * 10000.0f);
     /* echo-ACK：回送「我最近採納的對端 FSM 狀態」，供對端偵測失同步（純觀測） */
     ls->ack_state   = Link_GetPeer()->fsm_state;
-    /* 廣播本板主傘 PD14 共開狀態（MAIN_HIGH/DONE：對端據此「一起開」，見 servo_arb.h） */
+    /* 廣播本板主傘 PD14 共開狀態（MAIN_HIGH/DONE：對端據此「一起開」，見 servo_arb.h）。
+     * ★bench 序列進行中（g_bench_arb != NONE）改送 bench 階段值：bench 跑在
+     *   StartDiagnosticTask，飛控迴圈的本函式照樣以 20Hz 送，若這裡仍送 g_servo_arb_bcast
+     *   (=NONE)，對端 peer_main_arb 會在 BENCH_* 與 NONE 之間 20Hz 跳動——副板「見
+     *   BENCH_START 才跟隨」與 bench_wait_peer_arb 都會變成碰運氣（實測 log 已見交錯）。 */
+#if PYRO_SELFTEST_AVAILABLE
+    ls->main_arb    = (g_bench_arb != SERVO_ARB_MSG_NONE) ? g_bench_arb : g_servo_arb_bcast;
+#else
     ls->main_arb    = g_servo_arb_bcast;
+#endif
 #if FEATURE_FLASH
     ls->flash_ready = (FlashRing_GetPoolSectors() >= FLASH_RING_PREERASE_TARGET) ? 1U : 0U;
     ls->erase_pct   = FlashRing_GetErasePct();
@@ -2503,6 +2766,10 @@ static void Link_BuildOwnStatus(LinkStatus_t *ls)
 #else
     ls->profile_flags = 0U;
 #endif
+    /* 手動開傘命令中繼：本板已知曉的命令持續廣播，對端據此一起開傘（見 link_proto.h
+     * LINK_CMD_DEPLOY_*）。鎖存 + 每筆都送 ⇒ 丟包不會漏命令。 */
+    ls->cmd_flags = g_manual_deploy_cmd;
+    ls->erase_req = g_flash_erase_req_seq;   /* 主板遞增、副板跟擦（見 link_proto.h） */
 }
 
 /* 預擦期間輕量廣播：只關心 erase_pct / flash_ready 被對端收到。
@@ -2666,16 +2933,51 @@ static void Link_PublishTick(void)
             if (peer->fsm_state == STATE_PAD_ARMED &&
                 (current_fsm_state == STATE_INIT || current_fsm_state == STATE_PAD)) {
                 FSM_SetState(&g_fsm_ctx, STATE_PAD_ARMED);
+                /* 副航電收不到 433 上行，這聲嗶是它「有跟上地面站命令」的唯一聲音證據：
+                 * 台上按 ARM 應該聽到兩板各嗶 3 聲，只響一組就代表板間鏈路出問題。 */
+                Buzzer_RequestBeeps(3U);
                 printf("[LINK_SYNC] 接收主航電 ARM 命令 -> 副航電同步進入 STATE_PAD_ARMED\r\n");
             } else if (peer->fsm_state == STATE_PAD && current_fsm_state == STATE_PAD_ARMED) {
                 FSM_SetState(&g_fsm_ctx, STATE_PAD);
+                Buzzer_RequestBeeps(3U);
                 printf("[LINK_SYNC] 接收主航電 DISARM 命令 -> 副航電同步回到 STATE_PAD\r\n");
+            }
+
+            /* ★2026-08-01：主航電 `flash erase` → 副航電跟著擦一次。
+             * 只記旗標不在此執行：擦除阻塞數分鐘，這裡是 20Hz 的鏈路發佈路徑，
+             * 實際執行交給診斷任務（見 g_peer_erase_pending 的取用處），與遠端文字
+             * 命令走同一條 Parse_Serial_Command("flash erase")，共用它的狀態閘與
+             * IWDG／主迴圈讓路處理。
+             * 首次同步（s_erase_req_synced=0）只靜默採納，不擦——否則副板每次開機、
+             * 或鏈路重連時都會被主板當前的計數值誤觸發一次全擦。 */
+            static uint8_t s_last_peer_erase_req = 0;
+            static uint8_t s_erase_req_synced    = 0;
+            if (!s_erase_req_synced) {
+                s_last_peer_erase_req = peer->peer_erase_req;
+                s_erase_req_synced    = 1U;
+            } else if (peer->peer_erase_req != s_last_peer_erase_req) {
+                s_last_peer_erase_req = peer->peer_erase_req;
+                g_peer_erase_pending  = 1U;
+                printf("[LINK_SYNC] 接收主航電 flash erase 命令（erase_req=%u）-> 副航電排入擦除\r\n",
+                       (unsigned)peer->peer_erase_req);
             }
         }
     }
 #endif
 }
 #endif /* FEATURE_LINK */
+
+/* 開機提示的統一出口：有板間鏈路時經 Boot_BroadcastPrompt 同步廣播到 USB + LoRa(433/920)，
+ * 沒有鏈路的角色（IS_GROUND：FEATURE_LINK=0 但 FEATURE_FLASH=1，開機序列照跑）只走 USB。
+ * ★Boot_BroadcastPrompt 定義在上面的 #if FEATURE_LINK 內，開機序列不可直接呼叫它。 */
+static void Boot_Announce(const char *msg)
+{
+#if FEATURE_LINK
+    Boot_BroadcastPrompt(msg);
+#else
+    if (msg) { printf("%s\r\n", msg); }
+#endif
+}
 
 /* === HAL UART 回呼統一分派（單一定義；gps.c 已改為 GPS_Handle* 由此轉接） ===
  * USART6 → GPS（FEATURE_GPS）；USART2 → 板間鏈路（FEATURE_LINK）。 */
@@ -3002,9 +3304,9 @@ void StartDiagnosticTask(void *argument)
       Poll_Serial_Commands();   /* USART2 文字命令台；FEATURE_LINK 時 USART2 改作板間鏈路 */
 #elif !IS_GROUND && FEATURE_USB_CDC
       /* FEATURE_LINK 開啟時 UART2 作板間鏈路，但 USB CDC 是獨立通道，仍可接受命令。
-       * ⚠ 這裡「不分飛行狀態」一律受理：Parse_Serial_Command 內含 disarm、手動開傘等
-       *   危險指令，目前只有 bench 點火自帶 STATE_PAD/INIT 閘，其餘沒有飛行態防護。
-       *   待補：對危險指令加同樣的飛行態閘（見 board_config.h FEATURE_USB_DEBUG_LOG）。 */
+       * 這裡不預先過濾飛行狀態，飛行態閘由 Parse_Serial_Command 內各危險指令自行把關
+       * （bench=僅 PAD_ARMED、recalib=ARM+地面、deploy=ARM 或飛行中、disarm=PAD_ARMED/INIT）
+       * ——★2026-07-31 複查：這些閘都已補齊，見 board_config.h FEATURE_USB_DEBUG_LOG 說明。 */
       {
           static char s_usb_cmd_buf[128];
           static uint8_t s_usb_cmd_idx = 0;
@@ -3023,6 +3325,22 @@ void StartDiagnosticTask(void *argument)
                   s_usb_cmd_idx = 0;
               }
           }
+      }
+#endif
+
+#if IS_BACKUP && FEATURE_LINK && FEATURE_FLASH
+      /* === 主航電 `flash erase` 中繼執行（副航電）===========================
+       * 旗標由 Link_PublishTick 的 IS_BACKUP 區塊在偵測到主板 erase_req 變化時設起（那裡是
+       * 20Hz 鏈路路徑，不可阻塞）。此處是診斷任務，與遠端文字命令同一條執行路徑，
+       * 故直接複用 Parse_Serial_Command("flash erase")——連同它的狀態閘（僅
+       * INIT/PAD/LANDED）、IWDG 放寬、FlashErase_PauseFlightLoop 讓路、進度廣播與
+       * 擦除後重掃寫入頭全都照舊，零重複實作。
+       * ★先清旗標再執行：擦除期間鏈路仍在收封包，若主板此時又被下一次 erase，
+       * 計數會再變一次並重新設旗標，那次應該被保留（擦完再擦一輪），不可被本次清掉。 */
+      if (g_peer_erase_pending) {
+          g_peer_erase_pending = 0U;
+          printf("[LINK_SYNC] 副航電開始執行主航電中繼的 flash erase...\r\n");
+          Parse_Serial_Command("flash erase");
       }
 #endif
 
@@ -3721,6 +4039,15 @@ void Parse_Serial_Command(const char* cmd) {
                 printf("[FLASH] 未知擦除範圍 '%s'（用 ring 或 all）\r\n", tok[2]);
                 g_parse_status = ACK_UNKNOWN;
             } else {
+#if FEATURE_LINK && !IS_BACKUP
+                /* ★2026-08-01：主航電收到 erase → 帶動副航電一起擦。遞增請求計數，副板看到
+                 * 值變了就跑同一條 `flash erase`（見 link_proto.h erase_req 的設計說明）。
+                 * 在實際擦除「之前」就遞增：本板接下來會阻塞數分鐘，副板可同時開始，
+                 * 兩板擦除並行而非串行。計數隨 20Hz 狀態封包持續廣播，丟包不影響。 */
+                g_flash_erase_req_seq++;
+                printf("[FLASH] 已通知副航電一起擦除（erase_req=%u）\r\n",
+                       (unsigned)g_flash_erase_req_seq);
+#endif
                 /* 不在此包外層 SPI3 鎖：W25QXX_EraseBlock64K/EraseSector 每次 SPI
                  * 交易已各自透過 CS_LOW/CS_HIGH 自行鎖/解鎖（見 w25qxx.c）。外層長時間
                  * 持鎖會讓 E80 920MHz LoRa 遙測（含擦除進度/副板中繼）整段擦除期間
@@ -3781,10 +4108,8 @@ void Parse_Serial_Command(const char* cmd) {
                 FlashRing_ScanWriteHeadOnly();
                 uint32_t pool_after = FlashRing_ProbePoolNoErase();
                 g_flash_logging_active = 1;
-                g_flash_need_erase = (pool_after < FLASH_RING_PREERASE_TARGET) ? 1U : 0U;
-                printf("[FLASH] 擦除後池：%lu/%u sectors（%s）\r\n",
-                       (unsigned long)pool_after, (unsigned)FLASH_RING_PREERASE_TARGET,
-                       g_flash_need_erase ? "★仍未達標，ARM 仍被擋" : "已達標，可 ARM");
+                printf("[FLASH] 擦除後池：%lu/%u sectors\r\n",
+                       (unsigned long)pool_after, (unsigned)FLASH_RING_PREERASE_TARGET);
                 if (st == W25QXX_OK) {
                     printf("[FLASH] %s erased and re-initialized OK!\r\n",
                            erase_all ? "Whole chip" : "Ring Buffer");
@@ -3820,14 +4145,14 @@ void Parse_Serial_Command(const char* cmd) {
             g_flash_erase_in_progress = 0U;
             HAL_IWDG_Refresh(&hiwdg);
             g_flash_logging_active = 1;
-            g_flash_need_erase = (pool_now < FLASH_RING_PREERASE_TARGET) ? 1U : 0U;
-            if (g_flash_need_erase) {
-                printf("[FLASH] ★填池未達標（%lu/%u）：環內可能有殘留舊資料擋住，"
-                       "請改下 `flash erase` 整環全擦。ARM 仍被擋。\r\n",
+            if (pool_now < FLASH_RING_PREERASE_TARGET) {
+                /* 環內有殘留舊資料擋住往前擦，只能整環全擦才清得掉。開機序列跑同一支
+                 * TopUpPool，所以這裡達不了標的話開機也達不了 —— 屬於要處理的異常。 */
+                printf("[FLASH] 填池未達標（%lu/%u）：環內有殘留舊資料擋住，請改下 `flash erase` 整環全擦。\r\n",
                        (unsigned long)pool_now, (unsigned)FLASH_RING_PREERASE_TARGET);
                 g_parse_status = ACK_REJECTED;
             } else {
-                printf("[FLASH] 填池完成（%lu/%u），可以 ARM。\r\n",
+                printf("[FLASH] 填池完成（%lu/%u）。\r\n",
                        (unsigned long)pool_now, (unsigned)FLASH_RING_PREERASE_TARGET);
             }
         } else if (strcmp(tok[1], "dump") == 0) {
@@ -4034,18 +4359,16 @@ void StartDefaultTask(void *argument)
              "（池耗盡才丟包，飛行中永不擦除）\r\n");
   } else {
       /* 正常地面開機（或熱啟動驗證未過回 PAD 重校準）：
-       * ★2026-07-31 起「開機一律不擦除」（使用者決策）。舊版每次開機無條件整環全擦
-       * （~3 min）＋960-sector 預擦（~48s），代價太大且有兩個實務問題：飛完落地重開機
-       * 就把黑盒子擦光（BT1 dump 排在擦除之後，救不回來），以及擦除全程主迴圈停擺。
-       * 新流程：開機只做「唯讀認領」——把上一次使用者觸發擦除留在 flash 上的已擦區
-       * 找回來（FlashRing_ProbePoolNoErase，毫秒級、零擦除）。池未達標就：
-       *   ① 1Hz 醒目橫幅提醒（見主迴圈 g_flash_need_erase 區塊）
-       *   ② 下鏈 arm_flags 帶 TELEM_ARM_NEED_ERASE 給地面站 GUI 顯示
-       *   ③ ARM 一律被擋（既有 fsm.c flash_pool_ready 閘，非新增機制）
-       * 使用者以 `flash erase`（整環全擦，飛前正規流程）或 `flash pool`（快速填池，
-       * bench 用）建立池，USB console 與 LoRa 上行文字幀共用同一條路徑。
-       * FEATURE_FLASH_BOOT_FULL_ERASE 保留為緊急退路（預設 0）：設 1 才恢復舊的
-       * 開機自動整環全擦 + 填池行為。 */
+       * ★2026-08-01（使用者決策）：開機自動「補擦到基本需求」，不再靠使用者手動觸發、
+       * 也不再有任何未擦除警告或 ARM 防護 —— 開機完成時池必定達標，那些提示沒有存在意義。
+       * 流程：先唯讀認領既有已擦區（ProbePoolNoErase，毫秒級），不足才 FlashRing_TopUpPool()
+       * 把差額補上。
+       * ★為什麼是 TopUpPool 而不是整環全擦：整環全擦要 ~3min 且會把上一場飛行的黑盒子
+       * 擦光（BT1 dump 排在擦除之後，救不回來）。TopUp 只往「寫入頭前方」擦不足的那幾格，
+       * 已擦部分不重擦，上一場資料留在寫入頭後方不受影響，典型 10~30s。
+       * 飛前想要整環乾淨仍可手動下 `flash erase`。
+       * ★空中熱重啟走上面那條分支，全程零擦除，本段不會執行。
+       * FEATURE_FLASH_BOOT_FULL_ERASE 保留為緊急退路（預設 0）：設 1 才恢復開機整環全擦。 */
 #if FEATURE_FLASH_BOOT_FULL_ERASE
       {
           IWDG_HandleTypeDef iwdg_wide = hiwdg;
@@ -4075,23 +4398,52 @@ void StartDefaultTask(void *argument)
 #else
       FlashRing_RunPreErase(NULL);
 #endif
-#else /* 預設路徑：零擦除，只認領既有已擦區 */
-      uint32_t pool_sectors = FlashRing_ProbePoolNoErase();
-      printf("[FLASH_RING] 開機不擦除，認領既有已擦池：%lu/%u sectors（write=0x%06lX）\r\n",
-             (unsigned long)pool_sectors, (unsigned)FLASH_RING_PREERASE_TARGET,
-             (unsigned long)FlashRing_GetWriteAddr());
-      if (pool_sectors < FLASH_RING_PREERASE_TARGET) {
-          g_flash_need_erase = 1U;   /* 主迴圈 1Hz 橫幅 + 下鏈 arm_flags；ARM 已被 pool 閘擋下 */
-#if FEATURE_LINK
-          {
-              char boot_msg[128];
+#else /* 預設路徑：唯讀認領既有已擦區，不足才補擦到基本需求 */
+      /* ★訊息一律壓在 ~150 bytes（UTF-8 中文 3 bytes/字）：E22 預設 200B 子封包，超過會被切包。
+       * ★兩條分支都要明講走了哪一條 —— 池已達標時本段完全不擦除，log 上「什麼都沒發生」與
+       * 「跳過了」長得一樣，看起來會像開機擦除沒有生效。 */
+      {
+          char boot_msg[176];
+          uint32_t pool_sectors = FlashRing_ProbePoolNoErase();
+          snprintf(boot_msg, sizeof(boot_msg),
+                   "[FLASH_RING] 開機 Flash 檢查：已擦池 %lu/%u sectors（write=0x%06lX）",
+                   (unsigned long)pool_sectors, (unsigned)FLASH_RING_PREERASE_TARGET,
+                   (unsigned long)FlashRing_GetWriteAddr());
+          Boot_Announce(boot_msg);
+
+          if (pool_sectors >= FLASH_RING_PREERASE_TARGET) {
+              Boot_Announce("[FLASH_RING] 已達基本需求，本次開機不需擦除。");
+          } else {
               snprintf(boot_msg, sizeof(boot_msg),
-                       "[FLASH_RING] ★需要擦除：池 %lu/%u sectors，ARM 已被擋下。"
-                       "請下 `flash erase`（整環，~3min）或 `flash pool`（快速填池）。",
-                       (unsigned long)pool_sectors, (unsigned)FLASH_RING_PREERASE_TARGET);
-              Boot_BroadcastPrompt(boot_msg);
-          }
+                       "[FLASH_RING] 未達基本需求，開始補擦 %lu 格（只擦不足部分，不動已擦區）...",
+                       (unsigned long)(FLASH_RING_PREERASE_TARGET - pool_sectors));
+              Boot_Announce(boot_msg);
+
+              /* 補擦最壞 1500 格，遠超飛行用 ~2.05s IWDG 視窗 → 比照 `flash erase`／`flash pool`
+               * 先放寬到 10s（單次 64KB block erase 最壞 ~2s），補完立刻還原。 */
+              {
+                  IWDG_HandleTypeDef iwdg_wide = hiwdg;
+                  iwdg_wide.Init.Prescaler = IWDG_PRESCALER_256;
+                  iwdg_wide.Init.Reload    = 1250;   /* 32kHz/256=125Hz -> 1250/125 = 10s */
+                  HAL_IWDG_Init(&iwdg_wide);
+              }
+              /* 進度：FlashRing_TopUpPool 每 160 格印一行 [FLASH_ERASE] top-up N/M sectors P%
+               * （gui_monitor 的 C1b 分支吃得下 sectors 這個變體），callback 再把雙板進度
+               * 廣播到 USB/LoRa。LoRa 與 Link_Init 都在 osKernelStart 之前完成，此處可用。 */
+#if FEATURE_LINK
+              pool_sectors = FlashRing_TopUpPool(FlashErase_ProgressCallback);
+#else
+              pool_sectors = FlashRing_TopUpPool(NULL);
 #endif
+              HAL_IWDG_Init(&hiwdg);          /* 還原飛行用 ~2.05s 視窗 */
+              HAL_IWDG_Refresh(&hiwdg);
+
+              snprintf(boot_msg, sizeof(boot_msg),
+                       "[FLASH_RING] 補擦完成：池 %lu/%u sectors（write=0x%06lX）",
+                       (unsigned long)pool_sectors, (unsigned)FLASH_RING_PREERASE_TARGET,
+                       (unsigned long)FlashRing_GetWriteAddr());
+              Boot_Announce(boot_msg);
+          }
       }
 #endif /* FEATURE_FLASH_BOOT_FULL_ERASE */
   }
@@ -5017,31 +5369,6 @@ void StartDefaultTask(void *argument)
             printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\r\n\r\n");
         }
     }
-
-#if FEATURE_FLASH
-    /* === ★2026-07-31：Flash 池未達標橫幅（1Hz，僅地面狀態）===
-     * 開機不再自動擦除，所以「該擦而沒擦」不會有任何自然徵兆——沒有這行提醒，使用者只會
-     * 在按下 ARM 之後才發現被擋。與電梯 profile 橫幅同一套節奏/條件（飛行中不印，理由同上：
-     * printf 在飛行熱路徑會拖慢主迴圈）。旗標每輪重算，擦完即自動消失。
-     * 注意 fail-open 條件與 FSM_Update 組 flash_pool_ready 時一致：flash 沒偵測到或已停止
-     * 記錄時不擋 ARM，也就不該再喊「需要擦除」。 */
-    if (tick % 1000 == 500 && (current_fsm_state == STATE_INIT ||
-                               current_fsm_state == STATE_PAD  ||
-                               current_fsm_state == STATE_PAD_ARMED)) {
-        uint32_t pool_now = FlashRing_GetPoolSectors();
-        g_flash_need_erase = (flash_ring_hw_ok && g_flash_logging_active &&
-                              pool_now < FLASH_RING_PREERASE_TARGET) ? 1U : 0U;
-        if (g_flash_need_erase) {
-            printf("\r\n**********************************************************************\r\n");
-            printf("*** [FLASH_NOT_READY] 已擦池 %lu/%u sectors —— ARM 已被擋下 ***\r\n",
-                   (unsigned long)pool_now, (unsigned)FLASH_RING_PREERASE_TARGET);
-            printf("*** 飛前請下 `flash erase`（整環全擦 ~3min，正規流程）              ***\r\n");
-            printf("*** 或 `flash pool`（只補不足部分，bench 省時用）                   ***\r\n");
-            printf("*** USB console 與 LoRa 上行文字指令皆可                            ***\r\n");
-            printf("**********************************************************************\r\n\r\n");
-        }
-    }
-#endif
 
     /* === FSM 飛行狀態 LED（每 100ms 更新）—— 電梯/台面測試用肉眼確認狀態機推進 ===
      * STAT1 (PE3) / STAT2 (PE4) 依 current_fsm_state 編碼（active-high；SYS=心跳另計）：

@@ -44,13 +44,14 @@ extern "C" {
 #define TELEM_FLAG_HOTSTART       0x80U  /* 空中斷電熱啟動恢復成功（P0-F） */
 
 /* arm_flags 位元定義（flags 8 位已滿，ARM 被擋原因獨立一個 byte，供地面站顯示） */
-#define TELEM_ARM_BLOCKED_FLASH_POOL 0x01U  /* ARM 已送出但 flash 預擦池未達標，仍留 STATE_PAD
-                                              * （fail-open：flash 停用/未偵測到/未記錄時不會設此位） */
-#define TELEM_ARM_NEED_ERASE         0x02U  /* ★2026-07-31：池未達標「且尚未按 ARM」——開機不再自動
-                                              * 擦除，此位讓地面站在使用者按 ARM「之前」就看到需要先
-                                              * 擦除（下 `flash erase` 或 `flash pool`）。與 bit0 的差別：
-                                              * bit0 是「已按 ARM 但被擋」，bit1 是「還沒按就先警告」。
-                                              * ★沿用既有 arm_flags 空位，封包長度不變 ⇒ 不需三板同燒。 */
+#define TELEM_ARM_BLOCKED_FLASH_POOL 0x01U  /* ARM 已送出但 flash 預擦池未達標，仍留 STATE_PAD。
+                                              * ★2026-07-31 起恆為 0：使用者決策改為「ARM 一律放行 ＋
+                                              * 持續醒目提示」，見 main.c 組 in.flash_pool_ready 處。
+                                              * 位元保留不移除（封包長度不變，且將來若改回硬擋可直接復用）。 */
+#define TELEM_ARM_NEED_ERASE         0x02U  /* 池未達標警告。★2026-08-01 起韌體不再設定此位：
+                                              * 開機自動補擦到基本需求（見 main.c 開機序列），
+                                              * 「未擦除」不再是會發生的狀態。位元保留在協定裡
+                                              * （封包長度不變 ⇒ 不需三板同燒）。 */
 
 /* peer_link 位（主/副協同下鏈：主板把副板鏈路健康中繼給地面，供雙板監看） */
 #define TELEM_PEER_EVER    0x01U  /* 曾收過對端封包（valid） */

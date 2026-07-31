@@ -7,7 +7,6 @@
 #if PYRO_SELFTEST_AVAILABLE
 
 #include <stdio.h>
-#include <string.h>
 #include "main.h"        /* FIRE(PD13) / PWM_Servo(PD14) / LED_SYS(PE2) / LED_STAT2(PE4) 腳位 */
 #include "fsm.h"         /* FSM_DROGUE_MOTOR_RUN_PRIMARY/BACKUP_MS、DROGUE_LEAD_TIME_S：與飛行同源 */
 #if FEATURE_LINK
@@ -18,6 +17,7 @@
 /* 由 main.c 建立的周邊 handle。 */
 extern TIM_HandleTypeDef  htim2;   /* Buzzer   : TIM2 CH1 */
 extern IWDG_HandleTypeDef hiwdg;   /* 看門狗約 2.05s 逾時 */
+extern FlightState_t current_fsm_state;   /* main.c：本板目前 FSM 狀態（bench 期間仍在跑） */
 
 /* LED 腳位（皆 GPIOE）：State1=PE3 於 main.h 未命名，直接用腳號。 */
 #define PYRO_LED_STATE1_Pin   GPIO_PIN_3
@@ -32,23 +32,31 @@ static void sys_led_pump(void)
 #if FEATURE_LINK
 /* bench 協同：selftest 期間廣播本板 bench 階段狀態（重用 LinkPacket.main_arb）。RX(DMA/IDLE)
  * 與 TX(IT) 皆 ISR 驅動，故在阻塞序列中仍運作，兩板得以在各階段互通、對齊時序。 */
-static uint8_t s_bench_arb = SERVO_ARB_MSG_NONE;
+volatile uint8_t g_bench_arb = SERVO_ARB_MSG_NONE;
+/* ★封包一律走 Link_BuildOwnStatus() 組裝（main.c），不再自己拼一份殘缺的。
+ * 理由：bench 序列跑在 StartDiagnosticTask，飛控迴圈（StartDefaultTask）並沒有停，
+ * 其 Link_PublishTick 同樣以 20Hz 送 LinkStatus。舊版這裡自拼封包、fsm_state 硬寫
+ * STATE_PAD、其餘欄位清 0，於是對端每 50ms 交替收到兩套內容：
+ *   - fsm_state 在 PAD / PAD_ARMED 間跳 → 副板 LINK_SYNC 判定「主板 DISARM」，
+ *     bench 全程 20Hz 反覆 DISARM/ARM，且「自身 ARMED + 見 BENCH_START」這組跟隨
+ *     條件分屬不同封包，變成競態（歷史症狀：副板整場不跟隨）。
+ *   - main_arb 在 BENCH_* 與 NONE 間跳（2026-07-31 實測 log 已見）。
+ *   - h_est/erase_pct 等欄位被清 0 的封包覆蓋。
+ * 改為同源組裝後只有 main_arb 一欄由 bench 覆寫，而 Link_BuildOwnStatus 本身也會在
+ * g_bench_arb != NONE 時送同一個值，兩路內容完全一致。 */
 static void bench_bcast(void)
 {
     LinkStatus_t ls;
-    memset(&ls, 0, sizeof(ls));
-    ls.board_id  = IS_BACKUP ? LINK_BOARD_BACKUP : LINK_BOARD_PRIMARY;
-    ls.fsm_state = (uint8_t)STATE_PAD;
-    ls.flags     = (HAL_GPIO_ReadPin(FIRE_GPIO_Port, FIRE_Pin) == GPIO_PIN_SET) ? TELEM_FLAG_DROGUE_FIRED : 0U;
-    ls.main_arb  = s_bench_arb;
+    Link_BuildOwnStatus(&ls);
+    ls.main_arb = g_bench_arb;
     Link_SendStatus(&ls);
 }
 
-/* bench 協同期間（s_bench_arb != NONE）以 ~5Hz 印一行 [LINK] 風格的 arb 狀態，讓
+/* bench 協同期間（g_bench_arb != NONE）以 ~5Hz 印一行 [LINK] 風格的 arb 狀態，讓
  * gui_monitor 用既有 [LINK] 解析器顯示 bench 進度（阻塞序列中飛控迴圈的 [LINK] 不會跑）。 */
 static void bench_arb_report(void)
 {
-    if (s_bench_arb == SERVO_ARB_MSG_NONE &&
+    if (g_bench_arb == SERVO_ARB_MSG_NONE &&
         HAL_GPIO_ReadPin(FIRE_GPIO_Port, FIRE_Pin) == GPIO_PIN_RESET) return;
     static uint32_t s_last_ms = 0U;
     uint32_t now = HAL_GetTick();
@@ -56,14 +64,18 @@ static void bench_arb_report(void)
     s_last_ms = now;
     const LinkPeer_t *peer = Link_GetPeer();
     const char *link_state = !peer->valid ? "NONE" : (Link_PeerFresh(now) ? "OK" : "STALE");
-    printf("[LINK] self=%s peer=%s link=%s state=PAD flags=0x%02X age=%lums "
+    /* 格式與 main.c 診斷任務的 [LINK] 行一致：state/flags 都是「對端」的值。
+     * ★不再硬寫 state=PAD——bench 期間兩板實際處於 PAD_ARMED，硬寫會讓 GUI 的
+     *   STATE 欄在 bench 全程顯示成未武裝。 */
+    printf("[LINK] self=%s peer=%s link=%s state=%s flags=0x%02X age=%lums "
            "sync=OK lost=0 desync=0 self_arb=%s peer_arb=%s\r\n",
            IS_BACKUP ? "BACKUP" : "PRIMARY",
            !peer->valid ? "NONE" : ((peer->board_id == LINK_BOARD_BACKUP) ? "BACKUP" : "PRIMARY"),
            link_state,
+           link_fsm_state_name(peer->valid ? peer->fsm_state : (uint8_t)current_fsm_state),
            peer->flags,
            (unsigned long)(peer->valid ? (now - peer->last_rx_ms) : 0U),
-           ServoArb_MsgName(s_bench_arb),
+           ServoArb_MsgName(g_bench_arb),
            ServoArb_MsgName(peer->peer_main_arb));
     fflush(stdout);
 }
@@ -148,7 +160,7 @@ void PyroSelfTest_RunSequence_Ex(uint8_t skip_countdown)
 
 #if FEATURE_LINK
     /* 宣告「BENCH 序列開始」：副板據此自動跟隨進入自測（見 main.c 的 IS_BACKUP 跟隨區塊）。 */
-    s_bench_arb = SERVO_ARB_MSG_BENCH_START;
+    g_bench_arb = SERVO_ARB_MSG_BENCH_START;
 #endif
 
     if (!skip_countdown) {
@@ -175,17 +187,17 @@ void PyroSelfTest_RunSequence_Ex(uint8_t skip_countdown)
     /* === 步驟 1：PD13 (FIRE / 引傘 DC 馬達) —— 1:1 重現飛行的主/副開傘時序 ===
      * 1a. 主板 t=0 起拉高 FSM_DROGUE_MOTOR_RUN_PRIMARY_MS(8s)，廣播 BENCH_PRI_FIRE
      *     —— 對應飛行「主板提前 DROGUE_LEAD_TIME_S 開引傘、拉高 8s」。
-     * 1b. 副板見 BENCH_PRI_FIRE 後等 DROGUE_LEAD_TIME_S(4s) —— 模擬提前量，
-     *     4s 後才輪到副板（＝飛行的「真頂點」時刻）。
-     * 1c. 副板 t=4s 起拉高 FSM_DROGUE_MOTOR_RUN_BACKUP_MS(3s)，廣播 BENCH_SEC_FIRE。
-     *     ★兩板窗會重疊（主 0~8s、副 4~7s），這正是飛行的真實情形：PD13 是 diode-OR
-     *     的準位訊號，同時拉高無害，不需要（也不該）刻意錯開成互斥。 */
+     * 1b. 副板見 BENCH_PRI_FIRE 後等 DROGUE_LEAD_TIME_S —— 模擬提前量，之後才輪到副板
+     *     （＝飛行的「真頂點」時刻）。★lead 隨 profile：電梯場測 1s / 飛行 4s（fsm.h）。
+     * 1c. 副板 t=lead 起拉高 FSM_DROGUE_MOTOR_RUN_BACKUP_MS(3s)，廣播 BENCH_SEC_FIRE。
+     *     ★兩板窗會重疊（主 0~8s、副 lead~lead+3s），這正是飛行的真實情形：PD13 是
+     *     diode-OR 的準位訊號，同時拉高無害，不需要（也不該）刻意錯開成互斥。 */
     const uint32_t drogue_lead_ms = (uint32_t)(DROGUE_LEAD_TIME_S * 1000.0f);
 
     if (IS_PRIMARY) {
         /* --- 主板：t=0 立刻拉高 8s --- */
 #if FEATURE_LINK
-        s_bench_arb = SERVO_ARB_MSG_BENCH_PRI_FIRE;
+        g_bench_arb = SERVO_ARB_MSG_BENCH_PRI_FIRE;
 #endif
         printf("[PYRO-SELFTEST] [1a] 主板：PD13(FIRE)=HIGH %us（提前開引傘，對應飛行提前 %us）+ State1 亮\r\n",
                (unsigned)(FSM_DROGUE_MOTOR_RUN_PRIMARY_MS / 1000U), (unsigned)DROGUE_LEAD_TIME_S);
@@ -198,11 +210,11 @@ void PyroSelfTest_RunSequence_Ex(uint8_t skip_countdown)
 
 #if FEATURE_LINK
         /* 到達模擬頂點：通知副板該開了（副板據此起算自己的 3s）。 */
-        s_bench_arb = SERVO_ARB_MSG_BENCH_SEC_FIRE;
+        g_bench_arb = SERVO_ARB_MSG_BENCH_SEC_FIRE;
         printf("[PYRO-SELFTEST] [1c] 主板：已達模擬頂點，廣播通知副板開引傘（主板 PD13 仍 HIGH，兩窗重疊）\r\n");
         fflush(stdout);
 #endif
-        /* 主板剩餘導通時間（8s − 4s）。 */
+        /* 主板剩餘導通時間（8s − lead）。 */
         delay_fed(FSM_DROGUE_MOTOR_RUN_PRIMARY_MS - drogue_lead_ms);
     } else {
         /* --- 副板：等主板宣告開始 → 等滿 lead → 才拉高 3s --- */
@@ -219,7 +231,7 @@ void PyroSelfTest_RunSequence_Ex(uint8_t skip_countdown)
             printf("[PYRO-SELFTEST] [1b] 副板：未見主板通知（單板 bench / 鏈路異常）→ 自行往下走\r\n");
             fflush(stdout);
         }
-        s_bench_arb = SERVO_ARB_MSG_BENCH_SEC_FIRE;
+        g_bench_arb = SERVO_ARB_MSG_BENCH_SEC_FIRE;
 #else
         printf("[PYRO-SELFTEST] [1b] 副板：等待 %us（模擬主板提前量）\r\n", (unsigned)DROGUE_LEAD_TIME_S);
         fflush(stdout);
@@ -239,7 +251,7 @@ void PyroSelfTest_RunSequence_Ex(uint8_t skip_countdown)
                (unsigned)(FSM_DROGUE_MOTOR_RUN_BACKUP_MS / 1000U));
         fflush(stdout);
 #if FEATURE_LINK
-        s_bench_arb = SERVO_ARB_MSG_NONE;
+        g_bench_arb = SERVO_ARB_MSG_NONE;
         /* 對齊主板 8s 窗尾，兩板才一起進入步驟 2（單板/逾時則自行往下）。 */
         {
             uint32_t remain = FSM_DROGUE_MOTOR_RUN_PRIMARY_MS -
@@ -253,7 +265,7 @@ void PyroSelfTest_RunSequence_Ex(uint8_t skip_countdown)
     HAL_GPIO_WritePin(FIRE_GPIO_Port, FIRE_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOE, PYRO_LED_STATE1_Pin, PYRO_LED_OFF);
 #if FEATURE_LINK
-    s_bench_arb = SERVO_ARB_MSG_NONE;
+    g_bench_arb = SERVO_ARB_MSG_NONE;
 #endif
     printf("[PYRO-SELFTEST] [1] %s：PD13 通電測試結束，復位為 LOW + State1 熄\r\n", IS_PRIMARY ? "主板" : "副板");
     fflush(stdout);
@@ -269,7 +281,7 @@ void PyroSelfTest_RunSequence_Ex(uint8_t skip_countdown)
      * 這裡以主板廣播 BENCH_MAIN_HIGH 當作「呼叫」，副板見訊號立刻跟上（單板/逾時自行開）。 */
 #if FEATURE_LINK
     if (IS_PRIMARY) {
-        s_bench_arb = SERVO_ARB_MSG_BENCH_MAIN_HIGH;   /* 呼叫副板一起開 */
+        g_bench_arb = SERVO_ARB_MSG_BENCH_MAIN_HIGH;   /* 呼叫副板一起開 */
         printf("[PYRO-SELFTEST] [3] 主板：廣播 BENCH_MAIN_HIGH 呼叫副板一起開主傘（無握手隔離）\r\n");
         fflush(stdout);
     } else {
@@ -279,7 +291,7 @@ void PyroSelfTest_RunSequence_Ex(uint8_t skip_countdown)
             printf("[PYRO-SELFTEST] [3] 副板：未見主板呼叫（單板 bench / 鏈路異常）→ 自行開\r\n");
             fflush(stdout);
         }
-        s_bench_arb = SERVO_ARB_MSG_BENCH_MAIN_HIGH;
+        g_bench_arb = SERVO_ARB_MSG_BENCH_MAIN_HIGH;
     }
 #endif
     printf("[PYRO-SELFTEST] [3] %s：PD14 拉高 %ums（純 GPIO，不啟 PWM；雙板同時共開）...\r\n",
@@ -303,7 +315,7 @@ void PyroSelfTest_RunSequence_Ex(uint8_t skip_countdown)
     HAL_GPIO_WritePin(LED_STAT2_GPIO_Port, LED_STAT2_Pin, PYRO_LED_OFF);
 #if FEATURE_LINK
     /* 拉高窗結束，廣播 DONE；主板再花一小段時間確認副板也回報 DONE（純觀測，逾時即往下）。 */
-    s_bench_arb = SERVO_ARB_MSG_DONE;
+    g_bench_arb = SERVO_ARB_MSG_DONE;
     if (IS_PRIMARY) {
         printf("[PYRO-SELFTEST] [3] 主板：主傘拉高完成，等待副板回報 DONE（確認雙板共開）...\r\n");
         fflush(stdout);
@@ -318,7 +330,7 @@ void PyroSelfTest_RunSequence_Ex(uint8_t skip_countdown)
         fflush(stdout);
         for (int i = 0; i < 20; i++) delay_fed(50U);   /* 續播 ~1s 讓主板收得到 */
     }
-    s_bench_arb = SERVO_ARB_MSG_NONE;
+    g_bench_arb = SERVO_ARB_MSG_NONE;
 #endif
 
     printf("[PYRO-SELFTEST] 序列完成，返回呼叫端。\r\n");

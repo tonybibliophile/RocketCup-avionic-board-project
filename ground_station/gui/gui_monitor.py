@@ -81,7 +81,7 @@ from tkinter.scrolledtext import ScrolledText
 # 放在依賴自動安裝之後 —— gui_theme 會 import numpy/tkinter。
 from gui_theme import (PadRefTracker, make_elevator_banner, update_elevator_banner,
                         spam_elevator_console_warning, ELEVATOR_WARN_TAG_CFG,
-                        make_flash_banner, update_flash_banner)
+                        make_erase_banner, update_erase_banner)
 
 # Add parent directory to sys.path to load serial_link
 import sys
@@ -460,13 +460,24 @@ class RocketDashboardApp:
         self._elevator_self_ts = 0.0
         self._elevator_peer_ts = 0.0
 
-        # ★2026-07-31：Flash 未擦除橫幅。航電開機不再自動擦除（改為使用者下 `flash erase`／
-        # `flash pool`），池未達標時 ARM 會被擋——但在按下 ARM 之前完全沒有徵兆，所以這裡
-        # 也用「最近看到」的新鮮度窗口顯示橫幅。兩個來源：直連航電的 [FLASH_NOT_READY] 行，
-        # 以及經地面站板中繼的 [GS_PKT] armf: 位元。0.0 = 從未看過 / 已確認擦好。
-        self.flash_banner = make_flash_banner(self.root)
-        self._flash_need_erase_ts = 0.0
-        self._flash_need_erase_detail = ""
+        # ★2026-08-01：Flash 擦除進度橫幅。頂欄 lbl_erase 的 PRI/BAK 小標籤很容易被忽略，
+        # 尤其副航電卡在 0% 時分不出「還沒開始」跟「根本沒連上」——這條橫幅把
+        # primary=/backup=/peer= 放大顯示，peer 連線狀態直接寫清楚，不用猜。
+        # 資料來源：[FLASH_RING] primary=..%(rdy) backup=..%(rdy) self=.. peer=.. 行
+        # （開機補擦 / `flash erase` / `flash pool` / 副航電中繼執行都共用同一支
+        # FlashErase_ProgressCallback，見 main.c）。新鮮度窗口過期（代表沒有新進度行、
+        # 擦除已結束或雙方都斷線）才自動收合，見 _refresh_erase_banner。
+        self.erase_banner = make_erase_banner(self.root)
+        self._erase_active_ts = 0.0
+        self._erase_pri_pct = 0
+        self._erase_bak_pct = 0
+        self._erase_peer_state = "NONE"
+        # mode="dual"＝自 PRI/BAK 百分比組文字；"single"＝呼叫端已給好整行（單板直連的
+        # [FLASH_ERASE]，以及 ARM 當下的 [FLASH_ARM] 確認，兩者都沒有雙板 primary=/backup=
+        # 語意）。哪一路最後收到行就顯示哪一路（見 _show_erase_message/_refresh_erase_banner）。
+        self._erase_mode = "dual"
+        self._erase_single_text = ""
+        self._erase_single_color = "#ffcc00"
 
         # ---- 頂部狀態列：兩排設計，避免右側標籤被截斷 ----
         top_container = tk.Frame(self.root, bg="#151515")
@@ -545,6 +556,14 @@ class RocketDashboardApp:
                                        bg="#27272a", hover_bg="#3f3f46", fg="#ffffff",
                                        font=("Helvetica", 9, "bold"), width=8, padx=4, pady=3)
         self.btn_disarm.pack(side=tk.LEFT, padx=2)
+
+        # ★2026-08-01：ARM 當下的雙板 flash 擦除確認（firmware [FLASH_ARM] 行，見 main.c
+        # FlashArm_ReportStatus）。刻意放在 ARM 按鈕旁而不是頂欄那排小標籤：這是「按下 ARM
+        # 之後要立刻回頭確認的那一件事」，且它**不隨時間刷新**——顯示的永遠是最近一次 ARM
+        # 當下的快照，操作員可以在上架後任何時候回來看，不必去翻已捲走的 console。
+        self.lbl_arm_flash = tk.Label(arm_box, text="💾 ARM 檢查: 尚未 ARM", bg="#1a1a1a", fg="#666666",
+                                      font=("Helvetica", 9, "bold"), width=34, anchor="w")
+        self.lbl_arm_flash.pack(side=tk.LEFT, padx=(6, 2))
 
         # BENCH 桌面開傘測試獨立高亮控制區
         bench_box = tk.Frame(bot_bar, bg="#2d1b4e", highlightbackground="#8b5cf6", highlightthickness=2, padx=4, pady=2)
@@ -1742,35 +1761,6 @@ class RocketDashboardApp:
         if peer_active: who.append("對端(副板)")
         update_elevator_banner(self.root, self.elevator_banner, active, "+".join(who))
 
-    # ---- ★2026-07-31：Flash 未擦除提醒（開機不再自動擦除，見 main.c 開機序列） ----
-    def _handle_flash_not_ready_line(self, line):
-        """[FLASH_NOT_READY] 已擦池 320/1500 sectors —— ARM 已被擋下（航電 1Hz 直連輸出）"""
-        self._flash_need_erase_ts = time.time()
-        m = re.search(r"已擦池\s*(\d+)\s*/\s*(\d+)", line)
-        self._flash_need_erase_detail = (f"池 {m.group(1)}/{m.group(2)} sectors"
-                                         if m else "池未達標")
-        self._refresh_flash_banner()
-
-    def _handle_gs_pkt_arm_flags(self, arm_flags):
-        """[GS_PKT] armf:0x%02X（經地面站板 LoRa 中繼）。bit1 = TELEM_ARM_NEED_ERASE。
-        與直連來源共用同一個時間戳：同一 process 同時只會接一種來源，用時間戳統一收斂。"""
-        if arm_flags & 0x02:
-            self._flash_need_erase_ts = time.time()
-            if not self._flash_need_erase_detail:
-                self._flash_need_erase_detail = "航電回報：尚未擦除"
-        else:
-            # 權威來源明確說「不需要擦」→ 立刻清除，不等新鮮度窗口過期
-            self._flash_need_erase_ts = 0.0
-            self._flash_need_erase_detail = ""
-        self._refresh_flash_banner()
-
-    def _refresh_flash_banner(self):
-        """新鮮度窗口取 5 秒：航電端橫幅是 1Hz、下鏈 [GS_PKT] 約 2Hz，5 秒足以容忍
-        少量丟包又不會在擦完之後還留著過期警示。"""
-        active = (time.time() - self._flash_need_erase_ts) < 5.0
-        update_flash_banner(self.root, self.flash_banner, active,
-                            self._flash_need_erase_detail if active else "")
-
     # ------------------ 主執行緒：定時處理佇列 ------------------
     def poll_queue(self):
         # 批次處理佇列中的資料，避免界面阻塞
@@ -1807,9 +1797,6 @@ class RocketDashboardApp:
             elif "[ELEVATOR_TEST_WARNING]" in line:
                 tag = "elevator_warn"
                 self._handle_elevator_warning_line(line)
-            elif "[FLASH_NOT_READY]" in line:
-                tag = "err"
-                self._handle_flash_not_ready_line(line)
             elif "[MAG]" in line:
                 tag = "mag"
             elif "[GPS]" in line or "[GS_GPS]" in line:
@@ -1906,6 +1893,9 @@ class RocketDashboardApp:
         # 對端電梯測試 profile 新鮮度窗口到期要自動收合橫幅（見 _refresh_elevator_banner），
         # 沒有新的警告行進來時也得靠這裡定時檢查，不能只在收到行時才刷新。
         self._refresh_elevator_banner()
+        # Flash 擦除進度橫幅同理：擦除完成/雙板斷線後沒有新進度行進來，得靠這裡的
+        # 12 秒新鮮度窗口檢查才會自動收合，不能只在收到行時才刷新。
+        self._refresh_erase_banner()
 
         # 繼續定時輪詢
         try:
@@ -2280,7 +2270,8 @@ class RocketDashboardApp:
                 bak_pct = int(m_er.group(2))
                 cur_sec = m_er.group(4)
                 tot_sec = m_er.group(5)
-                self._update_erase_progress(pri_pct, bak_pct, cur_sec, tot_sec)
+                peer_state = m_er.group(6)   # OK/STALE/NONE：副航電是否有在跟這台通話
+                self._update_erase_progress(pri_pct, bak_pct, cur_sec, tot_sec, peer_state)
 
         # C1b. ★2026-07-31：單板擦除進度 [FLASH_ERASE] 96/255 blocks 37% | 本塊 152ms 平均 148ms
         #      已用 14s 預估剩餘 23s（整環全擦）／[FLASH_ERASE] top-up 480/1500 sectors 32% ...
@@ -2295,8 +2286,31 @@ class RocketDashboardApp:
                 self.lbl_erase.config(
                     text=f"💾 ERASE {pct}% [{cur}/{tot}]{eta}",
                     fg="#00e676" if pct >= 100 else "#ffcc00")
+                unit = "區塊" if "blocks" in line else "磁區"
+                self._show_erase_message(
+                    f"💾 Flash 擦除進行中 —— {pct}%（{cur}/{tot} {unit}）"
+                    + (f"，預估剩餘 {m_eta.group(1)}s" if m_eta else ""),
+                    "#00e676" if pct >= 100 else "#ffcc00")
             elif "DONE" in line:
                 self.lbl_erase.config(text="💾 ✅ 擦除完成", fg="#00e676")
+                self._show_erase_message("💾 ✅ Flash 擦除完成", "#00e676")
+
+        # C1c. ★2026-08-01：ARM 當下的雙板 flash 確認
+        #      [FLASH_ARM] armed primary=100%(rdy) backup=100%(rdy) pool=1500/1500 self=PRIMARY peer=OK
+        #      擦除進度行只在開機/手動擦除時出現，操作員真正按下 ARM 時早已捲走，這條補上
+        #      「這次飛行紀錄空間備好了沒、副航電是不是也擦完了」的當下快照（見 main.c
+        #      FlashArm_ReportStatus）。
+        elif "[FLASH_ARM]" in line:
+            m_arm = re.search(
+                r"primary=(\d+)%(\(rdy\))?\s+backup=(\d+)%(\(rdy\))?"
+                r"\s+pool=(\d+)/(\d+)\s+self=(\w+)\s+peer=(\w+)", line)
+            if m_arm:
+                pri_pct = int(m_arm.group(1)); pri_rdy = m_arm.group(2) is not None
+                bak_pct = int(m_arm.group(3)); bak_rdy = m_arm.group(4) is not None
+                pool, pool_need = int(m_arm.group(5)), int(m_arm.group(6))
+                peer_link = m_arm.group(8)
+                self._on_arm_flash_check(pri_pct, pri_rdy, bak_pct, bak_rdy,
+                                         pool, pool_need, peer_link)
 
         # C2. 主/備板間鏈路溝通狀態 [LINK] self:.. peer:.. link:OK/STALE/NONE state:.. flags:.. age:..ms
         #     （新版尾段：sync=OK/NO lost=.. desync=.. self_arb=.. peer_arb=.. peer_flash=.. primary_erase=..% backup_erase=..%
@@ -2325,9 +2339,11 @@ class RocketDashboardApp:
                                         int(flags_hex, 16), int(age_ms),
                                         sync=sync, lost=lost, desync=desync,
                                         self_arb=self_arb, peer_arb=peer_arb)
-                # 更新擦除進度（從 [LINK] 1Hz 診斷取得持續更新）
+                # 更新擦除進度（從 [LINK] 1Hz 診斷取得持續更新）；link_ok 就是這行的
+                # link=OK/STALE/NONE，借來當「副航電是否有在跟這台通話」的依據。
                 if primary_erase is not None and backup_erase is not None:
-                    self._update_erase_progress(int(primary_erase), int(backup_erase))
+                    self._update_erase_progress(int(primary_erase), int(backup_erase),
+                                                peer_state=link_ok, banner=False)
                 # USB 直連主航電時，對端（backup）EKF/baro/VF/加速度靠這條 1Hz 鏈路帶進來
                 # （底層板間鏈路本身是 20Hz，這裡只是把已經在收的資料印出來），不需要地面站
                 # LoRa 轉發。只在 peer 確實回報 BACKUP 角色時才收，避免 USB 若改接副航電時
@@ -2489,12 +2505,6 @@ class RocketDashboardApp:
             m_prof = re.search(r"prof:0x([0-9A-Fa-f]+)", line)
             if m_prof:
                 self._handle_gs_pkt_profile(m_prof.group(1))
-
-            # ★2026-07-31：Flash 未擦除提醒（bit1 = TELEM_ARM_NEED_ERASE）。舊版地面站韌體
-            # 的 [GS_PKT] 沒有 armf 欄位，match 不到就完全不動橫幅（維持既有行為）。
-            m_armf = re.search(r"armf:0x([0-9A-Fa-f]+)", line)
-            if m_armf:
-                self._handle_gs_pkt_arm_flags(int(m_armf.group(1), 16))
 
             m = re.search(r"alt:(-?\d+)cm", line)
             if m:
@@ -2838,11 +2848,34 @@ class RocketDashboardApp:
         return "break"
 
     # ==================== BENCH 桌面測試實時監控彈出視窗 ====================
+    # 副板延後量 = 韌體的 DROGUE_LEAD_TIME_S，它依飛行 profile 分流（board_config.h 的
+    # FLIGHT_PROFILE_ELEVATOR：電梯場測 1.0s / 真實飛行 4.0s），所以 GUI 不能寫死。
+    # 由韌體序列開場行與 [1a] 行解析出實際值，解析到之前一律顯示 "?s"，寧可留白也不要
+    # 顯示一個和板子上跑的不一樣的秒數。
+    _BENCH_LEAD_PATTERNS = (
+        re.compile(r"副板延後\s*(\d+(?:\.\d+)?)s"),        # 序列：... / 副板延後 1s 後 3s → ...
+        re.compile(r"對應飛行提前\s*(\d+(?:\.\d+)?)s"),     # [1a] 主板：... （提前開引傘，對應飛行提前 1s）
+        re.compile(r"主板提前\s*(\d+(?:\.\d+)?)s\s*開"),    # 引傘對應飛行：主板提前 1s 開、拉高 8s
+    )
+
+    def _bench_parse_lead(self, line):
+        """自韌體 [PYRO-SELFTEST] 行擷取副板延後量（DROGUE_LEAD_TIME_S），存起來給標籤用。"""
+        for pat in self._BENCH_LEAD_PATTERNS:
+            m = pat.search(line)
+            if m:
+                self.bench_lead_s = m.group(1)
+                return
+
+    def _lead(self):
+        """副板延後量顯示字串（未知時為 "?s"，等韌體開場行送到就會補上）。"""
+        return f"{getattr(self, 'bench_lead_s', None) or '?'}s"
+
     def open_bench_monitor_window(self):
         """開啟 BENCH 桌面測試實時監控彈出視窗。
 
         ★時序已改版（與飛行邏輯 1:1 對應）：
-          步驟1 引傘 PD13：主板 t=0 起 8s；副板延後 4s（頂點提前量）後 3s —— 兩窗**重疊**。
+          步驟1 引傘 PD13：主板 t=0 起 8s；副板延後 DROGUE_LEAD_TIME_S（頂點提前量，依
+          profile 為 1s/4s）後 3s —— 兩窗**重疊**。
           步驟3 主傘 PD14：★不啟 PWM，兩板**同時**純 GPIO 拉高 1.5s（互斥握手/舵機掃描已取消）。
         故本視窗不再顯示「1s Guard 意圖確認 / 讓位 / PWM 掃描 / 互斥防打架」那套語意，
         也不再需要舊的 _bench_step1_done 階段閘：新的 arb 值（BENCH_START / BENCH_PRI_FIRE /
@@ -2863,8 +2896,11 @@ class RocketDashboardApp:
         hdr_frame.pack(fill=tk.X)
         tk.Label(hdr_frame, text="🖥️ BENCH TEST REALTIME MONITOR", bg="#27104e", fg="#a855f7",
                  font=("Helvetica", 14, "bold")).pack(anchor="w")
-        tk.Label(hdr_frame, text="即時監控：引傘 PD13（主 8s / 副 延後 4s 後 3s，窗重疊）｜ 主傘 PD14（雙板同時拉高 1.5s，無 PWM、無握手）",
-                 bg="#27104e", fg="#d8b4fe", font=("Helvetica", 9)).pack(anchor="w", pady=(2, 0))
+        self.lbl_bench_hdr_timing = tk.Label(
+            hdr_frame,
+            text=f"即時監控：引傘 PD13（主 8s / 副 延後 {self._lead()} 後 3s，窗重疊）｜ 主傘 PD14（雙板同時拉高 1.5s，無 PWM、無握手）",
+            bg="#27104e", fg="#d8b4fe", font=("Helvetica", 9))
+        self.lbl_bench_hdr_timing.pack(anchor="w", pady=(2, 0))
 
         main_frame = tk.Frame(self.bench_win, bg="#121212", padx=18, pady=14)
         main_frame.pack(fill=tk.BOTH, expand=True)
@@ -3018,23 +3054,32 @@ class RocketDashboardApp:
         tag = "sys"
         clean_line = line.strip()
 
+        # 副板延後量隨韌體 profile 變（1s/4s），先自本行擷取，之後的標籤才顯示得出實際值。
+        self._bench_parse_lead(line)
+
         # ── 日誌分類高亮與步驟進度更新 ──
         # 時序（與飛行 1:1）：
-        #   步驟1 引傘 PD13：主板 t=0 起 8s；副板延後 4s 後 3s（兩窗重疊，diode-OR 準位訊號無妨）
+        #   步驟1 引傘 PD13：主板 t=0 起 8s；副板延後 DROGUE_LEAD_TIME_S 後 3s
+        #                    （兩窗重疊，diode-OR 準位訊號無妨）
         #   步驟3 主傘 PD14：兩板「同時」純 GPIO 拉高 1.5s（★無 PWM、無互斥握手、無讓位 guard）
         if ("開傘電火自測" in line or "序列：" in line or "對應飛行：" in line
                 or "LED:" in line or "⚠ PD13" in line or "倒數" in line or "同脈同步" in line):
             tag = "sys"
+            # 開場行帶著本次實際時序，順手把標題列的秒數補正。
+            if hasattr(self, 'lbl_bench_hdr_timing') and self.lbl_bench_hdr_timing.winfo_exists():
+                self.lbl_bench_hdr_timing.config(
+                    text=f"即時監控：引傘 PD13（主 8s / 副 延後 {self._lead()} 後 3s，窗重疊）｜ "
+                         f"主傘 PD14（雙板同時拉高 1.5s，無 PWM、無握手）")
         elif "[1a]" in line:
             tag = "fire"
-            self.lbl_bench_step.config(text="當前步驟: 1a/3 — 🔥 主板引傘 PD13 通電中 (8s，對應飛行提前 4s 開)")
+            self.lbl_bench_step.config(text=f"當前步驟: 1a/3 — 🔥 主板引傘 PD13 通電中 (8s，對應飛行提前 {self._lead()} 開)")
             self.bench_progressbar['value'] = 20
             self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🔥 PD13 HIGH (引傘通電 8s)", bg="#7f1d1d", fg="#ff6b6b")
-            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🟢 PD13 LOW (等模擬頂點，延後 4s)", bg="#064e3b", fg="#34d399")
+            self.lbl_bench_backup_status.config(text=f"🛟 BACKUP BOARD  : 🟢 PD13 LOW (等模擬頂點，延後 {self._lead()})", bg="#064e3b", fg="#34d399")
             self.lbl_bench_arb_status.config(text="🪂 主傘共開 (PD14 CO-FIRE): 🟢 IDLE (步驟1 進行中，PD14 未動作)", bg="#064e3b", fg="#34d399")
         elif "[1b]" in line:
             tag = "guard"
-            self.lbl_bench_step.config(text="當前步驟: 1b/3 — ⏳ 副板等待模擬頂點（延後 4s＝飛行提前量）")
+            self.lbl_bench_step.config(text=f"當前步驟: 1b/3 — ⏳ 副板等待模擬頂點（延後 {self._lead()}＝飛行提前量）")
             self.bench_progressbar['value'] = 30
             self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : ⏳ 等待模擬頂點 (PD13 仍 LOW)", bg="#78350f", fg="#fde047")
         elif "[1c]" in line and "已達模擬頂點" in line:
@@ -3195,11 +3240,15 @@ class RocketDashboardApp:
     def _on_bench_test(self):
         """觸發手動桌面開傘測試 (BENCH)。是否接受由航電板判斷（須先 ARM）；GUI 不做
         本地攔截，一律送出，接受/拒絕以航電回傳的 [ACK] 為準（見 update_bench_monitor）。"""
+        # 副板延後量 = 韌體 DROGUE_LEAD_TIME_S，依 profile 為 1s(電梯場測)/4s(飛行)；
+        # 送指令前不一定知道板上是哪一組，故沿用上次解析到的值，未知就寫明「見韌體開場行」。
+        lead_txt = (f"{self.bench_lead_s}s" if getattr(self, 'bench_lead_s', None)
+                    else "DROGUE_LEAD_TIME_S（依 profile 為 1s/4s，以韌體開場行為準）")
         ans = messagebox.askyesno(
             "手動桌面測試確認 (BENCH)",
             "確定要發送『桌面開傘測試 (BENCH)』指令嗎？\n\n"
             "⚠️ 注意（時序與飛行邏輯 1:1 對應）：\n"
-            "1. 引傘 PD13：主板 t=0 起通電 8s；副板延後 4s（模擬頂點提前量）後通電 3s，\n"
+            f"1. 引傘 PD13：主板 t=0 起通電 8s；副板延後 {lead_txt}（模擬頂點提前量）後通電 3s，\n"
             "   兩板通電窗會重疊（PD13 為 diode-OR 準位訊號，同時拉高無妨）。\n"
             "2. 主傘 PD14：★不啟動 PWM，兩板『同時』純 GPIO 拉高 1.5s（已取消互斥握手）。\n"
             "3. 全程耗時約 20 秒，測試完成後自動復位 PD14 並回歸正常 FSM。\n"
@@ -3253,6 +3302,8 @@ class RocketDashboardApp:
         if role is None:
             self.lbl_link.config(text="🔗 --", fg="#555555")
             self.lbl_erase.config(text="💾 ERASE: --", fg="#555555")
+            # ARM 檢查快照同樣要清掉：斷線換板後留著上一塊板的「✅ 已擦除」會直接誤導。
+            self.lbl_arm_flash.config(text="💾 ARM 檢查: 尚未 ARM", fg="#666666")
             self.link_last_age_ms = None
         # 同步 LoRa 面板（若已開啟）
         if hasattr(self, 'lora_win') and self.lora_win and self.lora_win.winfo_exists():
@@ -3425,11 +3476,27 @@ class RocketDashboardApp:
                 peer_text, peer_color = "🛸 PEER: NO LINK", "#ff3366"
             self.lbl_peer.config(text=peer_text, fg=peer_color)
 
-    def _update_erase_progress(self, pri_pct, bak_pct, cur_sec=None, tot_sec=None):
-        """更新頂部雙航電 Flash 預擦除進度標籤。pri_pct/bak_pct 為絕對角色百分比
-        （firmware 端已算好 primary=/backup=，這裡不再需要 self/peer 相對映射）。"""
+    def _update_erase_progress(self, pri_pct, bak_pct, cur_sec=None, tot_sec=None,
+                               peer_state=None, banner=True):
+        """更新頂部雙航電 Flash 預擦除進度標籤 + 大字橫幅。pri_pct/bak_pct 為絕對角色百分比
+        （firmware 端已算好 primary=/backup=，這裡不再需要 self/peer 相對映射）。
+        peer_state：OK/STALE/NONE，副航電是否有在跟「這台直連的板子」通話——不知道時傳 None，
+        沿用上次記錄的值（例如 C1b 單板格式沒有這個資訊，不該把它洗成「未知」）。"""
+        if peer_state is not None:
+            self._erase_peer_state = peer_state
+        self._erase_pri_pct = pri_pct
+        self._erase_bak_pct = bak_pct
+        # banner=False 是 [LINK] 1Hz 診斷行專用：那條行**永遠**帶 primary_erase=/backup_erase=，
+        # 每秒都推一次新鮮度時戳的話 12 秒窗口永遠不會過期，橫幅會從擦完之後一路掛在畫面上
+        # （綠色「擦除完成」變成常駐噪音，紅黃色則更糟）。所以 [LINK] 只餵頂欄小標籤，
+        # 大字橫幅一律由真正的事件行驅動：擦除進度（[FLASH_RING]/[FLASH_ERASE]）與
+        # ARM 確認（[FLASH_ARM]）。
+        if banner:
+            self._erase_mode = "dual"
+            self._erase_active_ts = time.time()
+
         if pri_pct >= 100 and bak_pct >= 100:
-            text = "💾 ✅ 雙板擦除完成 (Ready to ARM)"
+            text = "💾 ✅ 雙板擦除完成"
             color = "#00e676"
         else:
             sec_info = ""
@@ -3438,6 +3505,75 @@ class RocketDashboardApp:
             text = f"💾 PRI:{pri_pct}% BAK:{bak_pct}%{sec_info}"
             color = "#ffcc00" if (pri_pct > 0 or bak_pct > 0) else "#ff3366"
         self.lbl_erase.config(text=text, fg=color)
+        self._refresh_erase_banner()
+
+    def _on_arm_flash_check(self, pri_pct, pri_rdy, bak_pct, bak_rdy,
+                            pool, pool_need, peer_link):
+        """ARM 當下的雙板 flash 確認：ARM 旁的常駐標籤（快照，不隨時間刷新）＋一次大字橫幅。
+        判讀順序刻意是「副航電鏈路 → 副航電擦除 → 本板池」：副板沒連上時 bak_pct 只會是 0，
+        那個 0 不代表「沒擦」而是「不知道」，先講鏈路才不會誤導（同 _refresh_erase_banner）。"""
+        peer_txt = {"OK": "已連線", "STALE": "逾時", "NONE": "未連線"}.get(peer_link, "未知")
+        ok = pri_rdy and bak_rdy and peer_link == "OK" and pool >= pool_need
+
+        if ok:
+            self.lbl_arm_flash.config(
+                text=f"💾 ARM 檢查 ✅ 雙板已擦除 ({pool}/{pool_need})", fg="#00e676")
+            self._show_erase_message(
+                f"💾 ✅ ARM 確認：主/副航電 Flash 均已擦除就緒（本板池 {pool}/{pool_need} 格，副航電鏈路已連線）",
+                "#00e676")
+            return
+
+        # 未全綠：把最該注意的那一項排在最前面，橫幅用紅色（這是發射前的實際待辦）
+        issues = []
+        if peer_link != "OK":
+            issues.append(f"副航電鏈路{peer_txt}（BAK {bak_pct}% 不可信）")
+        elif not bak_rdy:
+            issues.append(f"副航電未就緒 BAK {bak_pct}%")
+        if not pri_rdy:
+            issues.append(f"主航電未就緒 PRI {pri_pct}%")
+        if pool < pool_need:
+            issues.append(f"本板池不足 {pool}/{pool_need} 格")
+        detail = "、".join(issues) if issues else "狀態不明"
+
+        self.lbl_arm_flash.config(text=f"💾 ARM 檢查 ⚠ {detail}", fg="#ff3366")
+        self._show_erase_message(f"⚠ ARM 確認：{detail}", "#ff3366")
+
+    def _show_erase_message(self, text, color):
+        """把一行現成文字掛上擦除橫幅（12 秒新鮮度窗口，之後自動收合）。兩個來源共用：
+        單板直連的 [FLASH_ERASE] 進度（手動 `flash erase` 不產生 primary=/backup= 那組雙板
+        欄位，只靠頂欄小標籤會被漏看——這是先前「手動擦除時畫面像沒反應」的來源），以及
+        ARM 當下的 [FLASH_ARM] 確認。切成 mode="single"（＝自帶文字）後 _refresh_erase_banner
+        直接印這行，之後只要再收到一行雙板進度就會被切回 dual（自算 PRI/BAK 文字）。"""
+        self._erase_mode = "single"
+        self._erase_single_text = text
+        self._erase_single_color = color
+        self._erase_active_ts = time.time()
+        self._refresh_erase_banner()
+
+    def _refresh_erase_banner(self):
+        """★2026-08-01：頂欄那顆小標籤（上面 _update_erase_progress 設的）字級小又跟一排
+        其他小標籤擠在一起，容易被忽略——這裡另外用大字橫幅把同一份資料醒目顯示一次，
+        尤其副航電連線狀態直接寫出來，「0%」不再是無法判讀的數字。
+        12 秒新鮮度窗口：擦除進度行間隔（每 10% 或 peer 進度變化才印一次）可能有數秒空檔，
+        窗口太短會在正常擦除中途誤收合；沒有新進度行進來超過這個窗口，視為擦除已結束
+        （成功訊息保留到窗口過期）或雙板都斷線，自動收合避免橫幅卡住不放。"""
+        active = (time.time() - self._erase_active_ts) < 12.0
+        if active and self._erase_mode == "single":
+            text, color = self._erase_single_text, self._erase_single_color
+        elif active:
+            pri, bak = self._erase_pri_pct, self._erase_bak_pct
+            if pri >= 100 and bak >= 100:
+                text = "💾 ✅ 雙板 Flash 擦除完成"
+                color = "#00e676"
+            else:
+                peer_txt = {"OK": "已連線", "STALE": "曾連線但逾時",
+                            "NONE": "尚未連線"}.get(self._erase_peer_state, "未知")
+                text = (f"💾 Flash 擦除進行中 —— 主航電(PRI) {pri}%　"
+                        f"副航電(BAK) {bak}%（鏈路：{peer_txt}）")
+                color = "#ffcc00"
+        else:
+            text, color = "", "#ffcc00"
+        update_erase_banner(self.erase_banner, active, text, color)
 
     # 對稱獨立冗餘下副板無自身電台；主板把副板摘要中繼進下鏈，地面經 [GS_PKT] peer: 看到。
     _PEER_FSM_NAMES = ["INIT", "PAD", "PAD_ARMED", "BOOST", "COAST", "DROGUE",
@@ -3466,7 +3602,7 @@ class RocketDashboardApp:
         elif pbarb == 4:    # BENCH_PRI_FIRE：主板引傘中，副板應仍 LOW（等模擬頂點）
             self.lbl_bench_step.config(text="當前步驟: 1a/3 — 🔥 主板引傘 PD13 通電中 (8s)")
             self.bench_progressbar['value'] = 20
-            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🟢 PD13 LOW (等模擬頂點，延後 4s)", bg="#064e3b", fg="#34d399")
+            self.lbl_bench_backup_status.config(text=f"🛟 BACKUP BOARD  : 🟢 PD13 LOW (等模擬頂點，延後 {self._lead()})", bg="#064e3b", fg="#34d399")
         elif pbarb == 3:    # DONE：副板 PD14 拉高窗結束、已回低
             self.lbl_bench_step.config(text="當前步驟: 3/3 — 🟢 副板主傘拉高完成，PD14 已回低")
             self.bench_progressbar['value'] = 96
@@ -4600,7 +4736,7 @@ class RocketDashboardApp:
         tk.Label(erase_all_frame, text="連同校準/mag/LoRa/總結整顆清空，之後須重新校正 (需二次確認)",
                  bg="#1c1c1c", fg="#ff5555", font=("Helvetica", 9)).pack(side=tk.LEFT)
 
-        # B3. ★2026-07-31：快速填池（航電開機不再自動擦除，池未達標會擋 ARM）
+        # B3. 快速填池：只補不足的部分（航電開機已自動補擦到基本需求，這裡是 bench 省時用）
         pool_frame = tk.Frame(op_box, bg="#1c1c1c")
         pool_frame.pack(fill=tk.X, pady=(0, 8))
         btn_pool = StyledButton(pool_frame, text="⚡ 快速填池", command=self.topup_flash_pool,
@@ -4616,9 +4752,9 @@ class RocketDashboardApp:
         self.lbl_flash_export_status.pack(anchor="w", pady=(10, 0))
 
     def topup_flash_pool(self):
-        """★2026-07-31：快速填池（`flash pool`）。航電開機不再自動擦除，池未達
-        FLASH_RING_PREERASE_TARGET 時 ARM 會被擋；本指令只補不足的部分、不動整環。
-        不需二次確認：它只擦「本來就沒資料」的區域，不會毀掉既有飛行紀錄。"""
+        """快速填池（`flash pool`）。★2026-08-01 起航電開機已自動把池補到
+        FLASH_RING_PREERASE_TARGET，本指令是 bench 反覆測試時的省時補救：只補不足的
+        部分、不動整環。不需二次確認：它只擦「本來就沒資料」的區域，不會毀掉既有飛行紀錄。"""
         if not self.running or not getattr(self, 'ser', None):
             messagebox.showwarning("警告", "串口未連接！無法發送填池命令。", parent=getattr(self, 'flash_win', None))
             return

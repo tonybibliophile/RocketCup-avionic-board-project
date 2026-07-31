@@ -403,10 +403,9 @@ static void gs_handle_packet(uint8_t link, const TelemetryPacket_t *pkt,
                (unsigned)pkt->peer_link,
                (int)pkt->peer_baro_cm,
                (int)pkt->peer_vf_h_cm, (int)pkt->peer_vf_v_cms,
-               /* ★2026-07-31 新增 armf：航電開機不再自動擦 flash，池未達標時 ARM 會被擋。
-                * 這一位（TELEM_ARM_NEED_ERASE）讓地面站 GUI 在使用者按 ARM「之前」就能跳
-                * 橫幅提醒先擦除。純字串尾端新增欄位，舊解析器不受影響（封包格式未動，
-                * 不需三板同燒）。 */
+               /* armf = TelemetryPacket_t.arm_flags。★2026-08-01 起航電開機自動補擦到基本
+                * 需求，未擦除警告與 ARM 防護皆已移除，此欄目前恆為 0（位元定義見 telemetry.h，
+                * 保留供將來復用）。純字串尾端欄位，舊解析器不受影響。 */
                (unsigned)pkt->peer_bench_arb, (unsigned)pkt->profile_flags,
                (unsigned)pkt->arm_flags);
     }

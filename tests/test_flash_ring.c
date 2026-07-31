@@ -96,16 +96,66 @@ static void test_hotstart_pool_start(void)
     check("環尾 sector → 迴繞回 BASE", ring_sector_end(END + 1UL - PKT) == BASE);
     check("舊版行為（erased_end = write_addr）在此為非對齊 ⇒ 已不再使用",
           ((BASE + 3 * SECTOR + 7 * PKT) % SECTOR) != 0);
-    /* 前向探測會逐 sector 推進，池不得超過目標上限（含首個 partial sector） */
-    uint32_t end = ring_sector_end(w);
-    uint32_t probed = 0;
-    while (ring_pool_bytes_calc(w, end) + SECTOR <= POOL_TARGET_BYTES) {
-        end = ring_sector_end(end);
-        probed++;
+    /* ★2026-08-01 回歸：FlashRing_ProbePoolNoErase() 的探測迴圈（w25qxx.c）。
+     * 舊版以「位元組」為界：pool_bytes + SECTOR <= POOL_TARGET_BYTES。寫入頭落在 sector
+     * 中間時（只要曾寫過任何一筆封包就會如此），起始半格讓池永遠停在 TARGET-0.x 格，
+     * floor 後恆為 TARGET-1 ⇒ 環明明整個是 0xFF 卻回報「需要擦除」，且唯一解法是再全擦。
+     * 本測試舊版還把該 off-by-one 寫成期望值（probed == TARGET-1）而長期全綠。
+     * 新版以「格數」為界，與 FlashRing_GetPoolSectors() 的 floor 語意一致。 */
+    static const uint32_t heads[] = {
+        BASE,                              /* 剛全擦完：write 對齊 BASE */
+        BASE + PKT,                        /* 寫過一筆：sector 中間 */
+        BASE + 3 * SECTOR + 7 * PKT,       /* 中段、sector 中間 */
+        BASE + 100 * SECTOR,               /* 中段、sector 對齊 */
+        BASE + 4000 * SECTOR + PKT,        /* 近環尾 + sector 中間（探測需迴繞） */
+    };
+    for (unsigned i = 0; i < sizeof(heads) / sizeof(heads[0]); i++) {
+        const uint32_t head = heads[i];
+        uint32_t e = ring_sector_end(head);
+        uint32_t n = 0;
+        while (ring_pool_bytes_calc(head, e) / SECTOR < FLASH_RING_PREERASE_TARGET
+               && n <= FLASH_RING_PREERASE_TARGET) {
+            e = ring_sector_end(e);
+            n++;
+        }
+        const uint32_t got = ring_pool_bytes_calc(head, e) / SECTOR;
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "write=0x%06lX 探測必達標（%lu >= %u 格）—— 不因半格 floor 卡在 %u",
+                 (unsigned long)head, (unsigned long)got,
+                 FLASH_RING_PREERASE_TARGET, FLASH_RING_PREERASE_TARGET - 1U);
+        check(msg, got >= FLASH_RING_PREERASE_TARGET);
+        snprintf(msg, sizeof(msg), "write=0x%06lX 探測迴圈有界終止", (unsigned long)head);
+        check(msg, n <= FLASH_RING_PREERASE_TARGET);
+        snprintf(msg, sizeof(msg), "write=0x%06lX 探測後 end 仍 sector 對齊", (unsigned long)head);
+        check(msg, (e % SECTOR) == 0);
+        snprintf(msg, sizeof(msg), "write=0x%06lX 池不超過目標 + 1 sector", (unsigned long)head);
+        check(msg, ring_pool_bytes_calc(head, e) <= POOL_TARGET_BYTES + SECTOR);
     }
-    check("探測迴圈終止且池 ≤ 目標上限", ring_pool_bytes_calc(w, end) <= POOL_TARGET_BYTES);
-    check("探測 sector 數合理（959 格 + 首個 partial）", probed == FLASH_RING_PREERASE_TARGET - 1U);
-    check("探測後 end 仍 sector 對齊", (end % SECTOR) == 0);
+}
+
+/* ★2026-08-01 回歸：ARM 後 flash 池被消耗，不得讓「有沒有擦過」的判定翻回「未擦除」。
+ * `flash erase` 產生的池恰好是 TARGET 格、零餘裕；PAD_ARMED 以 1Hz 寫入（main.c ring_enabled），
+ * 第一筆 128B 封包就讓 floor(池/SECTOR) 由 TARGET 掉到 TARGET-1。舊版 main.c 在 PAD_ARMED
+ * 仍以 live 池重算 g_flash_need_erase ⇒ 擦完一按 ARM，一秒後又開始洗 [FLASH_NOT_READY]，
+ * 且地面不會重新擦、再也回不去。本節鎖住該數值事實，正解見 main.c（PAD_ARMED 不重算）。 */
+static void test_pool_consumed_after_arm(void)
+{
+    printf("[5c] ARM 後池消耗與「未擦除」判定\n");
+    const uint32_t erased_end = BASE + (uint32_t)FLASH_RING_PREERASE_TARGET * SECTOR;
+    check("flash erase 後池恰為目標（零餘裕）",
+          ring_pool_bytes_calc(BASE, erased_end) / SECTOR == FLASH_RING_PREERASE_TARGET);
+    /* 武裝後每秒一筆：寫入頭前進，池縮小 */
+    uint32_t write = BASE;
+    for (int sec = 1; sec <= 3; sec++) {
+        write = ring_write_advance(write);
+        check("★寫入第一筆後 live 池即低於目標（故 PAD_ARMED 不可用 live 池判定是否擦過）",
+              ring_pool_bytes_calc(write, erased_end) / SECTOR
+                  == (uint32_t)FLASH_RING_PREERASE_TARGET - 1U);
+    }
+    check("池確實只少了 3 筆封包（非真的沒擦）",
+          ring_pool_bytes_calc(write, erased_end)
+              == (uint32_t)FLASH_RING_PREERASE_TARGET * SECTOR - 3U * PKT);
 }
 
 static void test_packet_addr(void)
@@ -223,6 +273,7 @@ int main(void)
     test_write_advance();
     test_erase_advance();
     test_hotstart_pool_start();
+    test_pool_consumed_after_arm();
     test_packet_addr();
     test_span_in_pool();
     test_full_lap_sim();

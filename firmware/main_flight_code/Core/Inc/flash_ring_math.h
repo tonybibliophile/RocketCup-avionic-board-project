@@ -72,8 +72,9 @@ extern "C" {
  * ⚠️ 若 fsm.h 任一 profile 的 FSM_MAIN_WATCHDOG_MS／FSM_MAIN_INFLATE_MS 之後調整
  * （例如換 profile 或重推 OpenRocket），此值須同步依上式重算（取兩 profile較大者
  * 再加上預期武裝時間），並於發射檢核表確認 [FLASH] pool 達標後才起飛。
- * ⚠️ 本值同時是 ARM 閘門檻：池未達標一律擋 ARM（fsm.c flash_pool_ready），且開機
- * 不再自動擦除，須由使用者下 `flash erase`／`flash pool` 指令。 */
+ * ★2026-08-01：本值是「開機自動補擦」的目標——開機序列以 FlashRing_TopUpPool() 把池補到
+ * 此值（見 main.c StartDefaultTask），故正常開機完成後必定達標。已無 ARM 閘（使用者決策），
+ * fsm.c 的 flash_pool_ready 保留但 main.c 固定餵 1。 */
 #define FLASH_RING_PREERASE_TARGET 1500U      /* ARM 前要求的最低已擦池（sectors） */
 
 /* 擦除粒度。必須等於 W25QXX_SECTOR_SIZE（w25qxx.h 以 _Static_assert 鎖定）。 */

@@ -257,9 +257,10 @@ typedef struct {
     uint8_t  peer_drogue_cmd; // D1 加法互救：對端已開副傘（LinkPeer.drogue_latched）。
                               // 嚴格 OR：僅「額外」促成本板開副傘，對端沉默則各路徑照舊獨立；
                               // arm-interlock = 已處 COAST（必經 BOOST）+ 起飛時間鎖，擋台上誤觸。
-    uint8_t  flash_pool_ready; // 1 = flash 預擦池已達 FLASH_RING_PREERASE_TARGET（或 flash 停用/
-                              // 未偵測到／未在記錄，此時 fail-open 恆為 1，不擋 ARM）。
-                              // main.c 依 FlashRing_GetPoolSectors() 組裝，見 FSM_Update。
+    uint8_t  flash_pool_ready; // 1 = flash 預擦池已達 FLASH_RING_PREERASE_TARGET。
+                              // ★2026-08-01：已無 ARM 閘（使用者決策：開機自動補擦到達標），
+                              // main.c 固定餵 1；本欄與下方 arm_blocked_flash 保留為純邏輯層
+                              // 防線（tests/test_fsm.c 仍覆蓋），要重啟防護見 FSM_Update 註解。
 } FSM_Input_t;
 
 /* === 動作（呼叫端立即執行；硬體動作先於 printf） === */

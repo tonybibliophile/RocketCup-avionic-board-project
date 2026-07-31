@@ -26,6 +26,14 @@ void Link_Init(void);
 /* 非阻塞送出一筆自身狀態（IT 傳輸；自動補遞增 seq；上一筆未送完則略過本次）。 */
 void Link_SendStatus(const LinkStatus_t *st);
 
+/* 組裝「本板目前狀態」封包（實作在 main.c，需要 FSM/EKF/感測器等全域）。
+ * 凡是要送 LinkStatus 的地方都走這支，確保各路廣播內容同源——bench 序列與飛控迴圈
+ * 是兩個 task、會同時各送各的，內容若不同源，對端欄位就會在兩套值之間跳動。 */
+void Link_BuildOwnStatus(LinkStatus_t *ls);
+
+/* fsm_state 數值 → 簡短字串（"PAD_ARMED" 等），供 [LINK] 診斷行輸出（實作在 main.c）。 */
+const char *link_fsm_state_name(uint8_t s);
+
 /* 取得對端狀態（含鎖存的 drogue/main 開傘旗標 + QoS：rx_count/lost_count），
  * 供地面監看與加法協同讀取。 */
 const LinkPeer_t *Link_GetPeer(void);
@@ -35,6 +43,9 @@ const LinkRx_t *Link_GetRx(void);
 
 /* 對端是否仍在線（valid 且距上次收包 < LINK_PEER_TIMEOUT_MS）。 */
 uint8_t Link_PeerFresh(uint32_t now_ms);
+
+/* DISARM 專用：清掉對端的四個開傘鎖存（見 LinkPeer_ClearDeployLatches）。 */
+void Link_ClearPeerDeployLatches(void);
 
 /* 板間鏈路健康狀態位（純觀測；不影響開傘決策）。 */
 #define LINK_STATUS_LOST    0x01U  /* 對端失聯（距上次有效封包 > LINK_PEER_TIMEOUT_MS） */

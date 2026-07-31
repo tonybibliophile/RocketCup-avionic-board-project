@@ -53,6 +53,12 @@ uint8_t UplinkCmd_TakeDeploy(uint8_t *want_drogue, uint8_t *want_main);
 void UplinkCmd_ForceDeploy(uint8_t want_drogue, uint8_t want_main);
 
 /**
+ * @brief 作廢尚未被取走的 pending 開傘請求。DISARM 專用（見 main.c Deploy_ResetLatches）：
+ *  不清的話，DISARM 前那一瞬間收到的 DEPLOY 會在下次 ARM 後才被 TakeDeploy 取走並點火。
+ */
+void UplinkCmd_ClearPendingDeploy(void);
+
+/**
  * @brief 取出並清除待辦的文字命令（一次性消費）。由診斷任務呼叫 → 餵 Parse_Serial_Command。
  * @param out  緩衝區，須 >= UPLINK_TEXT_MAX+1（含結尾 NUL）。
  * @param sz   out 大小。

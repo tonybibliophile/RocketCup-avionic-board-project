@@ -20,6 +20,12 @@
 
 extern UART_HandleTypeDef huart3;   /* E22 433 透傳（main.c 定義） */
 
+/* 「航電收到訊息」的聲音回覆：每收到一筆通過 CRC 的上行幀就嗶 3 短聲（main.c 定義，
+ * 非阻塞——只登記次數，實際發聲由飛控迴圈的 Buzzer_Service 推進）。台上操作員看不到
+ * console，靠耳朵確認命令真的進了火箭。 */
+extern void Buzzer_RequestBeeps(uint8_t n);
+#define UPLINK_ACK_BEEPS  3U
+
 /* ---- USART3 位元組環形緩衝：ISR 推入、遙測任務取出 ---- */
 #define U3R_SZ 256U
 static volatile uint8_t  s_ring[U3R_SZ];
@@ -178,6 +184,7 @@ void UplinkCmd_Poll(uint32_t now_ms)
 
         /* --- 文字命令幀（0x55/0xBB）：帶參數指令 → 交診斷任務餵 Parse_Serial_Command --- */
         if (UplinkTextRx_Feed(&s_trx, b, tseq_text, &tlen, &tseq)) {
+            Buzzer_RequestBeeps(UPLINK_ACK_BEEPS);   /* 收到訊息 → 嗶 3 聲 */
             if (!s_pending_text) {            /* 前一筆尚未被取走則丟棄本筆（極少見；避免覆蓋） */
                 memcpy(s_text, tseq_text, (size_t)tlen + 1U);
                 s_text_seq = tseq;
@@ -190,6 +197,7 @@ void UplinkCmd_Poll(uint32_t now_ms)
         /* --- 二進制幀（0x55/0xAA）：ARM/DISARM/DEPLOY/BENCH --- */
         if (!UplinkRx_Feed(&s_rx, b, &cmd, &arg, &seq)) continue;
         s_last_cmd = cmd;
+        Buzzer_RequestBeeps(UPLINK_ACK_BEEPS);       /* 收到訊息 → 嗶 3 聲（不論命令是否被接受） */
         switch (cmd) {
             case UPLINK_CMD_PING:
                 printf("[UPLINK] PING seq=%u（armed=%u）\r\n", (unsigned)seq, (unsigned)s_armed);
@@ -320,6 +328,12 @@ uint8_t UplinkCmd_TakeDeploy(uint8_t *want_drogue, uint8_t *want_main)
     if (s_pending_main)   { if (want_main)   *want_main   = 1; s_pending_main   = 0; any = 1; }
     else if (want_main)   *want_main = 0;
     return any;
+}
+
+void UplinkCmd_ClearPendingDeploy(void)
+{
+    s_pending_drogue = 0;
+    s_pending_main   = 0;
 }
 
 void UplinkCmd_ForceDeploy(uint8_t want_drogue, uint8_t want_main)

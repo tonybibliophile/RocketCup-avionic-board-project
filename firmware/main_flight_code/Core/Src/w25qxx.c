@@ -627,8 +627,8 @@ void FlashRing_RunPreErase(void (*progress_cb)(uint32_t current, uint32_t total)
 }
 
 /* ★2026-07-31：唯讀認領已擦區。開機序列的「唯一」池來源（冷開機與空中熱重啟共用）：
- * 開機不再自動擦除，池由使用者觸發的 `flash erase`／`flash pool` 指令建立，重開機後
- * 那片已擦區還好端端在 flash 上，只是 RAM 裡的 erased_end 沒了——本函式把它找回來。
+ * 開機序列的第一步：上一次留在 flash 上的已擦區還好端端在那，只是 RAM 裡的 erased_end
+ * 隨重啟沒了——本函式零擦除把它找回來，不足的部分再由 FlashRing_TopUpPool() 補（見 main.c）。
  *
  * 作法：先把寫入頭所在 sector 的剩餘空間計入池（必為 0xFF，理由見 ring_sector_end()），
  * 再逐 sector 讀首 2 bytes 確認 0xFF 才往前收（封包必以 0xAA 0x55 起頭、同 sector 內由
@@ -639,10 +639,17 @@ void FlashRing_RunPreErase(void (*progress_cb)(uint32_t current, uint32_t total)
 uint32_t FlashRing_ProbePoolNoErase(void)
 {
     uint32_t end = ring_sector_end(s_ring_write_addr);
-    const uint32_t pool_limit = (uint32_t)FLASH_RING_PREERASE_TARGET * W25QXX_SECTOR_SIZE;
     uint32_t probed = 0;
 
-    while (ring_pool_bytes_calc(s_ring_write_addr, end) + W25QXX_SECTOR_SIZE <= pool_limit) {
+    /* ★2026-08-01：迴圈上限改用「格數」而非「位元組數」。舊版以 pool_bytes + 4096 <= 1500*4096
+     * 為界，當寫入頭落在 sector 中間時（只要曾寫過任何一筆封包就會如此），起始的半格讓池永遠
+     * 停在 1499.x 格，floor 後恆為 1499 < 1500 ⇒ 環明明整個是 0xFF 卻回報「需要擦除」，且
+     * 唯一解法是再全擦一次。現在直接以 GetPoolSectors() 的同一套 floor 語意當終止條件，
+     * 需要時多探一格，確保「有 1500 個完整可用格」時就回報達標。
+     * probed 硬上限保證終止：整環全 0xFF 時不會繞回起點造成 pool 歸零後無限迴圈。 */
+    while (ring_pool_bytes_calc(s_ring_write_addr, end) / W25QXX_SECTOR_SIZE
+               < (uint32_t)FLASH_RING_PREERASE_TARGET
+           && probed <= (uint32_t)FLASH_RING_PREERASE_TARGET) {
         uint8_t head[2];
         if (W25QXX_ReadData(end, head, sizeof(head)) != W25QXX_OK) break;
         if (head[0] != 0xFF || head[1] != 0xFF) break;   /* 遇到既有資料：停手，絕不擦除 */

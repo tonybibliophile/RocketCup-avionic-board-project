@@ -102,9 +102,6 @@ class AvionicMonitorGUI:
         # 兩個時間戳走 3 秒新鮮度窗口，語意與 gui_monitor.py 同一套。
         self._elevator_self_ts = 0.0
         self._elevator_peer_ts = 0.0
-        # ★2026-07-31：Flash 未擦除提醒（來源＝航電 1Hz 的 [FLASH_NOT_READY] 行）
-        self._flash_need_erase_ts = 0.0
-        self._flash_need_erase_detail = ""
         self.ts_vz_ekf = deque(maxlen=_N)
         self.ts_vz_vf = deque(maxlen=_N)
         self.ts_acc_bmi = deque(maxlen=_N)
@@ -148,9 +145,6 @@ class AvionicMonitorGUI:
         # 橫幅擠在最上方（pack(before=...)，見 gui_theme.update_elevator_banner），
         # 平時不 pack、偵測到電梯 profile 才出現並閃爍。
         self.elevator_banner = gt.make_elevator_banner(self.root)
-        # ★2026-07-31：Flash 未擦除橫幅。航電開機不再自動擦除，池未達標會擋 ARM——
-        # 本工具是直連 USB 的操作台，[FLASH_NOT_READY] 1Hz 行直接進得來。
-        self.flash_banner = gt.make_flash_banner(self.root)
 
         top_bar = tk.Frame(top_container, bg=gt.BG_ROOT)
         top_bar.pack(fill=tk.X, side=tk.TOP)
@@ -525,22 +519,6 @@ class AvionicMonitorGUI:
         gt.update_elevator_banner(self.root, self.elevator_banner,
                                   self_active or peer_active, "+".join(who))
 
-    # ---- ★2026-07-31：Flash 未擦除提醒 ----
-    def _handle_flash_not_ready_line(self, line):
-        """[FLASH_NOT_READY] 已擦池 320/1500 sectors —— ARM 已被擋下（航電 1Hz 輸出）。
-        航電開機不再自動擦除，這是操作員在按 ARM 之前唯一的提醒來源。"""
-        self._flash_need_erase_ts = time.time()
-        m = re.search(r"已擦池\s*(\d+)\s*/\s*(\d+)", line)
-        self._flash_need_erase_detail = (f"池 {m.group(1)}/{m.group(2)} sectors"
-                                         if m else "池未達標")
-        self._refresh_flash_banner()
-
-    def _refresh_flash_banner(self):
-        """5 秒新鮮度窗口（來源是 1Hz，容忍少量丟行）；擦完航電就不再送，橫幅自動消失。"""
-        active = (time.time() - self._flash_need_erase_ts) < 5.0
-        gt.update_flash_banner(self.root, self.flash_banner, active,
-                               self._flash_need_erase_detail if active else "")
-
     # ------------------------------------------------------------------
     def poll_queue(self):
         max_lines = 80
@@ -557,8 +535,6 @@ class AvionicMonitorGUI:
                 self._handle_elevator_warning_line(line)
             elif "[PAD_CFG]" in line and "Flight Profile:" in line:
                 self._handle_pad_cfg_profile_line(line)
-            elif "[FLASH_NOT_READY]" in line:
-                self._handle_flash_not_ready_line(line)
             tag = ("elevator_warn" if "[ELEVATOR_TEST_WARNING]" in line else
                    "ack" if "[ACK]" in line else
                    "rate" if "[RATE]" in line else
@@ -593,7 +569,16 @@ class AvionicMonitorGUI:
             pass
 
     # ------------------------------------------------------------------ 解析
+    # BENCH 副板延後量（韌體 DROGUE_LEAD_TIME_S，依 profile 1s/4s）自韌體行擷取，
+    # 供 _on_bench_test 的確認框顯示實際值而非寫死秒數。
+    _BENCH_LEAD_RE = re.compile(r"副板延後\s*(\d+(?:\.\d+)?)s|對應飛行提前\s*(\d+(?:\.\d+)?)s")
+
     def parse_line(self, line):
+        if "[PYRO-SELFTEST]" in line:
+            m_lead = self._BENCH_LEAD_RE.search(line)
+            if m_lead:
+                self.bench_lead_s = m_lead.group(1) or m_lead.group(2)
+
         # 角色偵測：優先 [ROLE_ID] role=xxx（主動查詢回應），退回 [BOOT] ROLE=xxx
         if self.role is None:
             m = re.search(r"\[ROLE_ID\]\s+role=(PRIMARY|BACKUP)", line) or re.search(r"ROLE=(PRIMARY|BACKUP)", line)
@@ -919,11 +904,15 @@ class AvionicMonitorGUI:
             self.append_console(f"[GUI] ❌ 尋回指令被拒：{line.strip()}\n", "err")
 
     def _on_bench_test(self):
+        # 副板延後量 = 韌體 DROGUE_LEAD_TIME_S，依 FLIGHT_PROFILE_ELEVATOR 為 1s(電梯場測)
+        # /4s(飛行)，GUI 不寫死；沿用上次自 [PYRO-SELFTEST] 行解析到的值（見 _feed_line）。
+        lead_txt = (f"{self.bench_lead_s}s" if getattr(self, "bench_lead_s", None)
+                    else "DROGUE_LEAD_TIME_S（依 profile 為 1s/4s，以韌體開場行為準）")
         ans = messagebox.askyesno(
             "手動桌面測試確認 (BENCH)",
             "確定要發送『桌面開傘測試 (BENCH)』指令嗎？\n\n"
             "⚠️ 注意（時序與飛行邏輯 1:1 對應）：\n"
-            "1. 引傘 PD13：主板 t=0 起通電 8s；副板延後 4s（模擬頂點提前量）後通電 3s，\n"
+            f"1. 引傘 PD13：主板 t=0 起通電 8s；副板延後 {lead_txt}（模擬頂點提前量）後通電 3s，\n"
             "   兩板通電窗會重疊（PD13 為 diode-OR 準位訊號，同時拉高無妨）。\n"
             "2. 主傘 PD14：★不啟動 PWM，兩板『同時』純 GPIO 拉高 1.5s（已取消互斥握手）。\n"
             "3. 全程耗時約 20 秒，測試完成後自動復位並回歸正常 FSM。\n"

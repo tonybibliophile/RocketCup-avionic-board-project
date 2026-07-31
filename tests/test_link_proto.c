@@ -3,7 +3,8 @@
  * ===========================================================================
  *   cd tests && make run
  *
- *   [1] LinkPacket_t 大小 = 46 bytes（含 echo-ACK ack_state + VF h/v 中繼 + erase_pct），欄位 offset 逐一鎖定
+ *   [1] LinkPacket_t 大小 = 53 bytes（含 echo-ACK ack_state + VF h/v 中繼 + erase_pct + erase_req），
+ *       欄位 offset 逐一鎖定。★改動大小＝主/副兩板必須同時重燒（不影響地面下鏈 TelemetryPacket_t）。
  *   [2] LinkProto_Build → LinkRx_Feed 往返一致（含 sync 對齊與 CRC）
  *   [3] 單一位元翻轉 → CRC 不符 → 不吐封包
  *   [4] 前綴雜訊 / 連續兩筆 → 正確對齊並解出
@@ -40,18 +41,20 @@ static LinkStatus_t sample_status(void) {
     st.main_arb    = 2;            /* SERVO_ARB_MSG_DRIVING */
     st.flash_ready = 1;
     st.erase_pct   = 75;
+    st.erase_req   = 7;
     st.vf_h_cm     = 24950;        /* 249.50 m */
     st.vf_v_cms    = -1480;        /* -14.80 m/s */
     st.bmi_mag_cg  = 1015;         /* 10.15 g */
     st.adxl_mag_cg = 1032;         /* 10.32 g */
     st.profile_flags = TELEM_PROFILE_SELF_ELEVATOR;
+    st.cmd_flags   = LINK_CMD_DEPLOY_DROGUE | LINK_CMD_DEPLOY_MAIN;
     return st;
 }
 
 static void test_layout(void) {
     printf("[1] 封包大小與欄位 offset（解碼契約）\n");
-    check("sizeof(LinkPacket_t) == 51", sizeof(LinkPacket_t) == 51);
-    check("LINK_PACKET_SIZE == 51",     LINK_PACKET_SIZE == 51);
+    check("sizeof(LinkPacket_t) == 53", sizeof(LinkPacket_t) == 53);
+    check("LINK_PACKET_SIZE == 53",     LINK_PACKET_SIZE == 53);
 #define OFF(field, expect) \
     check("offsetof " #field " == " #expect, offsetof(LinkPacket_t, field) == (expect))
     OFF(sync0,       0);
@@ -78,7 +81,9 @@ static void test_layout(void) {
     OFF(bmi_mag_cg,  44);
     OFF(adxl_mag_cg, 46);
     OFF(profile_flags, 48);
-    OFF(crc16,       49);
+    OFF(cmd_flags,   49);
+    OFF(erase_req,   50);
+    OFF(crc16,       51);
 #undef OFF
 }
 
@@ -87,7 +92,7 @@ static void test_roundtrip(void) {
     LinkStatus_t st = sample_status();
     uint8_t buf[LINK_PACKET_SIZE];
     uint16_t n = LinkProto_Build(buf, &st);
-    check("Build 回傳長度 == 51", n == LINK_PACKET_SIZE);
+    check("Build 回傳長度 == 53", n == LINK_PACKET_SIZE);
     check("buf[0],buf[1] == sync", buf[0] == LINK_SYNC0 && buf[1] == LINK_SYNC1);
 
     LinkRx_t rx; LinkRx_Init(&rx);
@@ -114,11 +119,13 @@ static void test_roundtrip(void) {
     check("main_arb 一致",    out.main_arb    == st.main_arb);
     check("flash_ready 一致", out.flash_ready == st.flash_ready);
     check("erase_pct 一致",   out.erase_pct   == st.erase_pct);
+    check("erase_req 一致",   out.erase_req   == st.erase_req);
     check("vf_h_cm 一致",     out.vf_h_cm     == st.vf_h_cm);
     check("vf_v_cms 一致",    out.vf_v_cms    == st.vf_v_cms);
     check("bmi_mag_cg 一致",  out.bmi_mag_cg  == st.bmi_mag_cg);
     check("adxl_mag_cg 一致", out.adxl_mag_cg == st.adxl_mag_cg);
     check("profile_flags 一致", out.profile_flags == st.profile_flags);
+    check("cmd_flags 一致",   out.cmd_flags   == st.cmd_flags);
 }
 
 static void test_bad_crc(void) {

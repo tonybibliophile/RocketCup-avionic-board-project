@@ -35,6 +35,8 @@ uint16_t LinkProto_Build(uint8_t *out, const LinkStatus_t *st)
     pkt.bmi_mag_cg  = st->bmi_mag_cg;
     pkt.adxl_mag_cg = st->adxl_mag_cg;
     pkt.profile_flags = st->profile_flags;
+    pkt.cmd_flags   = st->cmd_flags;
+    pkt.erase_req   = st->erase_req;
 
     /* CRC 覆蓋除最後 2 bytes(crc16 本身) 外的全部內容 */
     pkt.crc16 = crc16_ccitt_false((const uint8_t *)&pkt, (uint16_t)(sizeof(pkt) - 2));

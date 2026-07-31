@@ -29,10 +29,16 @@ typedef struct {
     uint32_t last_rx_ms;     /* 本機收到該封包時的 tick（freshness 基準） */
     uint8_t  drogue_latched; /* 對端曾通報 DROGUE_FIRED（鎖存，不清除） */
     uint8_t  main_latched;   /* 對端曾通報 MAIN_DEPLOYED（鎖存，不清除） */
+    /* ★手動開傘「命令」中繼（LINK_CMD_DEPLOY_*，鎖存不清除）：對端收到地面站/USB 手動
+     * 開傘命令時會廣播，本板據此一起開傘。與上面兩個 *_latched 語意不同——那兩個是
+     * 「對端已經開了」（含 FSM 自動開傘），這兩個專指「人下的命令」，故可無條件跟隨。 */
+    uint8_t  cmd_drogue_latched; /* 對端曾廣播 LINK_CMD_DEPLOY_DROGUE */
+    uint8_t  cmd_main_latched;   /* 對端曾廣播 LINK_CMD_DEPLOY_MAIN */
     uint8_t  peer_ack_state; /* 對端封包 ack_state：對端回送「它所認知的『我方』狀態」 */
     uint8_t  peer_main_arb;  /* 對端主傘共開 / BENCH 狀態（SERVO_ARB_MSG_*，servo_arb.h） */
     uint8_t  peer_flash_ready; /* 對端 Flash 預擦池是否已達目標 (1=已就緒) */
     uint8_t  peer_erase_pct;   /* 對端 Flash 預擦進度 0..100% */
+    uint8_t  peer_erase_req;   /* 對端 `flash erase` 請求計數（遞增；副板據此跟擦，見 link_proto.h） */
     int32_t  h_est_cm;       /* 對端最近回報的 EKF 高度 (cm)（供下鏈中繼/監看） */
     int32_t  v_est_cms;      /* 對端最近回報的 EKF 垂直速度 (cm/s) */
     int32_t  baro_alt_cm;    /* 對端最近回報的 baro 相對高度 (cm) */
@@ -54,6 +60,11 @@ void    LinkPeer_Init(LinkPeer_t *p);
 void    LinkPeer_OnPacket(LinkPeer_t *p, const LinkPacket_t *pkt, uint32_t now_ms);
 /* 對端是否仍在線（valid 且距上次收包 < timeout_ms） */
 uint8_t LinkPeer_Fresh(const LinkPeer_t *p, uint32_t now_ms, uint32_t timeout_ms);
+
+/* 清除四個開傘相關鎖存（drogue/main_latched + cmd_drogue/cmd_main_latched），其餘對端
+ * 狀態與 QoS 統計保留。DISARM 專用：鎖存的語意是「本次飛行內不清除」，DISARM 即宣告
+ * 上一次飛行/桌面測試結束，不清會讓下一次 ARM 一武裝就被舊命令立刻開傘。 */
+void    LinkPeer_ClearDeployLatches(LinkPeer_t *p);
 
 /* 對端是否已「回音確認」我方目前狀態（peer_ack_state == my_state）。
  * 用於失同步偵測：我方狀態改變後，對端在 LINK_SYNC_TIMEOUT_MS 內未回同一狀態 → DESYNC。

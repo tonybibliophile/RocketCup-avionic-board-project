@@ -32,6 +32,7 @@ void LinkPeer_OnPacket(LinkPeer_t *p, const LinkPacket_t *pkt, uint32_t now_ms)
     p->peer_main_arb   = pkt->main_arb;
     p->peer_flash_ready = pkt->flash_ready;
     p->peer_erase_pct   = pkt->erase_pct;
+    p->peer_erase_req   = pkt->erase_req;
     p->peer_tick_ms    = pkt->tick_ms;
     p->last_rx_ms     = now_ms;
     p->h_est_cm       = pkt->h_est_cm;
@@ -51,6 +52,18 @@ void LinkPeer_OnPacket(LinkPeer_t *p, const LinkPacket_t *pkt, uint32_t now_ms)
     /* 開傘旗標一旦收到即鎖存（供加法協同判斷對端是否已開傘；不清除） */
     if (pkt->flags & TELEM_FLAG_DROGUE_FIRED)  p->drogue_latched = 1U;
     if (pkt->flags & TELEM_FLAG_MAIN_DEPLOYED) p->main_latched   = 1U;
+
+    /* 手動開傘命令中繼同樣鎖存：對端只要廣播過一次，之後丟包/失聯都不會漏掉命令。 */
+    if (pkt->cmd_flags & LINK_CMD_DEPLOY_DROGUE) p->cmd_drogue_latched = 1U;
+    if (pkt->cmd_flags & LINK_CMD_DEPLOY_MAIN)   p->cmd_main_latched   = 1U;
+}
+
+void LinkPeer_ClearDeployLatches(LinkPeer_t *p)
+{
+    p->drogue_latched     = 0U;
+    p->main_latched       = 0U;
+    p->cmd_drogue_latched = 0U;
+    p->cmd_main_latched   = 0U;
 }
 
 uint8_t LinkPeer_Fresh(const LinkPeer_t *p, uint32_t now_ms, uint32_t timeout_ms)

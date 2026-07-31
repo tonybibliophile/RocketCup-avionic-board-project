@@ -9,8 +9,9 @@
  *   全程：SYS LED (PE2) 1Hz 持續閃爍 = 韌體存活。
  *   1. PD13 (FIRE / 引傘 DC 馬達) —— 對應飛行「主板提前 DROGUE_LEAD_TIME_S 開、副板真頂點才開」：
  *      1a 主板 t=0 拉高 FSM_DROGUE_MOTOR_RUN_PRIMARY_MS(8s)（State1 LED / PE3 亮）；
- *      1b 副板見主板通電後等 DROGUE_LEAD_TIME_S(4s)（模擬提前量），期間雙板時序錯開；
- *      1c 副板 t=4s 起拉高 FSM_DROGUE_MOTOR_RUN_BACKUP_MS(3s)，與主板窗重疊——PD13 為
+ *      1b 副板見主板通電後等 DROGUE_LEAD_TIME_S（模擬提前量；★依 FLIGHT_PROFILE_ELEVATOR
+ *         分流：電梯場測 1s / 飛行 4s，見 fsm.h），期間雙板時序錯開；
+ *      1c 副板 t=lead 起拉高 FSM_DROGUE_MOTOR_RUN_BACKUP_MS(3s)，與主板窗重疊——PD13 為
  *         diode-OR 準位訊號，兩板同時拉高無害，飛行時本來就會重疊。
  *   2. 等待 PYRO_SELFTEST_GAP_MS。
  *   3. PD14 主傘 —— 對應飛行「不啟 PWM、純 GPIO 拉高 1.5s、兩板同時共開」：
@@ -53,7 +54,8 @@
 
 /* === 可調參數 ===
  * ★步驟 1/3 的時間一律直接沿用飛行常數，桌面測試與飛行 1:1 對應、不另立一套數字：
- *   步驟 1 PD13：FSM_DROGUE_MOTOR_RUN_PRIMARY_MS(8s) / _BACKUP_MS(3s) + DROGUE_LEAD_TIME_S(4s) 錯開。
+ *   步驟 1 PD13：FSM_DROGUE_MOTOR_RUN_PRIMARY_MS(8s) / _BACKUP_MS(3s) + DROGUE_LEAD_TIME_S
+ *               （1s 電梯 / 4s 飛行，隨 profile）錯開。
  *   步驟 3 PD14：SERVO_MAIN_HIGH_MS(1.5s)，雙板同時。
  * 下方 PYRO_SELFTEST_FIRE_MS / PYRO_SELFTEST_SERVO_HIGH_MS 已不再被 pyro_selftest.c 使用（保留相容）。 */
 #ifndef PYRO_SELFTEST_FIRE_MS
@@ -92,6 +94,13 @@
 #endif
 #ifndef PYRO_BUZZER_BEEP_MS
 #define PYRO_BUZZER_BEEP_MS  120U
+#endif
+
+#if FEATURE_LINK
+/* bench 序列目前的階段（SERVO_ARB_MSG_*；NONE = 未在跑 bench）。
+ * 由 pyro_selftest.c 於序列各階段更新，main.c 的 Link_BuildOwnStatus 讀取後填進
+ * LinkStatus.main_arb —— bench 與飛控迴圈兩路廣播因此送出同一個值。 */
+extern volatile uint8_t g_bench_arb;
 #endif
 
 /*

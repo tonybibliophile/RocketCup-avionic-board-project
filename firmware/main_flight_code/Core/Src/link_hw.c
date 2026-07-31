@@ -76,6 +76,14 @@ uint8_t Link_PeerFresh(uint32_t now_ms)
     return LinkPeer_Fresh(&s_peer, now_ms, LINK_PEER_TIMEOUT_MS);
 }
 
+void Link_ClearPeerDeployLatches(void)
+{
+    /* s_peer 由 ISR 更新：四個 uint8_t 鎖存位的清除是各自獨立的單位元組寫入，
+     * 與 ISR 的置位競爭最壞情況只是「清完立刻又被對端下一筆置回」——那正是我們要的
+     * 語意（對端還在喊命令就不該清掉），故不需關中斷。 */
+    LinkPeer_ClearDeployLatches(&s_peer);
+}
+
 /* 失同步/失聯偵測（純觀測）：追蹤我方狀態變更時刻，若對端未於 LINK_SYNC_TIMEOUT_MS
  * 內 echo-ACK 回同一狀態 → DESYNC；對端逾時無封包 → LOST。 */
 static uint8_t  s_link_status         = 0U;

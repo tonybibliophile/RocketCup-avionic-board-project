@@ -7,6 +7,11 @@
  * TELEM_FLAG_* 位元值（單一真相來源），備板據 DROGUE_FIRED / MAIN_DEPLOYED 判
  * 主板是否已開傘。
  *
+ * ★★ LinkPacket_t 是**固定長度** framing：欄位增減 = 主/備兩板必須同時重燒。只燒一片
+ *    會 100% CRC 全壞（[LINK] 顯示 LOST），詳見下行遙測同款事故的教訓。
+ *    2026-08-01：新增 cmd_flags（51 → 52 bytes）。地面站解析的是 TelemetryPacket_t，
+ *    不受本次改動影響，不需重燒地面站。
+ *
  * 本檔與 link_proto.c 不依賴 HAL / RTOS，僅 <stdint.h>（+ crc16.h / telemetry.h
  * 皆 header-only 純邏輯），可由 tests/test_link_proto.c 在 host 上驗證。
  * 位元組順序假設 little-endian（STM32 與 x86 host 皆是，與 telemetry 同策略）。
@@ -28,6 +33,19 @@ extern "C" {
 /* board_id 欄位值 */
 #define LINK_BOARD_PRIMARY  0U
 #define LINK_BOARD_BACKUP   1U
+
+/* cmd_flags：★「地面站遙控手動開傘」中繼位（與 flags 的 TELEM_FLAG_* 語意不同）。
+ * flags 的 DROGUE_FIRED/MAIN_DEPLOYED 是「本板已經開了」的事實回報；cmd_flags 是
+ * 「本板收到地面站/USB 的手動開傘命令」這個**命令本身**，用途是把命令原樣帶給對端，
+ * 讓只有主航電接得到 433 上行（FEATURE_UPLINK_DEPLOY 僅 IS_PRIMARY）的情況下，
+ * 副航電也一起開。
+ *   - 一旦收到即鎖存並持續廣播（20Hz）：單筆丟包不會漏掉命令。
+ *   - 兩板皆會把已知曉的命令回廣播（等冪），任一板中途重開機也能被對端重新帶起來。
+ *   - 刻意不重用 flags：FSM 自動開傘同樣會點亮 DROGUE_FIRED，若拿它當命令用，
+ *     主航電提前 4s 的動態預測開傘就會把副航電一起牽走——那正是 fsm.c 的
+ *     peer_drogue_cmd 只允許 IS_PRIMARY 接受所要避免的事。 */
+#define LINK_CMD_DEPLOY_DROGUE  0x01U  /* 手動開副傘命令（地面站 ARM→DEPLOY 已驗證） */
+#define LINK_CMD_DEPLOY_MAIN    0x02U  /* 手動開主傘命令 */
 
 /* 板間狀態封包（packed，固定長度）。欄位順序即解碼契約。 */
 typedef struct __attribute__((packed)) {
@@ -55,6 +73,14 @@ typedef struct __attribute__((packed)) {
     int16_t  bmi_mag_cg;   /* BMI088 加速度模長 |a| (cg = 0.01g)：供對端中繼下鏈，與本板原始加速度對照 */
     int16_t  adxl_mag_cg;  /* ADXL375 加速度模長 |a| (cg = 0.01g) */
     uint8_t  profile_flags; /* TELEM_PROFILE_SELF_ELEVATOR：本板是否仍以電梯測試 profile 編譯（供對端/地面站中繼） */
+    uint8_t  cmd_flags;    /* LINK_CMD_DEPLOY_*：本板已知曉的「手動開傘命令」（鎖存，帶動對端一起開） */
+    /* ★2026-08-01：`flash erase` 中繼——主航電收到擦除命令時遞增本計數器，副航電看到值變了
+     * 就跟著擦一次。刻意用「遞增計數器」而非 cmd_flags 那種鎖存位：
+     *   - 鎖存位會被 20Hz 一直廣播 ⇒ 副板會反覆擦除，且每次重開機都再擦一遍。開傘鎖存
+     *     沒這個問題（重複點火無害），但重複擦除＝耗損 + 抹掉副板剛錄的黑盒子。
+     *   - 計數器天生等冪：副板只在「值與上次記下的不同」時動作，丟包不影響（下一筆
+     *     封包仍帶新值），且副板開機第一筆封包只是靜默採納、不會誤觸發。 */
+    uint8_t  erase_req;    /* 主航電 `flash erase` 請求計數（遞增；副板據此跟擦） */
     uint16_t crc16;        /* CRC-16/CCITT-FALSE，覆蓋本封包前面所有位元組 */
 } LinkPacket_t;
 
@@ -84,6 +110,8 @@ typedef struct {
     int16_t  bmi_mag_cg;   /* BMI088 加速度模長 |a| (cg = 0.01g) */
     int16_t  adxl_mag_cg;  /* ADXL375 加速度模長 |a| (cg = 0.01g) */
     uint8_t  profile_flags; /* 呼叫端填 TELEM_PROFILE_SELF_ELEVATOR（本板 FLIGHT_PROFILE_ELEVATOR 編譯期值） */
+    uint8_t  cmd_flags;    /* 呼叫端填 LINK_CMD_DEPLOY_*（本板已知曉的手動開傘命令，鎖存） */
+    uint8_t  erase_req;    /* 呼叫端填本板 `flash erase` 請求計數（遞增；見 LinkPacket_t 說明） */
 } LinkStatus_t;
 
 /**

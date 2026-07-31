@@ -67,10 +67,19 @@
 #define FEATURE_LORA   (IS_PRIMARY || IS_GROUND)  /* LoRa 硬體 init：E22 433(UART3) + E80 920(SPI3) */
 #define FEATURE_LORA_TX IS_PRIMARY                /* 下行遙測「發送」：僅主航電 */
 #define FEATURE_LORA_RX IS_GROUND                 /* 下行遙測「接收」：僅地面站 */
-#define FEATURE_FLASH   1                         /* 電梯場測：開啟記錄，無法全程接筆電監看時事後回放用 */
+#define FEATURE_FLASH   1                         /* Flash 記錄：飛行/場測皆開，無法全程接筆電監看時事後回放用 */
 #ifndef FEATURE_FLASH_BOOT_FULL_ERASE
-#define FEATURE_FLASH_BOOT_FULL_ERASE 0           /* 開機整環全擦(~3min)：0=關閉方便 bench 反覆重開機測試；
-                                                     * ★正式飛行前務必改回 1（見 main.c 開機序列說明） */
+#define FEATURE_FLASH_BOOT_FULL_ERASE 0           /* 開機整環全擦(~3min) + 填池：★0 才是正式飛行設定。
+                                                     * ⚠ 本行舊註解曾寫「正式飛行前務必改回 1」——那是
+                                                     * 2026-07-31「開機一律不擦除」決策之前的說法，已作廢
+                                                     * （見 main.c 開機序列該區塊）。設 1 的實際後果是
+                                                     * 「飛完落地重開機就把黑盒子擦光」，BT1 dump 排在擦除
+                                                     * 之後、救不回來——正式飛行反而更不該設 1。
+                                                     * 現行飛前流程：開機零擦除只認領既有已擦池 → 池不足時
+                                                     * 1Hz 橫幅 + 下鏈 TELEM_ARM_NEED_ERASE + ARM 被
+                                                     * flash_pool_ready 閘擋下 → 人工下 `flash erase`
+                                                     * （整環，飛前正規）或 `flash pool`（快速填池，bench 用）。
+                                                     * 設 1 僅作為那條路徑壞掉時的緊急退路。 */
 #endif
 #ifndef FEATURE_HOTSTART
 #define FEATURE_HOTSTART 1                        /* 空中熱啟動恢復（飛行中重啟直接回原狀態、略過開機預擦） */
@@ -96,7 +105,16 @@
  *   0 = 飛行 profile（預設，真實彈道門檻 + 估計器路徑正常參與）
  *   1 = 電梯測試 profile（門檻縮放） */
 #ifndef FLIGHT_PROFILE_ELEVATOR
-#define FLIGHT_PROFILE_ELEVATOR 1
+#define FLIGHT_PROFILE_ELEVATOR 0   /* ★2026-07-31：切回飛行 profile（正式）。
+                                     * 影響（fsm.h Profile 隔離區塊，全部一起換過去）：
+                                     *   起飛 baro 門檻 5m→20m、燒完 2.0g→0.5g、
+                                     *   頂點回落 2m→10m/40→20 週期、
+                                     *   失效保護 120s→28.221s（副 32.221s）、
+                                     *   主傘看門狗 300s→248s、降級主傘 8m→350m、
+                                     *   落地 5m→30m、主傘目標 10m→300m、
+                                     *   引傘提前量 1s→4s、頂點動態預測路徑 關→開。
+                                     * 場測請改回 1，勿在飛行 binary 上留 1（下鏈 profile_flags
+                                     * 會亮 TELEM_PROFILE_*，三支 GUI 會閃警示橫幅）。 */
 #endif
 
 /* FEATURE_FORCE_BARO_ONLY：改為固定 0，不再由 FLIGHT_PROFILE_ELEVATOR 推導。
@@ -162,7 +180,11 @@
 
 /* 上行手動開傘：地面站經 433 反向打命令，火箭在下行之外空出 1/10 時槽接收。
  * 僅主航電（有 E22 TX/RX + 飛控點火輸出）；地面站送命令端走 IS_GROUND 的 gs_lora_test。
- * 安全：兩段式 ARM→DEPLOY + ARM 逾時自動解除（見 uplink_cmd.c / uplink_proto.h）。 */
+ * 安全：兩段式 ARM→DEPLOY（見 uplink_cmd.c / uplink_proto.h）。
+ * ⚠ 2026-07-31 複查更正：本註解原本還寫「ARM 逾時自動解除」——**實際上沒有實作**。
+ *   uplink_cmd.c 的 s_arm_tick 只被寫入、從未被讀取，s_armed 一旦為 1 就維持到
+ *   收到 DISARM 或重開機為止。若要逾時自動解除，得在 UplinkCmd_Poll 補判斷；在那之前
+ *   請把「ARM 後未發射就一直是武裝狀態」當成現況操作（發射取消務必手動 disarm）。 */
 #if LORA433_TX_ONLY
 #define FEATURE_UPLINK_DEPLOY  0
 #else
@@ -188,10 +210,14 @@
  *   真正貴的是 printf 自身的格式化（%f → _dtoa_r，每個 double 數千 cycles，
  *   12 行/秒 ≈ 0.14% CPU）——而這筆成本改走 ITM 也一樣付，關本旗標省不掉。
  *
- * ★該關的真正理由是「指令通道」：本旗標＝1 時 StartDiagnosticTask 會持續受理 USB CDC
- *   文字命令，含 disarm、手動開傘，且不分飛行狀態（見 main.c Parse_Serial_Command）。
- *   這是實體風險，不是效能風險。正解是在那幾個危險指令上補 STATE_PAD/INIT 閘
- *   （比照 bench 點火已有的做法）；補上之後本旗標忘了改回 0 也不再致命。 */
+ * ★曾經該關的理由是「指令通道」：本旗標＝1 時 StartDiagnosticTask 會持續受理 USB CDC
+ *   文字命令，含 disarm、手動開傘。當時那幾個指令沒有飛行態閘，是實體風險（非效能風險），
+ *   正解是補閘而非關旗標。★2026-07-31 複查：閘已經補齊，故正式飛行保持 1 不再致命 ——
+ *     bench    → 僅 STATE_PAD_ARMED（Parse_Serial_Command 的 "bench"）
+ *     recalib  → 須 ARM ＋ 僅 STATE_PAD/INIT/PAD_ARMED
+ *     deploy   → 須 ARM，或已在飛行中（飛行中手動開傘是刻意保留的救援路徑）
+ *     disarm   → 僅 STATE_PAD_ARMED / STATE_INIT
+ *   飛行時 USB 線是拔的，沒有 host 就沒有 token 封包，通道實際上也不存在。 */
 /* ★7/26：曾一度懷疑 MX_USB_DEVICE_Init()（本旗標=1 時掛進主航電開機序列）是
  * 「開機完全無反應」的元兇而暫時關過（見 git log）。後以 ST-Link mode=HOTPLUG
  * 不重置直接 attach 讀 PC，抓到真正根因是 BOOT0 腳位被拉到 System Memory
