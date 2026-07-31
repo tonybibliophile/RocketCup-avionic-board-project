@@ -85,6 +85,10 @@ PEER_LINK_EVER, PEER_LINK_FRESH, PEER_LINK_LOST, PEER_LINK_DESYNC = 0x01, 0x02, 
 
 # arm_flags 位（ARM 被擋下的原因，與 telemetry.h TELEM_ARM_* 對應）
 TELEM_ARM_BLOCKED_FLASH_POOL = 0x01
+# ★2026-07-31：航電開機不再自動擦除 flash，池未達標時 ARM 會被擋。此位在「使用者按 ARM
+# 之前」就先亮，讓地面站能提早提醒下 `flash erase`（整環，飛前正規流程）或 `flash pool`
+# （只補不足部分）。bit0 = 已按 ARM 但被擋；bit1 = 還沒按就先警告。
+TELEM_ARM_NEED_ERASE = 0x02
 
 # drogue_alt_m / main_alt_m 的「尚未開傘」哨兵（與 telemetry.h TELEM_DEPLOY_ALT_NA 一致）。
 # 刻意不用 0：0 m 是合法開傘高度（地面誤觸發），用 0 當「沒開」會把該警示的事件藏起來。
@@ -166,8 +170,11 @@ def fmt_human(p: dict) -> str:
     if p["health_bits"] or p["sensor_bits"]:
         health = f" !ekf=0x{p['health_bits']:02X} !sens=0x{p['sensor_bits']:02X}"
     arm_block = ""
-    if p.get("arm_flags", 0) & TELEM_ARM_BLOCKED_FLASH_POOL:
+    _af = p.get("arm_flags", 0)
+    if _af & TELEM_ARM_BLOCKED_FLASH_POOL:
         arm_block = " [ARM BLOCKED: flash pool not ready]"
+    elif _af & TELEM_ARM_NEED_ERASE:
+        arm_block = " [FLASH NOT ERASED: run `flash erase` before ARM]"
     vf = f"vf=({p.get('vf_pos_z_cm', 0)/100.0:.2f}m,{p.get('vf_vel_z_cms', 0)/100.0:+.2f}m/s)"
     # 滾動極值：火箭端全速率追蹤，下鏈 ~2Hz 抓不到真峰值，這三個才是可信數字
     mx = (f"MAX=({p.get('max_alt_m', 0)}m,{p.get('max_vel_ms', 0):+d}m/s,"
