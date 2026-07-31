@@ -80,7 +80,8 @@ from tkinter.scrolledtext import ScrolledText
 # 同理——是否顯示/怎麼措辭三支 GUI 必須一致，複製兩份遲早會走鐘，不重新發明。
 # 放在依賴自動安裝之後 —— gui_theme 會 import numpy/tkinter。
 from gui_theme import (PadRefTracker, make_elevator_banner, update_elevator_banner,
-                        spam_elevator_console_warning, ELEVATOR_WARN_TAG_CFG)
+                        spam_elevator_console_warning, ELEVATOR_WARN_TAG_CFG,
+                        make_flash_banner, update_flash_banner)
 
 # Add parent directory to sys.path to load serial_link
 import sys
@@ -458,6 +459,14 @@ class RocketDashboardApp:
         # 但用時間戳統一收斂邏輯最單純）。0.0 = 從未看過 / 已被權威來源明確清除。
         self._elevator_self_ts = 0.0
         self._elevator_peer_ts = 0.0
+
+        # ★2026-07-31：Flash 未擦除橫幅。航電開機不再自動擦除（改為使用者下 `flash erase`／
+        # `flash pool`），池未達標時 ARM 會被擋——但在按下 ARM 之前完全沒有徵兆，所以這裡
+        # 也用「最近看到」的新鮮度窗口顯示橫幅。兩個來源：直連航電的 [FLASH_NOT_READY] 行，
+        # 以及經地面站板中繼的 [GS_PKT] armf: 位元。0.0 = 從未看過 / 已確認擦好。
+        self.flash_banner = make_flash_banner(self.root)
+        self._flash_need_erase_ts = 0.0
+        self._flash_need_erase_detail = ""
 
         # ---- 頂部狀態列：兩排設計，避免右側標籤被截斷 ----
         top_container = tk.Frame(self.root, bg="#151515")
@@ -1733,6 +1742,35 @@ class RocketDashboardApp:
         if peer_active: who.append("對端(副板)")
         update_elevator_banner(self.root, self.elevator_banner, active, "+".join(who))
 
+    # ---- ★2026-07-31：Flash 未擦除提醒（開機不再自動擦除，見 main.c 開機序列） ----
+    def _handle_flash_not_ready_line(self, line):
+        """[FLASH_NOT_READY] 已擦池 320/1500 sectors —— ARM 已被擋下（航電 1Hz 直連輸出）"""
+        self._flash_need_erase_ts = time.time()
+        m = re.search(r"已擦池\s*(\d+)\s*/\s*(\d+)", line)
+        self._flash_need_erase_detail = (f"池 {m.group(1)}/{m.group(2)} sectors"
+                                         if m else "池未達標")
+        self._refresh_flash_banner()
+
+    def _handle_gs_pkt_arm_flags(self, arm_flags):
+        """[GS_PKT] armf:0x%02X（經地面站板 LoRa 中繼）。bit1 = TELEM_ARM_NEED_ERASE。
+        與直連來源共用同一個時間戳：同一 process 同時只會接一種來源，用時間戳統一收斂。"""
+        if arm_flags & 0x02:
+            self._flash_need_erase_ts = time.time()
+            if not self._flash_need_erase_detail:
+                self._flash_need_erase_detail = "航電回報：尚未擦除"
+        else:
+            # 權威來源明確說「不需要擦」→ 立刻清除，不等新鮮度窗口過期
+            self._flash_need_erase_ts = 0.0
+            self._flash_need_erase_detail = ""
+        self._refresh_flash_banner()
+
+    def _refresh_flash_banner(self):
+        """新鮮度窗口取 5 秒：航電端橫幅是 1Hz、下鏈 [GS_PKT] 約 2Hz，5 秒足以容忍
+        少量丟包又不會在擦完之後還留著過期警示。"""
+        active = (time.time() - self._flash_need_erase_ts) < 5.0
+        update_flash_banner(self.root, self.flash_banner, active,
+                            self._flash_need_erase_detail if active else "")
+
     # ------------------ 主執行緒：定時處理佇列 ------------------
     def poll_queue(self):
         # 批次處理佇列中的資料，避免界面阻塞
@@ -1769,6 +1807,9 @@ class RocketDashboardApp:
             elif "[ELEVATOR_TEST_WARNING]" in line:
                 tag = "elevator_warn"
                 self._handle_elevator_warning_line(line)
+            elif "[FLASH_NOT_READY]" in line:
+                tag = "err"
+                self._handle_flash_not_ready_line(line)
             elif "[MAG]" in line:
                 tag = "mag"
             elif "[GPS]" in line or "[GS_GPS]" in line:
@@ -2432,6 +2473,12 @@ class RocketDashboardApp:
             m_prof = re.search(r"prof:0x([0-9A-Fa-f]+)", line)
             if m_prof:
                 self._handle_gs_pkt_profile(m_prof.group(1))
+
+            # ★2026-07-31：Flash 未擦除提醒（bit1 = TELEM_ARM_NEED_ERASE）。舊版地面站韌體
+            # 的 [GS_PKT] 沒有 armf 欄位，match 不到就完全不動橫幅（維持既有行為）。
+            m_armf = re.search(r"armf:0x([0-9A-Fa-f]+)", line)
+            if m_armf:
+                self._handle_gs_pkt_arm_flags(int(m_armf.group(1), 16))
 
             m = re.search(r"alt:(-?\d+)cm", line)
             if m:
@@ -4537,10 +4584,31 @@ class RocketDashboardApp:
         tk.Label(erase_all_frame, text="連同校準/mag/LoRa/總結整顆清空，之後須重新校正 (需二次確認)",
                  bg="#1c1c1c", fg="#ff5555", font=("Helvetica", 9)).pack(side=tk.LEFT)
 
+        # B3. ★2026-07-31：快速填池（航電開機不再自動擦除，池未達標會擋 ARM）
+        pool_frame = tk.Frame(op_box, bg="#1c1c1c")
+        pool_frame.pack(fill=tk.X, pady=(0, 8))
+        btn_pool = StyledButton(pool_frame, text="⚡ 快速填池", command=self.topup_flash_pool,
+                                bg="#005a5a", hover_bg="#008080", fg="#ffffff",
+                                font=("Helvetica", 10, "bold"), padx=14, pady=7)
+        btn_pool.pack(side=tk.LEFT, padx=(0, 10))
+        tk.Label(pool_frame, text="只把已擦池補到 ARM 門檻，不動整環 (bench 省時用；飛前仍應走「清空飛行紀錄」)",
+                 bg="#1c1c1c", fg="#00cccc", font=("Helvetica", 9)).pack(side=tk.LEFT)
+
         # C. 狀態提示標籤
         self.lbl_flash_export_status = tk.Label(op_box, text="就緒。請選擇欲執行的操作。", bg="#1c1c1c", fg="#888888",
                                                font=("Monaco", 9, "bold"))
         self.lbl_flash_export_status.pack(anchor="w", pady=(10, 0))
+
+    def topup_flash_pool(self):
+        """★2026-07-31：快速填池（`flash pool`）。航電開機不再自動擦除，池未達
+        FLASH_RING_PREERASE_TARGET 時 ARM 會被擋；本指令只補不足的部分、不動整環。
+        不需二次確認：它只擦「本來就沒資料」的區域，不會毀掉既有飛行紀錄。"""
+        if not self.running or not getattr(self, 'ser', None):
+            messagebox.showwarning("警告", "串口未連接！無法發送填池命令。", parent=getattr(self, 'flash_win', None))
+            return
+        if self.send_command("flash pool"):
+            if hasattr(self, 'lbl_flash_export_status') and self.lbl_flash_export_status.winfo_exists():
+                self.lbl_flash_export_status.config(text="⏳ 正在填池中（只補不足部分）...", fg="#00cccc")
 
     def erase_flash_ring(self):
         """只清 Ring Buffer 飛行紀錄，保留 Sector 0 校準/mag/LoRa 參數與任務總結。"""

@@ -385,7 +385,7 @@ static void gs_handle_packet(uint8_t link, const TelemetryPacket_t *pkt,
                "vfh:%dcm vfv:%dcms max:%um mvel:%dms macc:%ucg dalt:%dm malt:%dm "
                "gps:%u/%u pos:%c%lu.%06lu,%c%lu.%06lu galt:%dm accel:%d,%d,%d hg:%dcg "
                "peer:%u pflags:0x%02X plink:0x%02X "
-               "pbaro:%dcm pvfh:%dcm pvfv:%dcms pbarb:%u prof:0x%02X\r\n",
+               "pbaro:%dcm pvfh:%dcm pvfv:%dcms pbarb:%u prof:0x%02X armf:0x%02X\r\n",
                (unsigned)((link == GS_LINK_920) ? 920U : 433U),
                (int)rssi, (int)snr, (unsigned)pkt->seq, (unsigned)pkt->fsm_state,
                (int)pkt->ekf_pos_z_cm, (int)pkt->ekf_vel_z_cms, (int)pkt->baro_alt_cm,
@@ -403,7 +403,12 @@ static void gs_handle_packet(uint8_t link, const TelemetryPacket_t *pkt,
                (unsigned)pkt->peer_link,
                (int)pkt->peer_baro_cm,
                (int)pkt->peer_vf_h_cm, (int)pkt->peer_vf_v_cms,
-               (unsigned)pkt->peer_bench_arb, (unsigned)pkt->profile_flags);
+               /* ★2026-07-31 新增 armf：航電開機不再自動擦 flash，池未達標時 ARM 會被擋。
+                * 這一位（TELEM_ARM_NEED_ERASE）讓地面站 GUI 在使用者按 ARM「之前」就能跳
+                * 橫幅提醒先擦除。純字串尾端新增欄位，舊解析器不受影響（封包格式未動，
+                * 不需三板同燒）。 */
+               (unsigned)pkt->peer_bench_arb, (unsigned)pkt->profile_flags,
+               (unsigned)pkt->arm_flags);
     }
 }
 
