@@ -3,7 +3,7 @@
  * ===========================================================================
  *   cd tests && make run
  *
- *   [1] TelemetryPacket_t 大小 = 116 bytes（與 TX/地面站解碼契約一致）
+ *   [1] TelemetryPacket_t 大小 = 99 bytes（與 TX/地面站解碼契約一致）
  *   [2] 組一筆有效封包 → TelemRx_Feed 往返一致（sync 對齊 + CRC）
  *   [3] 單一位元翻轉 → CRC 不符 → 不吐封包、crc_err++
  *   [4] 前綴雜訊 + 連續兩筆 → 正確對齊並解出 2 筆
@@ -51,8 +51,8 @@ static uint16_t build_sample(uint8_t *buf) {
 
 static void test_size(void) {
     printf("[1] 封包大小（解碼契約）\n");
-    check("sizeof(TelemetryPacket_t) == 116", sizeof(TelemetryPacket_t) == 116);
-    check("TELEM_PACKET_SIZE == 116",         TELEM_PACKET_SIZE == 116);
+    check("sizeof(TelemetryPacket_t) == 99", sizeof(TelemetryPacket_t) == 99);
+    check("TELEM_PACKET_SIZE == 99",          TELEM_PACKET_SIZE == 99);
 }
 
 static void test_roundtrip(void) {
@@ -172,7 +172,7 @@ static void test_realign_after_false_sync(void) {
     int got = 0;
 
     /* 雜訊裡湊巧出現一組假的 A5 5A，緊接著才是真封包。
-     * 解析器會先咬住假 sync 湊滿 116 bytes、CRC 失敗——而真封包的起點就落在
+     * 解析器會先咬住假 sync 湊滿 117 bytes、CRC 失敗——而真封包的起點就落在
      * 這段緩衝的 offset 2。舊實作把整段丟光、從下一個位元組重找 sync，真封包
      * 連帶報銷（一次誤判賠兩包）；回溯重對齊要在緩衝內找回 offset 2 的 A5 5A。 */
     got += TelemRx_Feed(&rx, TELEM_SYNC0, &out);

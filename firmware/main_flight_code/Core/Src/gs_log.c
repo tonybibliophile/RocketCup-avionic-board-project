@@ -62,12 +62,12 @@ int GsLog_CsvHeader(char *out, size_t cap)
 {
     return snprintf(out, cap,
         "rx_utc,aligned_utc,link_mhz,rssi_dbm,snr_cb,offset_ms,"
-        "seq,fsm_state,rkt_tick_ms,ekf_alt_cm,ekf_vel_cms,baro_alt_cm,baro_pa,"
-        "vf_alt_cm,vf_vel_cms,"
+        "seq,fsm_state,rkt_tick_ms,ekf_alt_cm,ekf_vel_cms,baro_alt_cm,"
+        "vf_alt_cm,vf_vel_cms,max_alt_m,max_vel_ms,max_acc_cg,drogue_alt_m,main_alt_m,"
         "gps_lat_1e6,gps_lon_1e6,gps_alt_m,gps_sats,gps_fix,bat_mv,"
         "flags,health,sensor,"
-        "peer_fsm,peer_flags,peer_h_cm,peer_v_cms,peer_baro_cm,peer_link,peer_loss_pmil,"
-        "peer_az_cg,peer_vf_h_cm,peer_vf_v_cms,peer_bench_arb,"
+        "peer_fsm,peer_flags,peer_baro_cm,peer_link,"
+        "peer_vf_h_cm,peer_vf_v_cms,peer_bench_arb,"
         "gs_lat_1e6,gs_lon_1e6,gs_alt_m,gs_sats,gs_fix,"
         "rx_utc_ms,aligned_utc_ms\r\n");
 }
@@ -83,27 +83,27 @@ int GsLog_FormatCsvRow(char *out, size_t cap, const GsLogRecord_t *rec)
 
     return snprintf(out, cap,
         "%s,%s,%u,%d,%d,%d,"
-        "%u,%u,%u,%d,%d,%d,%u,"
-        "%d,%d,"
+        "%u,%u,%u,%d,%d,%d,"
+        "%d,%d,%u,%d,%u,%d,%d,"
         "%d,%d,%d,%u,%u,%u,"
         "0x%02X,0x%02X,0x%02X,"
-        "%u,0x%02X,%d,%d,%d,0x%02X,%u,"
-        "%d,%d,%d,%u,"
+        "%u,0x%02X,%d,0x%02X,"
+        "%d,%d,%u,"
         "%d,%d,%d,%u,%u,"
         "%u,%u\r\n",
         rx_hms, al_hms, link_mhz,
         (int)rec->rssi_dbm, (int)rec->snr_cb, (int)rec->offset_ms,
         (unsigned)p->seq, (unsigned)p->fsm_state, (unsigned)p->tick_ms,
         (int)p->ekf_pos_z_cm, (int)p->ekf_vel_z_cms, (int)p->baro_alt_cm,
-        (unsigned)p->baro_press_pa,
         (int)p->vf_pos_z_cm, (int)p->vf_vel_z_cms,
+        (unsigned)p->max_alt_m, (int)p->max_vel_ms, (unsigned)p->max_acc_cg,
+        (int)p->drogue_alt_m, (int)p->main_alt_m,
         (int)p->gps_lat_1e6, (int)p->gps_lon_1e6, (int)p->gps_alt_m,
         (unsigned)p->gps_sats, (unsigned)p->gps_fix, (unsigned)p->bat_mv,
         (unsigned)p->flags, (unsigned)p->health_bits, (unsigned)p->sensor_bits,
-        (unsigned)p->peer_fsm_state, (unsigned)p->peer_flags,
-        (int)p->peer_h_cm, (int)p->peer_v_cms, (int)p->peer_baro_cm,
-        (unsigned)p->peer_link, (unsigned)p->peer_loss_pmil,
-        (int)p->peer_az_cg, (int)p->peer_vf_h_cm, (int)p->peer_vf_v_cms,
+        (unsigned)p->peer_fsm_state, (unsigned)p->peer_flags, (int)p->peer_baro_cm,
+        (unsigned)p->peer_link,
+        (int)p->peer_vf_h_cm, (int)p->peer_vf_v_cms,
         (unsigned)p->peer_bench_arb,
         (int)rec->gs_lat_1e6, (int)rec->gs_lon_1e6, (int)rec->gs_alt_m,
         (unsigned)rec->gs_sats, (unsigned)rec->gs_fix,

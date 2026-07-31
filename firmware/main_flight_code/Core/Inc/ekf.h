@@ -91,7 +91,7 @@ void EKF_AttitudeUpdate(float gx, float gy, float gz, float ax, float ay, float 
  * 校準完成後第一次有效定位鎖定發射台原點 (lat0/lon0)，之後以等距投影換算
  * ENU 水平位移並排程一次 (E/N) 位置量測更新，於 EKF_Task 內套用。
  * 多次提交僅保留最新一筆；衛星數越少量測噪聲 R 越大（越不信任）。 */
-void EKF_SubmitGPS(int32_t lat_1e6, int32_t lon_1e6, uint8_t satellites);
+void EKF_SubmitGPS(int32_t lat_1e6, int32_t lon_1e6, uint8_t satellites, uint32_t hacc_mm);
 
 /* 地磁計航向 (yaw) 注入（由 defaultTask 呼叫，~10Hz）。
  * mx,my,mz 為 IMU body frame 下的磁場向量（任意單位，僅取方向）。

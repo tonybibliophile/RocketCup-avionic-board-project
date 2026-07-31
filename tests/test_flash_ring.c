@@ -79,6 +79,35 @@ static void test_erase_advance(void)
     check("target 防衛收斂 END+1 → BASE", ring_erase_target(END + 1UL) == BASE);
 }
 
+/* 熱重啟池起點（FlashRing_SkipPreErase 的位址數學）：
+ * 寫入頭所在 sector 的剩餘空間必為已擦（該 sector 進入寫入前已擦淨、封包由低往高寫），
+ * 故 erased_end 收在下一個 sector 邊界 —— 既維持 sector 對齊不變量，也把那段殘量計入池。
+ * 舊版直接令 erased_end = write_addr（128B 對齊）：池=0 且不對齊，落地後第一次滾動擦除
+ * 會擦掉寫入頭所在 sector（連同重啟前最後 ≤31 筆），本節即該回歸的鎖。 */
+static void test_hotstart_pool_start(void)
+{
+    printf("[5b] 熱重啟池起點（零擦除還原）\n");
+    const uint32_t w = BASE + 3 * SECTOR + 7 * PKT;   /* sector 中段的寫入頭 */
+    check("erased_end 收在下一個 sector 邊界", ring_sector_end(w) == BASE + 4 * SECTOR);
+    check("恆 sector 對齊", (ring_sector_end(w) % SECTOR) == 0);
+    check("同 sector 殘量計入池", ring_pool_bytes_calc(w, ring_sector_end(w)) == SECTOR - 7 * PKT);
+    check("寫入頭恰在 sector 邊界 → 整個 sector 計入池",
+          ring_pool_bytes_calc(BASE + SECTOR, ring_sector_end(BASE + SECTOR)) == SECTOR);
+    check("環尾 sector → 迴繞回 BASE", ring_sector_end(END + 1UL - PKT) == BASE);
+    check("舊版行為（erased_end = write_addr）在此為非對齊 ⇒ 已不再使用",
+          ((BASE + 3 * SECTOR + 7 * PKT) % SECTOR) != 0);
+    /* 前向探測會逐 sector 推進，池不得超過目標上限（含首個 partial sector） */
+    uint32_t end = ring_sector_end(w);
+    uint32_t probed = 0;
+    while (ring_pool_bytes_calc(w, end) + SECTOR <= POOL_TARGET_BYTES) {
+        end = ring_sector_end(end);
+        probed++;
+    }
+    check("探測迴圈終止且池 ≤ 目標上限", ring_pool_bytes_calc(w, end) <= POOL_TARGET_BYTES);
+    check("探測 sector 數合理（959 格 + 首個 partial）", probed == FLASH_RING_PREERASE_TARGET - 1U);
+    check("探測後 end 仍 sector 對齊", (end % SECTOR) == 0);
+}
+
 static void test_packet_addr(void)
 {
     printf("[5] 熱啟動回讀位址\n");
@@ -193,6 +222,7 @@ int main(void)
     test_pool();
     test_write_advance();
     test_erase_advance();
+    test_hotstart_pool_start();
     test_packet_addr();
     test_span_in_pool();
     test_full_lap_sim();

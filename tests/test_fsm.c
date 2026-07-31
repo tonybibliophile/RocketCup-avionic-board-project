@@ -474,8 +474,17 @@ static void test_hotstart_decide(void) {
     check("DESCENT 已點火 → 維持 DESCENT", d.restore == 1 && d.state == STATE_DESCENT);
 
     /* 合理性檢查 */
-    d = FSM_HotStartDecide(1, STATE_COAST, 60000, 250.0f, 240.0f, 0);
-    check("tick ≥ 60s → PAD（陳舊資料）", d.restore == 0);
+    /* 上限 2026-07-31 由 60s 放大到 FSM_HOTSTART_MAX_TICK_MS（完整飛行 ~278s + 餘裕）：
+     * 傘降段重啟必須還原得回來（舊值只蓋到頂點後約 30s，整段傘降被判成陳舊資料）。 */
+    d = FSM_HotStartDecide(1, STATE_DESCENT, 90000, 250.0f, 240.0f, 1);
+    check("傘降段 90s 重啟 → 仍恢復（舊 60s 上限會誤判陳舊）",
+          d.restore == 1 && d.state == STATE_DESCENT);
+    d = FSM_HotStartDecide(1, STATE_DESCENT, FSM_HOTSTART_MAX_TICK_MS - 1000U, 250.0f, 240.0f, 1);
+    check("上限前 1s → 恢復", d.restore == 1);
+    d = FSM_HotStartDecide(1, STATE_COAST, FSM_HOTSTART_MAX_TICK_MS, 250.0f, 240.0f, 0);
+    check("tick ≥ 上限 → PAD（陳舊資料）", d.restore == 0);
+    check("上限已涵蓋主傘看門狗（BOOST..DESCENT 的最晚寫入時刻）",
+          FSM_HOTSTART_MAX_TICK_MS >= FSM_MAIN_WATCHDOG_MS);
     d = FSM_HotStartDecide(1, STATE_COAST, 8000, 550.0f, 100.0f, 0);
     check("高度差 ≥ 300m → PAD（殘留封包）", d.restore == 0);
     d = FSM_HotStartDecide(1, STATE_COAST, 8000, 100.0f, 550.0f, 0);

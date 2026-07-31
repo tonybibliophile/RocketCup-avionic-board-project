@@ -41,26 +41,40 @@ extern "C" {
  * 飛行態（含 STATE_PAD_ARMED，見 main.c FlashRing_SetEraseAllowed 呼叫處）禁止
  * 同步滾動擦除（最壞 ~400ms 阻塞主迴圈，FSM 停擺、EKF 斷饋且持 SPI3 mutex）——
  * 池必須撐滿整段「同步擦除被禁止」的視窗，即 STATE_PAD_ARMED 進入到
- * STATE_MAIN_DEPLOY 結束。INIT/PAD/PAD_ARMED 已完全不寫入 flash（main.c 的
- * ring_enabled），整池即飛行預算，地面待命再久也不消耗。
+ * STATE_MAIN_DEPLOY 結束。
+ *
+ * ★2026-07-31 更正：舊註解寫「PAD_ARMED 完全不寫入 flash，地面待命再久也不消耗」，
+ * 與 main.c 現況不符 —— PAD_ARMED 以 1Hz 寫入（記錄武裝後、起飛前的地面狀態），
+ * 且該段同步擦除已被禁止、背景 PreEraseOne 也只在 state <= STATE_PAD 才跑，池在
+ * 武裝期只出不進。故池的真實預算是「武裝等待 + 飛行」兩筆帳：
+ *   飛行可記錄秒數 = (池封包數 − 武裝秒數) ÷ 100
+ * 舊值 960 sectors（30720 封包）下，武裝 12 分鐘就把飛行量壓到 300s、與
+ * FSM_HOTSTART_MAX_TICK_MS 相等（熱重啟窗口再也無法靠「通電放久」老化出去，見
+ * fsm.h 該常數說明）；電梯 profile 更只需武裝 7 分鐘就蓋不滿看門狗視窗。
  *
  * 本檔不 include board_config.h（維持 header-only、不依賴 HAL/profile 巨集），
  * 故此常數無法依 FLIGHT_PROFILE_ELEVATOR 分流，須直接取兩 profile 中「較大」的
  * 硬上限（此視窗長度 = FSM_MAIN_WATCHDOG_MS + FSM_MAIN_INFLATE_MS，見 fsm.h）：
  *   飛行 profile：248000 + 3000 = 251000ms = 251s（唯一真實來源見 fsm.h，勿抄值）
  *   電梯 profile：300000 + 3000 = 303000ms = 303s ← 較大，取此為硬上限
- * 303s + ~4s 邊界餘裕 ≈ 307.2s → 307.2s × 100Hz ÷ 32 封包/sector = 960 sectors。
- * （舊值 332 sectors≈106.2s 係基於已不成立的 92000ms 假設推算，早已對不上任一
- * profile 的實際看門狗值，已改正。）960 sectors 仍遠小於環容量 4080 sectors，
- * 不影響上方迴繞歧義防呆的池上限設計。
- * 池子由開機序列一次性 bulk 預擦滿（main.c 呼叫 FlashRing_InitEx，內部即
- * w25qxx.c 的 FlashRing_Init 迴圈，每 sector 餵狗，約 960 × ~50ms ≈ 48s）；
- * main.c 的 0.5s/次背景 FlashRing_PreEraseOne() 迴圈僅在 INIT/PAD 期作補漏
- * 安全網（例如上行 EraseAll 指令清池後），非常態填池路徑，PAD_ARMED 不觸發。
+ * 303s + ~4s 邊界餘裕 ≈ 307.2s → 307.2s × 100Hz ÷ 32 封包/sector = 960 sectors，
+ * 這是「飛行段本身」的硬需求下限（舊值即取此）。
+ *
+ * ★2026-07-31：960 → 1500（使用者決策）。理由是上面那筆武裝帳：
+ *   1500 sectors = 48000 封包。武裝 60 分鐘（3600 封包）後仍剩 (48000−3600)/100
+ *   = 444s 飛行量，涵蓋電梯 profile 的 303s 視窗仍有 141s 餘裕；同時遠高於
+ *   FSM_HOTSTART_MAX_TICK_MS(300s)，維持「卡在飛行狀態的板子通電放久就能老化出
+ *   熱重啟窗口」這條逃生路徑（見 fsm.h 該常數說明）。
+ * ★放大池「不」增加擦除時間：擦除已改為使用者觸發，`flash erase` 本來就整環全擦
+ *   （255 次 64KB block erase），之後整環皆 0xFF，池由 FlashRing_ProbePoolNoErase()
+ *   唯讀認領，零額外擦除。1500 仍遠小於環容量 4080 sectors，不影響上方迴繞歧義
+ *   防呆的池上限設計。
  * ⚠️ 若 fsm.h 任一 profile 的 FSM_MAIN_WATCHDOG_MS／FSM_MAIN_INFLATE_MS 之後調整
- * （例如換 profile 或重推 OpenRocket），此值須同步依上式重算（取兩 profile較大者），
- * 並於發射檢核表確認 [FLASH] pool 達標後才起飛。 */
-#define FLASH_RING_PREERASE_TARGET 960U       /* PAD 期背景預擦目標（sectors） */
+ * （例如換 profile 或重推 OpenRocket），此值須同步依上式重算（取兩 profile較大者
+ * 再加上預期武裝時間），並於發射檢核表確認 [FLASH] pool 達標後才起飛。
+ * ⚠️ 本值同時是 ARM 閘門檻：池未達標一律擋 ARM（fsm.c flash_pool_ready），且開機
+ * 不再自動擦除，須由使用者下 `flash erase`／`flash pool` 指令。 */
+#define FLASH_RING_PREERASE_TARGET 1500U      /* ARM 前要求的最低已擦池（sectors） */
 
 /* 擦除粒度。必須等於 W25QXX_SECTOR_SIZE（w25qxx.h 以 _Static_assert 鎖定）。 */
 #define FLASH_RING_SECTOR_SIZE   4096UL
@@ -108,6 +122,16 @@ static inline uint32_t ring_erase_advance(uint32_t erased_end)
         erased_end = FLASH_RINGBUF_ADDR;
     }
     return erased_end;
+}
+
+/* 給定位址所在 sector 的下一個 sector 邊界（正規化迴繞：≥ END+1 即回 BASE）。
+ * 熱重啟池起點用：寫入頭「之後、同 sector 內」的剩餘空間必定仍是已擦狀態
+ * （該 sector 進入寫入前已擦淨，且封包嚴格由低位址往高寫），故那段可直接計入池，
+ * 而 erased_end 收在此邊界即維持 sector 對齊不變量。 */
+static inline uint32_t ring_sector_end(uint32_t addr)
+{
+    uint32_t end = (addr & ~(FLASH_RING_SECTOR_SIZE - 1UL)) + FLASH_RING_SECTOR_SIZE;
+    return (end >= FLASH_RINGBUF_END + 1UL) ? FLASH_RINGBUF_ADDR : end;
 }
 
 /* 最後一筆已寫封包的位址（熱啟動回讀）。write==BASE 時為環尾最後一格。 */

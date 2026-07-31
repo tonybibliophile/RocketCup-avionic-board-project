@@ -44,6 +44,9 @@ void LinkPeer_OnPacket(LinkPeer_t *p, const LinkPacket_t *pkt, uint32_t now_ms)
     p->q_z            = pkt->q_z;
     p->vf_h_cm        = pkt->vf_h_cm;
     p->vf_v_cms       = pkt->vf_v_cms;
+    p->bmi_mag_cg     = pkt->bmi_mag_cg;
+    p->adxl_mag_cg    = pkt->adxl_mag_cg;
+    p->profile_flags  = pkt->profile_flags;
 
     /* 開傘旗標一旦收到即鎖存（供加法協同判斷對端是否已開傘；不清除） */
     if (pkt->flags & TELEM_FLAG_DROGUE_FIRED)  p->drogue_latched = 1U;

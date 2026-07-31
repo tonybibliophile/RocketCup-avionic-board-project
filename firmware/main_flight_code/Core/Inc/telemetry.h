@@ -46,12 +46,30 @@ extern "C" {
 /* arm_flags 位元定義（flags 8 位已滿，ARM 被擋原因獨立一個 byte，供地面站顯示） */
 #define TELEM_ARM_BLOCKED_FLASH_POOL 0x01U  /* ARM 已送出但 flash 預擦池未達標，仍留 STATE_PAD
                                               * （fail-open：flash 停用/未偵測到/未記錄時不會設此位） */
+#define TELEM_ARM_NEED_ERASE         0x02U  /* ★2026-07-31：池未達標「且尚未按 ARM」——開機不再自動
+                                              * 擦除，此位讓地面站在使用者按 ARM「之前」就看到需要先
+                                              * 擦除（下 `flash erase` 或 `flash pool`）。與 bit0 的差別：
+                                              * bit0 是「已按 ARM 但被擋」，bit1 是「還沒按就先警告」。
+                                              * ★沿用既有 arm_flags 空位，封包長度不變 ⇒ 不需三板同燒。 */
 
 /* peer_link 位（主/副協同下鏈：主板把副板鏈路健康中繼給地面，供雙板監看） */
 #define TELEM_PEER_EVER    0x01U  /* 曾收過對端封包（valid） */
 #define TELEM_PEER_FRESH   0x02U  /* 對端在線（LINK_PEER_TIMEOUT_MS 內收過） */
 #define TELEM_PEER_LOST    0x04U  /* 曾失聯（Phase B 設定） */
 #define TELEM_PEER_DESYNC  0x08U  /* 狀態失同步（Phase B 設定） */
+
+/* profile_flags 位：board_config.h FLIGHT_PROFILE_ELEVATOR 醒目標示。正式版預設兩板
+ * 皆為 0（真實飛行 profile）；只要任一板仍以電梯測試 profile 編譯/燒錄（例如換板未
+ * 重燒、忘記切回），地面站/GUI 必須顯著警示，避免誤以測試門檻上真實彈道。
+ * SELF 由本板 telemetry.c 依編譯期巨集直接填；PEER 由主板依板間鏈路（link_proto.h
+ * 同一位元語意）中繼副板回報值換算而來，僅主板下鏈時填寫。 */
+#define TELEM_PROFILE_SELF_ELEVATOR  0x01U  /* 本板韌體以 FLIGHT_PROFILE_ELEVATOR=1 編譯 */
+#define TELEM_PROFILE_PEER_ELEVATOR  0x02U  /* 對端（副板）韌體亦為電梯測試 profile */
+
+/* drogue_alt_m / main_alt_m 的「尚未開傘」哨兵。刻意不用 0：0 m 是合法的開傘高度
+ * （地面誤觸發／發射台高度誤判），用 0 當「沒開」會把真正該警示的事件藏起來。
+ * 與 w25qxx.h FlashRingPacket_t 的同名欄位共用同一個哨兵值。 */
+#define TELEM_DEPLOY_ALT_NA  ((int16_t)-32768)
 
 /* 下行遙測封包（packed，固定長度）。欄位順序即為地面端解碼契約。 */
 typedef struct __attribute__((packed)) {
@@ -69,7 +87,6 @@ typedef struct __attribute__((packed)) {
     int16_t  ekf_q3;         /* qz ×10000 */
 
     int32_t  baro_alt_cm;    /* BMP388 海拔 (cm) */
-    uint32_t baro_press_pa;  /* BMP388 氣壓 (Pa) */
 
     int16_t  imu_ax_mg;      /* BMI088 加速度 X (mg, sensor frame) */
     int16_t  imu_ay_mg;      /* BMI088 加速度 Y (mg) */
@@ -77,12 +94,11 @@ typedef struct __attribute__((packed)) {
     int16_t  gyro_x_dps;     /* BMI088 角速度 X (dps) */
     int16_t  gyro_y_dps;     /* BMI088 角速度 Y (dps) */
     int16_t  gyro_z_dps;     /* BMI088 角速度 Z (dps) */
-    int16_t  hg_ax_cg;       /* ADXL375 高G X (cg=0.01g, sensor frame) */
-    int16_t  hg_ay_cg;       /* ADXL375 高G Y (cg) */
-    int16_t  hg_az_cg;       /* ADXL375 高G Z (cg) */
-    int16_t  mag_x_mg;       /* MMC5983 磁場 X (mGauss, body frame) */
-    int16_t  mag_y_mg;       /* MMC5983 磁場 Y (mGauss) */
-    int16_t  mag_z_mg;       /* MMC5983 磁場 Z (mGauss) */
+    /* ADXL375 高G「模長」(cg = 0.01g)。★2026-07-30 由三軸縮成單一模長：本板 ADXL375
+     * 三軸實測雜訊全爆（Z σ645mG），FSM 起飛/燒完判定早已改吃 BMI088，下鏈保留三軸
+     * 只是浪費 4 bytes 空中時間；留模長供「高G 是否仍在動/是否過載」的粗判即可。
+     * 完整三軸原始值仍完整寫進 Flash ring（FlashRingPacket_t adxl_x/y/z）。 */
+    int16_t  hg_mag_cg;
 
     int32_t  gps_lat_1e6;    /* 緯度 deg ×1e6（+北/−南） */
     int32_t  gps_lon_1e6;    /* 經度 deg ×1e6（+東/−西） */
@@ -92,7 +108,6 @@ typedef struct __attribute__((packed)) {
 
     uint16_t bat_mv;         /* 電池電壓 (mV) */
     uint16_t cpu_main_x10;   /* MainTask+ISR CPU 佔用率 (% ×10) */
-    uint16_t cpu_ekf_x10;    /* EKFTask CPU 佔用率 (% ×10) */
     uint8_t  flags;          /* TELEM_FLAG_* 位元旗標 */
 
     uint8_t  health_bits;    /* P1：EKF_HB_*（ekf_guard.h；0=EKF 全健康） */
@@ -103,25 +118,60 @@ typedef struct __attribute__((packed)) {
     int32_t  vf_pos_z_cm;    /* VF 高度 (cm) */
     int32_t  vf_vel_z_cms;   /* VF 垂直速度 (cm/s) */
 
+    /* --- ★飛行滾動極值（2026-07-30 新增）------------------------------------
+     * 火箭端以「感測器全速率」持續更新的最大值，每一包都重複攜帶。
+     * 存在理由：433 下鏈實際只有約 2Hz（103B @ 2.4k 空中速率 ≈ 350ms/包），而推力段
+     * 只有 2~3 秒、峰值 G 不到 1 秒、頂點是一個瞬間——用 2Hz 取樣去記錄這些，最大高度
+     * 與最大加速度會系統性偏低。這三個欄位由飛控迴圈以 100Hz(高度/速度) 與 400Hz 逐筆
+     * 掃批次(加速度) 追蹤，因此：
+     *   ① 不受下鏈取樣率限制，是真峰值；
+     *   ② 抗丟包——每包都帶滾動值，頂點後任何一包穿透就拿得到，不必剛好收到峰值那包；
+     *   ③ 火箭無法回收時，這是唯一能知道「到底飛多高、多快、承受多少 G」的來源。
+     * 於 ARM（STATE_PAD → PAD_ARMED）歸零，避免地面測試/搬動污染。
+     * ⚠ 飛行中熱重啟會一併歸零（本版未做跨重啟保存），此時 TELEM_FLAG_HOTSTART 會設起來，
+     *   判讀時需注意極值只涵蓋最後一次重啟之後。 */
+    uint16_t max_alt_m;      /* 起飛後最大相對高度 (m，0..65535；來源同 FSM 決策用 h_est) */
+    int16_t  max_vel_ms;     /* 起飛後最大垂直速度 (m/s，來源同 FSM 決策用 v_est) */
+    uint16_t max_acc_cg;     /* 起飛後最大合加速度 |a| (cg = 0.01g)；來源 BMI088 逐筆批次掃描。
+                              * ⚠ BMI088 量程 ±24g，真實峰值超過會被硬體削頂（讀到 ~2400cg
+                              * 就代表「至少 24g」而非精確值）。ADXL375 因本板雜訊問題不採用。 */
+
+    /* --- ★實際開傘高度（2026-07-30 新增，各 2B）---------------------------------
+     * 回答「傘到底是在對的高度開的嗎」——不必回收火箭就能判定。上面的 max_alt_m 只給
+     * 頂點，開傘時機是另一回事：下鏈 ~2.3Hz，開傘那一瞬間的封包很可能剛好丟掉，事後
+     * 從稀疏取樣反推不出開傘高度。故於開傘動作發生的那個飛控週期就地鎖存（100Hz 解析度），
+     * 之後每包重複攜帶、且跨熱重啟保存（見 w25qxx.h FlashRingPacket_t 同名欄位）。
+     * 來源與 max_alt_m 相同（in.h_est，FSM 決策實際採用的估計值），故可直接互相比較。
+     * 未開傘 = TELEM_DEPLOY_ALT_NA；用哨兵而非 0，因為 0 m 是合法的開傘高度（地面誤觸發）。 */
+    int16_t  drogue_alt_m;   /* 副傘實際開傘相對高度 (m)；未開傘 = TELEM_DEPLOY_ALT_NA */
+    int16_t  main_alt_m;     /* 主傘實際開傘相對高度 (m)；未開傘 = TELEM_DEPLOY_ALT_NA */
+
     /* --- 主/副協同：主板中繼「對端(副板)摘要」，供地面站雙板監看（Phase A/B/C）。
-     *     來源為板間鏈路 LinkPeer_t；無對端時全 0、peer_link=0。 --- */
+     *     來源為板間鏈路 LinkPeer_t；無對端時全 0、peer_link=0。
+     *     ★2026-07-30：拿掉對端 EKF 高度/速度、高G、丟包率——地面站顯示一律改看 VF
+     *     （開傘決策實際採用的估計器，見上方本板 vf_pos_z_cm 註解），EKF/高G/丟包率
+     *     只留給板間鏈路本身的 LinkPeer_t／USB 直連診斷（main.c [LINK] 行）用，
+     *     不必再佔下行封包位元組。 --- */
     uint8_t  peer_fsm_state; /* 對端 FlightState_t 飛行狀態碼 */
-    uint8_t  peer_flags;     /* 對端 TELEM_FLAG_* 子集 */
-    int32_t  peer_h_cm;      /* 對端 EKF 高度 (cm) */
-    int32_t  peer_v_cms;     /* 對端 EKF 垂直速度 (cm/s) */
+    uint8_t  peer_flags;     /* 對端 TELEM_FLAG_* 子集。★bit0 DROGUE_FIRED / bit1 MAIN_DEPLOYED
+                              * 為「開過」鎖存值（Telemetry_Build 由 LinkPeer 的 drogue_latched/
+                              * main_latched OR 進來），不是對端此刻的腳位現況——副板引傘只導通
+                              * 3s，即時值在 ~2Hz 下鏈幾乎必漏。其餘位仍為即時值。 */
     int32_t  peer_baro_cm;   /* 對端 baro 相對高度 (cm) */
     uint8_t  peer_link;      /* TELEM_PEER_* 鏈路健康位 */
-    uint16_t peer_loss_pmil; /* 對端封包丟失率 (‰，0..1000) */
-    int16_t  peer_az_cg;     /* 對端 高G 垂直加速度 (cg = 0.01g) */
     int32_t  peer_vf_h_cm;   /* 對端 VF 高度 (cm) */
     int32_t  peer_vf_v_cms;  /* 對端 VF 垂直速度 (cm/s) */
 
     uint8_t  arm_flags;      /* TELEM_ARM_* 位元（ARM 被擋下的原因，供地面站顯示） */
 
-    /* 對端(副板) D2 主傘舵機/BENCH 桌測握手狀態（servo_arb.h SERVO_ARB_MSG_*：
-     * 0=NONE 1=INTENT 2=DRIVING 3=DONE 4=BENCH_PRI_FIRE 5=BENCH_SEC_FIRE 6=BENCH_BOTH_FIRE）。
-     * 讓地面站不必接對端板 USB 也能經 LoRa 看到副板舵機驅動進度（見 Link_BuildOwnStatus）。 */
+    /* 對端(副板) 主傘共開 / BENCH 桌測狀態（servo_arb.h SERVO_ARB_MSG_*：
+     * 0=NONE 1=BENCH_START 2=LEGACY_DRIVING(已廢除) 3=DONE 4=BENCH_PRI_FIRE
+     * 5=BENCH_SEC_FIRE 6=BENCH_MAIN_HIGH 7=MAIN_HIGH）。★主傘互斥握手已取消，
+     * 改為兩板同時把 PD14 純 GPIO 拉高 SERVO_MAIN_HIGH_MS。
+     * 讓地面站不必接對端板 USB 也能經 LoRa 看到副板開傘進度（見 Link_BuildOwnStatus）。 */
     uint8_t  peer_bench_arb;
+
+    uint8_t  profile_flags;  /* TELEM_PROFILE_*：本板/對端是否仍為電梯測試 profile */
 
     uint16_t crc16;          /* CRC-16/CCITT-FALSE，覆蓋本封包前面所有位元組 */
 } TelemetryPacket_t;

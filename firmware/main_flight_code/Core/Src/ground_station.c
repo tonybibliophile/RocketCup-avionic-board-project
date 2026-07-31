@@ -73,20 +73,28 @@ static uint8_t s_e80buf[255];
 
 /* ---- 指示燈（板上三顆，地面站用途）----
  *   PE2 LED_SYS    : 心跳閃爍（1Hz）= 韌體存活、主迴圈在跑
- *   PE3 LED_State1 : GPS 定位有效 = 恆亮（時間對齊錨點就緒）
- *   PE4 LED_State2 : 接收活動 = 收到下行封包即短亮，隨流量閃爍
+ *   PE3 LED_State1 : 收到 433 (E22) 封包 = 逐包翻轉，隨收包速率閃爍
+ *   PE4 LED_State2 : 收到 920 (E80) 封包 = 逐包翻轉，隨收包速率閃爍
  * 規格表標「低/高電平控制」；此處採 active-high（SET=亮，GPIO init 為 RESET=滅）。
- * 若實際硬體為 active-low，將 GS_LED_ON/GS_LED_OFF 對調即可。 */
-#define GS_LED_ON       GPIO_PIN_SET
-#define GS_LED_OFF      GPIO_PIN_RESET
-#define GS_LED1_Pin     GPIO_PIN_3        /* PE3 LED_State1（main.h 未命名，直接用腳號） */
-#define GS_RX_LED_MS    120U              /* 收到封包後亮燈持續（製造每包可見閃爍） */
-#define GS_HEARTBEAT_MS 500U              /* LED_SYS 心跳半週期（1Hz 閃） */
+ * 若實際硬體為 active-low，將 GS_LED_ON/GS_LED_OFF 對調即可。
+ *
+ * ★收包燈採「逐包翻轉」而非「收到後亮 N ms」：920 實測可達 8–10Hz（週期
+ *   100–125ms），若採固定亮燈時長，只要亮燈時長 >= 封包週期，下一包就會在
+ *   前一次亮燈熄滅前又把燈重新點亮，脈衝彼此重疊、肉眼看起來像恆亮，感覺
+ *   不出速率、甚至像「跟不上」。逐包翻轉不管封包多快都一定有可見邊沿。 */
+#define GS_LED_ON            GPIO_PIN_SET
+#define GS_LED_OFF           GPIO_PIN_RESET
+#define GS_LED1_Pin          GPIO_PIN_3   /* PE3 LED_State1（main.h 未命名，直接用腳號） */
+#define GS_RX_LED_TIMEOUT_MS 300U         /* 超過此時間沒收到新封包，燈直接熄滅（判定鏈路中斷） */
+#define GS_HEARTBEAT_MS      500U         /* LED_SYS 心跳半週期（1Hz 閃） */
 
-static volatile uint32_t s_last_pkt_tick = 0;   /* 最後一筆有效封包 tick（任一鏈路） */
+static volatile uint32_t s_last_pkt_tick_433 = 0;   /* 最後一筆 433 (E22) 有效封包 tick */
+static volatile uint32_t s_last_pkt_tick_920 = 0;   /* 最後一筆 920 (E80) 有效封包 tick */
+static volatile uint8_t  s_led_433_on = 0;          /* 每收一包 433 翻轉一次 */
+static volatile uint8_t  s_led_920_on = 0;          /* 每收一包 920 翻轉一次 */
 
 /* 依現況驅動三顆 LED。每個主迴圈週期呼叫一次。 */
-static void gs_leds_update(uint32_t now, uint8_t gps_fix)
+static void gs_leds_update(uint32_t now)
 {
     static uint32_t hb_tick = 0;
     static uint8_t  hb_on   = 0;
@@ -95,11 +103,14 @@ static void gs_leds_update(uint32_t now, uint8_t gps_fix)
         hb_on ^= 1U;
         HAL_GPIO_WritePin(LED_SYS_GPIO_Port, LED_SYS_Pin, hb_on ? GS_LED_ON : GS_LED_OFF);
     }
-    HAL_GPIO_WritePin(GPIOE, GS_LED1_Pin,            /* PE3：GPS fix 恆亮 */
-                      gps_fix ? GS_LED_ON : GS_LED_OFF);
-    uint8_t rx_active = (s_last_pkt_tick != 0) && ((now - s_last_pkt_tick) < GS_RX_LED_MS);
-    HAL_GPIO_WritePin(LED_STAT2_GPIO_Port, LED_STAT2_Pin,  /* PE4：接收活動 */
-                      rx_active ? GS_LED_ON : GS_LED_OFF);
+    uint8_t rx_433 = s_led_433_on &&
+        (s_last_pkt_tick_433 != 0) && ((now - s_last_pkt_tick_433) < GS_RX_LED_TIMEOUT_MS);
+    HAL_GPIO_WritePin(GPIOE, GS_LED1_Pin,            /* PE3：433 收包活動 */
+                      rx_433 ? GS_LED_ON : GS_LED_OFF);
+    uint8_t rx_920 = s_led_920_on &&
+        (s_last_pkt_tick_920 != 0) && ((now - s_last_pkt_tick_920) < GS_RX_LED_TIMEOUT_MS);
+    HAL_GPIO_WritePin(LED_STAT2_GPIO_Port, LED_STAT2_Pin,  /* PE4：920 收包活動 */
+                      rx_920 ? GS_LED_ON : GS_LED_OFF);
 }
 
 /* ---- USART3（E22）位元組環形緩衝：ISR 推入、任務取出 ---- */
@@ -183,20 +194,38 @@ void GroundStation_OnUart3Error(void)
     /* ★DMA 接收下 ORE 屬「非阻斷錯誤」：HAL 只發錯誤回呼，DMA 接收其實還活著。
      * 這種情況不可重掛（會回 HAL_BUSY），更不可把 s_u3_dma_old_pos 歸零——DMA 的
      * 寫入位置並沒有跟著回到 0，歸零會讓下一次事件把一整段舊資料當新的重讀一遍。
-     * 只有 HAL 真的把接收停掉（RxState 已非 BUSY_RX）時才需要、也才能重掛。 */
+     * 只有 HAL 真的把接收停掉（RxState 已非 BUSY_RX）時才需要、也才能重掛。
+     * ★但「RxState != BUSY_RX」不等於「現在可以重掛」——lora_e22.c 的設定模式一開始
+     *   就用 HAL_UART_AbortReceive() 把 RxState 打回 READY，一路到離開設定模式前都
+     *   是這個狀態；若這個 ISR（不受任何任務優先權節制）在這段窗口內被 M1 切換/baud
+     *   改變觸發的雜訊 ORE 打進來，重掛的 DMA 會硬生生把 lora_e22.c 正在阻塞輪詢等待
+     *   的模組回應位元組搶走（DMA 永遠比軟體輪詢快），造成 `e22 freq/pwr/air` 每次
+     *   都 st=3(HAL_TIMEOUT)、回讀全 0。故先查 LoRaE22_IsInConfigMode()：正在設定
+     *   模式就不搶，離開時 lora_e22.c 自己會呼叫這支重掛。 */
     if (huart3.RxState != HAL_UART_STATE_BUSY_RX) {
-        gs_u3_rx_rearm();
+        if (!LoRaE22_IsInConfigMode()) {
+            gs_u3_rx_rearm();
+        }
     }
 }
 
-/* ---- SD（FatFS CSV） ---- */
+/* ---- SD（FatFS：CSV 人讀 log + 完整二進位原始封包） ----
+ * 兩個檔案同一 session 配對（同一個索引 i）：
+ *   GSLOG%03d.CSV — 人讀摘要，欄位為 GsLog_FormatCsvRow() 子集（不含 gyro/mag/hg raw）。
+ *   GSRAW%03d.BIN — 逐筆 append 完整 GsLogRecord_t（含 79-byte 原始 TelemetryPacket_t，
+ *                   與 Flash 上寫入的格式一模一樣，含 magic/CRC），供事後解出 gyro/mag/
+ *                   高G/原始氣壓等 CSV 沒收錄的欄位。 */
 static FIL      s_sd_file;
 static uint8_t  s_sd_ok = 0;
 static uint32_t s_sd_rows = 0;
 
+static FIL      s_sd_raw_file;
+static uint8_t  s_sd_raw_ok = 0;
+static uint32_t s_sd_raw_rows = 0;
+
 static void gs_sd_open(void)
 {
-    char name[16];
+    char name[16], raw_name[16];
     FILINFO fno;
     HAL_IWDG_Refresh(&hiwdg);
     if (f_mount(&SDFatFS, SDPath, 1) != FR_OK) {
@@ -206,7 +235,9 @@ static void gs_sd_open(void)
     HAL_IWDG_Refresh(&hiwdg);
     for (int i = 0; i < 1000; i++) {
         snprintf(name, sizeof(name), "GSLOG%03d.CSV", i);
-        if (f_stat(name, &fno) == FR_NO_FILE) break;   /* 取下一個未用檔名 */
+        snprintf(raw_name, sizeof(raw_name), "GSRAW%03d.BIN", i);
+        /* 兩個都要未使用才取這個索引，確保 CSV/BIN 是同一 session 配對 */
+        if (f_stat(name, &fno) == FR_NO_FILE && f_stat(raw_name, &fno) == FR_NO_FILE) break;
     }
     HAL_IWDG_Refresh(&hiwdg);
     if (f_open(&s_sd_file, name, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
@@ -218,6 +249,10 @@ static void gs_sd_open(void)
         s_sd_ok = 1;
     }
     HAL_IWDG_Refresh(&hiwdg);
+    if (f_open(&s_sd_raw_file, raw_name, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+        s_sd_raw_ok = 1;
+    }
+    HAL_IWDG_Refresh(&hiwdg);
 }
 static void gs_sd_write(const char *row, uint16_t n)
 {
@@ -225,6 +260,13 @@ static void gs_sd_write(const char *row, uint16_t n)
     UINT bw;
     f_write(&s_sd_file, row, (UINT)n, &bw);
     if ((++s_sd_rows % 16U) == 0U) f_sync(&s_sd_file);   /* 定期 flush 降低掉電損失 */
+}
+static void gs_sd_write_raw(const GsLogRecord_t *rec)
+{
+    if (!s_sd_raw_ok) return;
+    UINT bw;
+    f_write(&s_sd_raw_file, rec, (UINT)GS_LOG_RECORD_SIZE, &bw);
+    if ((++s_sd_raw_rows % 16U) == 0U) f_sync(&s_sd_raw_file);   /* 定期 flush 降低掉電損失 */
 }
 
 /* ---- Flash（W25Q128 ring 區順序 append；用前才擦的 erase-ahead） ---- */
@@ -235,6 +277,16 @@ static void gs_flash_init(void)
 {
     s_fl_addr = FLASH_RINGBUF_ADDR;
     s_fl_erased_end = FLASH_RINGBUF_ADDR;   /* 尚未擦任何 sector */
+}
+
+/* 手動 `flash erase`（gs_lora_test.c）在呼叫 FlashRing_EraseAll() 整段擦淨後呼叫本函式，
+ * 重設寫入頭。★注意 s_fl_erased_end 設為 END+1（已擦到底），不是 gs_flash_init() 那個
+ * ADDR（尚未擦任何 sector）——後者會讓 gs_flash_append() 在收包當下逐個 sector 現場擦除
+ * （每次 ~數十~數百 ms），把剛用 FlashRing_EraseAll() 省下的一次性停頓又分散成每包卡頓。 */
+void GroundStation_FlashResetAfterErase(void)
+{
+    s_fl_addr = FLASH_RINGBUF_ADDR;
+    s_fl_erased_end = FLASH_RINGBUF_END + 1UL;
 }
 static void gs_flash_ensure_erased(uint32_t addr, uint32_t n)
 {
@@ -269,7 +321,13 @@ static void gs_handle_packet(uint8_t link, const TelemetryPacket_t *pkt,
                              int16_t rssi, int16_t snr)
 {
     uint32_t rx_tick = HAL_GetTick();
-    s_last_pkt_tick = rx_tick;          /* 接收活動指示燈（PE4）用 */
+    if (link == GS_LINK_920) {
+        s_last_pkt_tick_920 = rx_tick;  /* 接收活動指示燈（PE4）用 */
+        s_led_920_on ^= 1U;
+    } else {
+        s_last_pkt_tick_433 = rx_tick;  /* 接收活動指示燈（PE3）用 */
+        s_led_433_on ^= 1U;
+    }
     GsTimeSync_OnPacket(&s_ts, pkt->tick_ms, rx_tick, GS_TIMESYNC_EMA_SHIFT);
     uint32_t rx_utc = GsTimeSync_GroundUtcMs(&s_ts, rx_tick);
     uint32_t al_utc = GsTimeSync_RocketAlignedUtcMs(&s_ts, pkt->tick_ms);
@@ -287,6 +345,7 @@ static void gs_handle_packet(uint8_t link, const TelemetryPacket_t *pkt,
         gs_usb_send((const uint8_t *)s_row, (uint16_t)n);
         gs_sd_write(s_row, (uint16_t)n);
     }
+    gs_sd_write_raw(&rec);
     gs_flash_append(&rec);
 
     /* 更新通訊測試統計 */
@@ -298,6 +357,16 @@ static void gs_handle_packet(uint8_t link, const TelemetryPacket_t *pkt,
         s_stat_433_cnt++;
     }
 
+    /* 姿態四元數（EKF 估測，×10000 int16）：封包本就攜帶（telemetry.h ekf_q0..q3），
+     * 但過去從未印出，GUI 端因此完全沒有姿態資料。★不要塞進下面的 [GS_PKT]——那行已經
+     * 400+ bytes（USB_LOG_LINE_MAX 從 256 加大到 512 前還會被硬截斷，見 main.c _write()
+     * 註解），加大後也所剩無幾、以後還會有人繼續加欄位。改印成獨立短行（~40 bytes），
+     * 完全不影響 [GS_PKT] 本身，舊 GUI/舊解析器也不會受影響（純新增一行）。seq 供 GUI 端
+     * 與 [GS_PKT] 對應/去重用。 */
+    printf("[GS_ATT] seq:%u q:%d,%d,%d,%d\r\n",
+           (unsigned)pkt->seq,
+           (int)pkt->ekf_q0, (int)pkt->ekf_q1, (int)pkt->ekf_q2, (int)pkt->ekf_q3);
+
     /* 及時（實時）控制台印出收到的下行遙測封包摘要。
      * vz / pos / galt：GUI 圖表（EKF 垂直速度）與 GPS 地圖（火箭經緯度）需要，
      * 封包本就攜帶，此處補印出（pos 格式與航電 [GPS] 行一致：±d.6f）。 */
@@ -306,27 +375,40 @@ static void gs_handle_packet(uint8_t link, const TelemetryPacket_t *pkt,
         char lon_sign = (pkt->gps_lon_1e6 < 0) ? '-' : '+';
         uint32_t lat_abs = (pkt->gps_lat_1e6 < 0) ? (uint32_t)(-pkt->gps_lat_1e6) : (uint32_t)pkt->gps_lat_1e6;
         uint32_t lon_abs = (pkt->gps_lon_1e6 < 0) ? (uint32_t)(-pkt->gps_lon_1e6) : (uint32_t)pkt->gps_lon_1e6;
+        /* ★2026-07-30：peer 段拿掉 EKF 高度/速度(ph/pv)、丟包率(ploss)、高G(paz)——
+         * 對端狀態一律改看 VF（開傘決策實際採用的估計器），見 telemetry.h peer_vf_h_cm
+         * 註解。EKF/丟包率/高G 仍在板間鏈路本身可查（USB 直連該板的 [LINK] 行）。 */
+        /* ★max/mvel/macc＝火箭端全速率追蹤的滾動極值（見 telemetry.h）。務必印出來——
+         * 下鏈只有約 2Hz，抓不到真正的頂點與峰值 G，這三個數字才是「飛多高/多快/幾 G」
+         * 的唯一可信來源，火箭無法回收時尤其如此。 */
         printf("[GS_PKT] link:%uMHz rssi:%d snr:%d seq:%u fsm:%u alt:%dcm vz:%dcms baro:%dcm bat:%dmV "
-               "vfh:%dcm vfv:%dcms "
-               "gps:%u/%u pos:%c%lu.%06lu,%c%lu.%06lu galt:%dm accel:%d,%d,%d "
-               "peer:%u pflags:0x%02X ph:%dcm pv:%dcms plink:0x%02X ploss:%u "
-               "pbaro:%dcm paz:%d pvfh:%dcm pvfv:%dcms pbarb:%u\r\n",
+               "vfh:%dcm vfv:%dcms max:%um mvel:%dms macc:%ucg dalt:%dm malt:%dm "
+               "gps:%u/%u pos:%c%lu.%06lu,%c%lu.%06lu galt:%dm accel:%d,%d,%d hg:%dcg "
+               "peer:%u pflags:0x%02X plink:0x%02X "
+               "pbaro:%dcm pvfh:%dcm pvfv:%dcms pbarb:%u prof:0x%02X armf:0x%02X\r\n",
                (unsigned)((link == GS_LINK_920) ? 920U : 433U),
                (int)rssi, (int)snr, (unsigned)pkt->seq, (unsigned)pkt->fsm_state,
                (int)pkt->ekf_pos_z_cm, (int)pkt->ekf_vel_z_cms, (int)pkt->baro_alt_cm,
                (unsigned)pkt->bat_mv,
                (int)pkt->vf_pos_z_cm, (int)pkt->vf_vel_z_cms,
+               (unsigned)pkt->max_alt_m, (int)pkt->max_vel_ms, (unsigned)pkt->max_acc_cg,
+               (int)pkt->drogue_alt_m, (int)pkt->main_alt_m,   /* -32768 = 未開傘 */
                (unsigned)pkt->gps_sats, (unsigned)pkt->gps_fix,
                lat_sign, (unsigned long)(lat_abs / 1000000U), (unsigned long)(lat_abs % 1000000U),
                lon_sign, (unsigned long)(lon_abs / 1000000U), (unsigned long)(lon_abs % 1000000U),
                (int)pkt->gps_alt_m,
                (int)pkt->imu_ax_mg, (int)pkt->imu_ay_mg, (int)pkt->imu_az_mg,
+               (int)pkt->hg_mag_cg,
                (unsigned)pkt->peer_fsm_state, (unsigned)pkt->peer_flags,
-               (int)pkt->peer_h_cm, (int)pkt->peer_v_cms,
-               (unsigned)pkt->peer_link, (unsigned)pkt->peer_loss_pmil,
-               (int)pkt->peer_baro_cm, (int)pkt->peer_az_cg,
+               (unsigned)pkt->peer_link,
+               (int)pkt->peer_baro_cm,
                (int)pkt->peer_vf_h_cm, (int)pkt->peer_vf_v_cms,
-               (unsigned)pkt->peer_bench_arb);
+               /* ★2026-07-31 新增 armf：航電開機不再自動擦 flash，池未達標時 ARM 會被擋。
+                * 這一位（TELEM_ARM_NEED_ERASE）讓地面站 GUI 在使用者按 ARM「之前」就能跳
+                * 橫幅提醒先擦除。純字串尾端新增欄位，舊解析器不受影響（封包格式未動，
+                * 不需三板同燒）。 */
+               (unsigned)pkt->peer_bench_arb, (unsigned)pkt->profile_flags,
+               (unsigned)pkt->arm_flags);
     }
 }
 
@@ -430,7 +512,7 @@ static void gs_usb_selftest_loop(void)
         if (alt_m <= 0) { alt_m = 0; dir = 1; }
         tick += 100;
 
-        gs_leds_update(HAL_GetTick(), 0);   /* 自測無實體 GPS：心跳 + 接收活動仍會動 */
+        gs_leds_update(HAL_GetTick());      /* 心跳 + 433/920 接收活動仍會動 */
         HAL_IWDG_Refresh(&hiwdg);
         osDelay(100);   /* 10 Hz */
     }
@@ -637,8 +719,8 @@ void GroundStation_Run(void)
             (void)LoRaE80_StartRx();
         }
 
-        /* 指示燈：心跳 / GPS fix / 接收活動 */
-        gs_leds_update(now_tick, g->fix_valid);
+        /* 指示燈：心跳 / 433 收包 / 920 收包 */
+        gs_leds_update(now_tick);
 
         HAL_IWDG_Refresh(&hiwdg);
         osDelay(GS_POLL_DELAY_MS);

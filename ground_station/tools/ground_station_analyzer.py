@@ -18,9 +18,14 @@ ground_station_analyzer.py — 地面站接收品質與紀錄管線分析工具 
 功能特色：
   1. 【雙鏈路分開統計】：433(E22，開 REG3 bit7 才有 RSSI、無 SNR) /
      920(E80/LR1121，有 RSSI/SNR) 分別計算
-     封包速率、CRC 錯誤率、Resync（雜訊）比例、單鏈路序號丟包率。
-  2. 【合併丟包率】：兩鏈路依 seq+時間相近去重後合併計算，才是地面站「實際到手」的
-     完整度 —— 這才是雙鏈路備援真正該看的指標，比任一單鏈路的丟包率更關鍵。
+     封包速率、平均/最長封包間隔、CRC 錯誤率、Resync（雜訊）比例。
+  2. 【合併封包間隔】：兩鏈路依 seq+時間相近去重後看「地面站兩條鏈路同時斷多久」——
+     這才是雙鏈路備援真正該看的指標，比任一單鏈路的間隔更關鍵。
+     ★2026-07-30：本工具不再計算任何「到達率丟失／丟包率」。那類指標必須先反推
+     「火箭端到底發了幾包」當分母，而 433 的發送機會取決於未實測的空中時間、AUX
+     背壓與上行接收窗相位，分母本身就是猜的，算出來的丟失率不可信（歷次 report
+     的 Union Loss 甚至換算出遠超硬體上限的隱含 tick 頻率）。判定改用只依賴「實際
+     收到什麼」的量測值：有效封包頻率夠不夠、封包間隔會不會出現長空窗。
   3. 【紀錄管線卡頓偵測】：量測連續封包落地間隔，抓出停頓（stall），對應已知的
      Flash erase-ahead 阻塞等紀錄延遲風險。
   4. 【超詳細報告輸出】：ANSI 終端表格、Markdown 報告、JSON 數據、HTML 儀表板。
@@ -80,38 +85,53 @@ DEDUPE_WINDOW_S = 0.6
 # (100ms) 打包一筆並「共用同一個 seq」，920(E80) 每個時槽都發(僅受 BUSY 背壓跳過)。
 # ★2026-07-28（main.c:2633 起註解）：433(E22) 的 AUX 背壓已是真的限流，LORA433_TX_EVERY
 # 已從 3 改回 1（每槽都嘗試發送），實際發送速率改由空中時間自然限流，不再靠時槽除數硬撐。
-# 早期版本 TX_EVERY=3 時若不做 step 正規化，會把合法降速誤判成 90%+ 丟包；TX_EVERY 改 1
-# 後若忘了同步改這裡（曾發生），後果相反且更危險：seq 差 3 才被當作「差 1 步」，
-# calc_tick_loss() 的 expected 因此被除小、lost 貼地板成 0 ——真丟包會被吃成 0% 完全測不出來。
 LORA_TELEM_PERIOD_MS = 100.0
 LORA433_TX_EVERY = 1
 
-# 上行接收窗（main.c UPLINK_LISTEN_EVERY，FEATURE_UPLINK_DEPLOY 開啟時生效，主航電預設開）：
-# 每 10 個 433 時槽固定空出 1 槽不發射，讓地面站上行命令有機會被收到。這個槽仍會讓
-# Telemetry_Build() 的全域 seq 往前走，但 433 這次「不嘗試發送」——地面站收到的 433 seq
-# 因此規律性每 10 筆多墊 1（gap=2 而非 1），是已知設計行為，不是遺失，calc_tick_loss()
-# 需要用 listen_skip_every 把這個規律間隙扣掉，否則會被誤算成 433 專屬的假丟包。
-UPLINK_LISTEN_EVERY = 10
+# 上行接收窗（main.c UPLINK_LISTEN_PERIOD_MS / UPLINK_LISTEN_HOLD_MS，FEATURE_UPLINK_DEPLOY
+# 開啟時生效，主航電預設開）：
+# ★2026-07-30：韌體把這個窗從「每 10 個時槽跳 1 槽」改成「每 3000ms 連續 800ms 完全不發」。
+# 原因見 main.c 註解——時槽只有 100ms，而一包 433 的空中時間 ~390~580ms，跳過 1 個排程
+# 時槽時模組還在把前一包送上空中，空中根本沒有靜默，地面站的 ARM/DEPLOY 永遠打不進來
+# （實測：連送 10 次 ARM 全無 ACK）。窗必須用時間定義且長度 > 一包空中時間才成立。
+# ★★2026-07-30 第二輪：只有「窗內不餵資料」還是不通（實測 LORA433_RX_ONLY=1 就通、
+# 設回 0 就不通，證明 RF 層無罪）。根因是名目窗長 != 真正的靜默長度——listen_slot 只在
+# 迴圈開頭判斷一次，一包在窗開始前一瞬間才起飛的封包會吃掉窗的前半段，800ms 的窗真正
+# 靜默只剩 ~300ms。韌體因此在窗「之前」加了一段發射守衛帶 UPLINK_TX_GUARD_MS，讓在途
+# 封包在窗開始前送完，並把 HOLD 從 800 縮到 400（總不發射時間 800→1000ms）。
+# 對本分析器的意義：433 的規律性 seq 間隙是「每 3000ms 有一段連續 1000ms 完全沒發」
+# ——換算成時槽就是每 30 個 tick 連續 10 個 tick 不發射。
+UPLINK_LISTEN_PERIOD_MS = 3000.0
+UPLINK_LISTEN_HOLD_MS = 400.0
+UPLINK_TX_GUARD_MS = 600.0
+# 不發射總時長（守衛帶 + 窗，兩段在時間軸上相連）佔全部時間的比例：
+# 433 可用發送時間只剩 (1 - 這個比例)。
+UPLINK_LISTEN_QUIET_MS = UPLINK_TX_GUARD_MS + UPLINK_LISTEN_HOLD_MS       # = 1000
+UPLINK_LISTEN_DUTY = UPLINK_LISTEN_QUIET_MS / UPLINK_LISTEN_PERIOD_MS     # = 0.333
+UPLINK_LISTEN_PERIOD_TICKS = round(UPLINK_LISTEN_PERIOD_MS / LORA_TELEM_PERIOD_MS)  # = 30
+UPLINK_LISTEN_HOLD_TICKS = round(UPLINK_LISTEN_QUIET_MS / LORA_TELEM_PERIOD_MS)     # = 10
 
-# 433/E22 實際可達速率不再是「時槽除數」而是空中時間物理上限（見 main.c:2634-2636）：
-# 2400bps、TELEM_PACKET_SIZE=116 bytes → 116*8/2400 ≈ 386.7ms/包 ≈ 2.59 pkt/s，
-# 再扣掉上行接收窗佔用的 1/10 嘗試次數，才是韌體實際會嘗試逼近的速率上限。
-LORA433_AIR_BPS = 2400.0
-LORA433_PACKET_BYTES = 116
-LORA433_AIRTIME_S = LORA433_PACKET_BYTES * 8.0 / LORA433_AIR_BPS
+# 433/E22 實際可達速率不再是「時槽除數」而是空中時間物理上限，但這個空中時間本身
+# ★還沒有實測、只有韌體裡兩份互相矛盾的估計值★：
+#   main.c:2635  ≈386.7ms（116*8bit/2400bps，純位元數/鮑率的天真算法）
+#   lora_e22.c:546 ≈580ms（同一顆模組同一個封包大小，但沒寫算法來源）
+# E22-400T30S 規格書(Datasheets/E22-400T30S_UserManual_EN_v1.8.pdf)證實這顆模組底層
+# 是 LoRa 調變(SX1262)，「air data rate」只是展頻參數的抽象標籤，不是序列埠那種純位元
+# 速率——跟 920(E80/LR1121) 一樣，真實空中時間還要疊加前導碼/表頭等 LoRa 開銷，386.7ms
+# 那個天真算法幾乎必然低估。兩份估計都不可信的情況下，先採用比較保守（考慮了 LoRa 開銷
+# 方向、不是純位元數/鮑率）的 580ms，但這仍然是估計值，不是實測——長遠應該在韌體端
+# 直接量測 AUX 從忙轉閒的實際耗時（例如在 LoRaE22_Send 判定 AUX 轉閒置那一刻打時間戳，
+# 跟上一次成功發送時間戳相減），回填這裡取代猜測值。
+LORA433_AIRTIME_S = 0.580   # ← 估計值，見上方註解；非實測
 NOMINAL_RATE_HZ = {
-    LINK_433: (1.0 / LORA433_AIRTIME_S) * (UPLINK_LISTEN_EVERY - 1) / UPLINK_LISTEN_EVERY,  # ≈2.33 Hz
+    LINK_433: (1.0 / LORA433_AIRTIME_S) * (1.0 - UPLINK_LISTEN_DUTY),  # ≈1.15 Hz(估計)
     LINK_920: 1000.0 / LORA_TELEM_PERIOD_MS,                        # 10 Hz（受空中時間/BUSY 影響）
 }
 
-# ★2026-07-28：SEQ_STEP 曾誤設成 LORA433_TX_EVERY(=1)——那只代表韌體「每個 tick 都會
-# 嘗試呼叫」LoRaE22_Send()，不代表每個 tick 都真的送得出去。LoRaE22_Send() 遇到 AUX
-# busy（上一包還在空中）會直接跳過、不等待，所以 433 兩次成功發射之間最少要隔
-# ceil(空中時間/tick週期) 個 tick——這才是「單鏈路 RF 到達率丟失」該拿來當基準的
-# 物理下限，不是排程嘗試頻率。用 LORA433_TX_EVERY(=1) 當 step 等於拿「每 tick 都該
-# 收到」這個不可能達到的標準去算丟失率，即使訊號完美無雜訊也會算出巨大假丟包。
-LORA433_MIN_TX_SPACING_TICKS = math.ceil(LORA433_AIRTIME_S / (LORA_TELEM_PERIOD_MS / 1000.0))  # = 4
-SEQ_STEP = {LINK_433: LORA433_MIN_TX_SPACING_TICKS, LINK_920: 1}
+# 433 兩次成功發射之間的物理下限：LoRaE22_Send() 遇到 AUX busy（上一包還在空中）會直接
+# 跳過、不等待，所以最少要隔 ceil(空中時間/tick週期) 個 tick。★這只用於 --selftest 模擬
+# 資料的產生（讓假資料長得像真排程），不再拿來當任何判定指標的分母——見檔頭說明。
+LORA433_MIN_TX_SPACING_TICKS = math.ceil(LORA433_AIRTIME_S / (LORA_TELEM_PERIOD_MS / 1000.0))  # = 6(估計)
 
 # ===========================================================================
 #  即時 Console 逐行規則 (與 ground_station.c / gs_lora_test.c printf 格式同步)
@@ -151,15 +171,24 @@ SPEC_LIMITS = {
     # Resync 比例（433 才有 raw byte 計數，920 只有 rsync 計數無 raw）：
     # rsync/(ok+crc+rsync)。偏高代表「同步位元組頻繁對不上」= 空中雜訊/速率不符為主因。
     "resync_max_ratio": 0.15,
-    # 單鏈路 seq 丟包率：允許比合併值寬鬆，因為單鏈路失手本就可能被另一鏈路補上。
-    "single_link_loss_max_ratio": 0.10,
-    # 總通訊頻率(含 CRC 無效)相對韌體排定速率(NOMINAL_RATE_HZ)的比例門檻：低於此比例代表
-    # RF 前端可能根本沒同步到訊號(而非單純解碼品質問題)。
+    # 通訊頻率相對韌體排定速率(NOMINAL_RATE_HZ)的比例門檻：低於此比例代表
+    # RF 前端可能根本沒同步到訊號(而非單純解碼品質問題)。有效頻率(CRC 正確)與
+    # 總頻率(含 CRC 無效)共用這組比例——前者是「資料真的到手」的 GO/NO-GO，
+    # 後者用來分辨「沒收到訊號」還是「收到但解不出來」。
     "total_rate_warn_ratio": 0.60,
     "total_rate_fail_ratio": 0.30,
-    # 合併(兩鏈路去重後)丟包率：地面站「實際到手」的完整度，是本工具最重要的
-    # GO/NO-GO 指標——即使某一鏈路整個掛掉，只要另一鏈路頂住，這裡就該還在低位。
-    "combined_loss_max_ratio": 0.05,
+    # 封包間隔（gap）門檻：★取代舊的「到達率丟失」，只看實際收到的封包之間隔了多久，
+    # 不需要反推火箭端發了幾包（那個分母是猜的，見檔頭說明）。
+    #   平均間隔 = 頻率的倒數，用同一組比例換算成倍率（1/0.6≈1.67、1/0.3≈3.33）。
+    #   最長空窗 = 連續斷訊的最壞情況，比平均值更能反映「飛行中會不會突然失聯一段」。
+    # 倍率以各鏈路名目間隔(1/NOMINAL_RATE_HZ)為基準，並套一個絕對下限避免 920 名目
+    # 間隔只有 100ms 時把正常抖動誤判成空窗。
+    "gap_mean_warn_mult": 1.67,
+    "gap_mean_fail_mult": 3.33,
+    "gap_max_warn_mult": 4.0,
+    "gap_max_fail_mult": 8.0,
+    "gap_max_warn_floor_ms": 1000.0,
+    "gap_max_fail_floor_ms": 2000.0,
     # SX126x/LR1121 (920) 常見「可靠接收」門檻，非晶片絕對靈敏度極限（SF/BW視設定
     # 靈敏度可到 -130dBm 以下，但留餘裕才穩）。
     "rssi_warn_dbm": -110.0,
@@ -192,84 +221,6 @@ class StatMetrics:
         self.p2p = self.max_val - self.min_val
 
 
-def unwrap_seq_sequential(ordered_seqs: list) -> list:
-    """把 uint8 seq（每 256 就繞回）依「已確定為真實傳送順序」的序列展開成連續遞增值，
-    純粹用相鄰兩筆的 mod 256 差值累加，完全不依賴 wall-clock 時間。
-
-    用在單鏈路檢查：同一鏈路收到的封包，印出順序本來就等於真實傳送順序（韌體單執行緒
-    同步解碼＋printf，不會有重排），所以直接從「起始 seq」往後累加「中間掉了幾個」即可，
-    不需要引入時間反推 tick——這樣量測結果完全不受序列埠讀取的時序/緩衝延遲影響
-    （即使 [ground_station_analyzer.py](serial timeout) 這類 host 端計時源不準也沒差）。
-
-    ⚠ 限制：若同一鏈路真的連續靜默超過 128 個 tick(~12.8s)，mod 256 差值會把這段
-    空窗誤讀成一個較小的正常間隔（aliasing）。一般 RF 短暫失聯不會斷這麼久，可接受；
-    真的要防這個，才需要另外引入時間輔助（見 unwrap_seq_to_ticks）。"""
-    if not ordered_seqs:
-        return []
-    out = [ordered_seqs[0]]
-    for i in range(1, len(ordered_seqs)):
-        gap = (ordered_seqs[i] - ordered_seqs[i - 1]) % 256
-        out.append(out[-1] + gap)
-    return out
-
-
-def unwrap_seq_to_ticks(events: list, period_s: float, t0: float) -> list:
-    """把 uint8 seq（每 256 就繞回）依已知的固定全域 tick 週期(period_s，即
-    LORA_TELEM_PERIOD_MS/1000，兩鏈路共用同一個 100ms tick 計數器)展開成連續遞增的
-    整數 tick 值，不依賴事件的到達順序——只有「合併雙鏈路」時才需要這個版本。
-
-    ★2026-07-28 修正根因：舊版 calc_seq_loss() 是把事件按「到達時間」排序後，逐一算
-    (seq[i]-seq[i-1]) % 256——這個算法隱含假設「按到達時間排序後 seq 必然遞增」。但
-    433 單包空中時間(~387ms)遠長於 920(~87ms)，合併雙鏈路去重排序時只要有一次 433
-    包比 920 晚到、把一個「seq 較小」的事件排在「seq 較大」事件後面，這個正常的時間
-    序倒置就會被 mod 256 誤讀成「seq 跳了將近 256」，單一次誤判就能把 expected 炸到
-    脫離物理上限（見四次實測 report：Union Loss 換算出的隱含 tick 頻率高達 ~270~370Hz，
-    遠超火箭端 10Hz 設計上限）。改用「已知週期反推最接近的 tick」展開，只要 t0 附近
-    時鐘誤差遠小於半個 256-tick 週期(~12.8s)，就與事件到達順序完全無關，不會再被
-    偶發的跨鏈路延遲差污染。★單鏈路檢查不會有這個跨鏈路重排問題，改用不依賴時間的
-    unwrap_seq_sequential()。"""
-    out = []
-    for e in events:
-        est_tick = (e["t"] - t0) / period_s
-        k = round((est_tick - e["seq"]) / 256.0)
-        out.append(e["seq"] + 256 * k)
-    return out
-
-
-def calc_tick_loss(unwrapped_ticks: list, step: int = 1, listen_skip_every: int = None) -> dict:
-    """依展開後的全域 tick 值算丟包率。涵蓋範圍 [lo, hi] 內：
-
-    1. 先扣掉上行接收窗（listen_skip_every）佔用的 tick——這是「全域 tick」上固定
-       相位的已知排程(main.c listen_slot 判斷式 tick % N == N-1)，逐一列舉是精確值，
-       不是近似值。
-    2. step=1（如 920，每個 tick 都是確定的發送機會）：剩下每個 tick 都直接跟實收
-       集合比對，等同逐一核對每一筆 seq 是否出現——集合運算，不是統計反推。
-    3. step>1（如 433，受空中時間物理限制，兩次成功發射間至少要隔 step 個 tick）：
-       實際成功發射的相位並不固定在 lo, lo+step, lo+2*step,...（取決於 AUX 何時轉
-       閒置，不是固定週期排程），不能假設固定相位逐一列舉，改用「可用機會 tick 數
-       / 最小間隔」估計此範圍內最多能塞進幾次成功發射，這是密度上限，非精確逐筆核對。
-
-    不受事件排列順序影響，天生免疫 unwrap_seq_to_ticks() 註解描述的跨鏈路時間序
-    倒置問題。"""
-    if not unwrapped_ticks:
-        return {"expected": 0.0, "lost": 0.0, "ratio": 0.0}
-    distinct = set(unwrapped_ticks)
-    lo, hi = min(distinct), max(distinct)
-    total_ticks = hi - lo + 1
-
-    if listen_skip_every:
-        listen_ticks = sum(1 for g in range(lo, hi + 1) if g % listen_skip_every == listen_skip_every - 1)
-    else:
-        listen_ticks = 0
-    opportunity_ticks = total_ticks - listen_ticks
-
-    expected = float(opportunity_ticks) if step <= 1 else opportunity_ticks / float(step)
-    received = float(len(distinct))
-    lost = max(expected - received, 0.0)
-    ratio = (lost / expected) if expected > 0 else 0.0
-    return {"expected": expected, "lost": lost, "ratio": ratio}
-
-
 def merge_dedupe_events(events: list) -> list:
     """合併兩鏈路事件（按時間排序後），同 seq 且到達時間差 < DEDUPE_WINDOW_S 視為
     同一次火箭傳送被兩鏈路都收到，僅保留先到的一筆。"""
@@ -282,8 +233,31 @@ def merge_dedupe_events(events: list) -> list:
     return merged
 
 
+def gap_limits(nominal_rate_hz: float) -> dict:
+    """由名目速率換算該鏈路的封包間隔（gap）判定門檻（ms）。
+
+    ★2026-07-30：本工具改用 gap 取代舊的「到達率丟失」。差別在於分母：丟失率要先假設
+    「火箭端在這段時間內本來該發幾包」，而 433 的發送機會取決於未實測的空中時間、AUX
+    背壓與上行接收窗相位——分母是猜的，算出來的百分比自然不可信。gap 只用「實際收到的
+    兩包之間隔了多久」這個直接量測值，不需要任何關於發射端排程的假設；名目速率在這裡
+    僅用來決定門檻寬鬆度（門檻本來就是啟發式的），不進入量測值本身。
+
+    最長空窗另外套絕對下限：920 名目間隔只有 100ms，光是 4 倍(400ms)會把正常的排程抖動
+    /單包空中時間誤判成空窗，實務上「短暫失聯」至少要到秒級才有意義。"""
+    nominal_gap_ms = (1000.0 / nominal_rate_hz) if nominal_rate_hz > 0 else 0.0
+    return {
+        "nominal_gap_ms": nominal_gap_ms,
+        "mean_warn_ms": nominal_gap_ms * SPEC_LIMITS["gap_mean_warn_mult"],
+        "mean_fail_ms": nominal_gap_ms * SPEC_LIMITS["gap_mean_fail_mult"],
+        "max_warn_ms": max(nominal_gap_ms * SPEC_LIMITS["gap_max_warn_mult"],
+                           SPEC_LIMITS["gap_max_warn_floor_ms"]),
+        "max_fail_ms": max(nominal_gap_ms * SPEC_LIMITS["gap_max_fail_mult"],
+                           SPEC_LIMITS["gap_max_fail_floor_ms"]),
+    }
+
+
 def gap_stats(times: list, warn_ms: float, fail_ms: float) -> dict:
-    """連續事件時間戳的間隔統計（ms），用來偵測紀錄管線停頓。"""
+    """連續事件時間戳的間隔統計（ms），用來偵測紀錄管線停頓與鏈路空窗。"""
     if len(times) < 2:
         return {"count": 0, "mean_ms": 0.0, "max_ms": 0.0, "stall_count": 0, "stall_ratio": 0.0}
     gaps_ms = [(times[i] - times[i - 1]) * 1000.0 for i in range(1, len(times))]
@@ -452,6 +426,244 @@ def load_gs_log_csv(path: str) -> list:
 
 
 # ===========================================================================
+#  轉播飛行數據：圖表 + GPS 地圖（讀「地面站實際收到」的內容，與 flash_analyzer.py
+#  讀「火箭自己 Flash Ring 存的完整內容」互補——雙鏈路丟包會讓兩者有落差，這正是
+#  地面站備援想觀察的東西）。與 load_gs_log_csv() 不同：後者只留鏈路品質欄位供
+#  seq/gap 統計；這裡留飛行物理量 + 雙板 peer 摘要 + 兩端 GPS 全量。
+# ===========================================================================
+def load_relay_flight_csv(csv_path: str) -> list:
+    """解析地面站 Flash/SD CSV（gs_log.c GsLog_CsvHeader 格式）為轉播飛行事件 list。
+    每筆同時附上兩種時間基準，不在此處依時間篩掉任何列——是否需要有效 UTC 由呼叫端
+    （畫圖表 vs 畫地圖）各自決定：
+      t_utc      —— 地面站 GPS 校時後的當日 UTC 秒數；地面站當下還沒 GPS lock 時該筆是 None
+                     （rx_utc_ms==0，見 gs_timesync.h GsTimeSync_GroundUtcMs：未拿到 UTC 錨點
+                     前一律回傳 0）。
+      t_fallback —— rkt_tick_ms + offset_ms（火箭開機相對時間，經地面本機 tick 偏移量 EMA
+                     修正），兩欄皆不依賴地面站 GPS，任何一筆都有效；供整段 session 都沒
+                     GPS lock 時，圖表時間軸的備援基準（見 generate_relay_flight_chart）。
+    地圖（generate_relay_gps_map）只看 gps_fix/gs_fix，不需要時間，因此完全不受兩者影響。"""
+    events = []
+    day_offset_ms = 0
+    prev_raw_ms = None
+    with open(csv_path, "r", encoding="utf-8", errors="ignore", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                raw_ms = int(row["rx_utc_ms"])
+                rkt_tick_ms = int(row["rkt_tick_ms"])
+                offset_ms = int(row["offset_ms"])
+                t_utc = None
+                if raw_ms != 0:
+                    if prev_raw_ms is not None and raw_ms < prev_raw_ms - 43200000:
+                        day_offset_ms += 86400000
+                    prev_raw_ms = raw_ms
+                    t_utc = (raw_ms + day_offset_ms) / 1000.0
+
+                events.append({
+                    "t_utc": t_utc,
+                    "t_fallback": (rkt_tick_ms + offset_ms) / 1000.0,
+                    "link_mhz": int(row["link_mhz"]),
+                    "rssi_dbm": int(row["rssi_dbm"]),
+                    "snr_cb": int(row["snr_cb"]),
+                    "seq": int(row["seq"]),
+                    "fsm_state": int(row["fsm_state"]),
+                    "ekf_alt_m": int(row["ekf_alt_cm"]) / 100.0,
+                    "ekf_vel_ms": int(row["ekf_vel_cms"]) / 100.0,
+                    "baro_alt_m": int(row["baro_alt_cm"]) / 100.0,
+                    "vf_alt_m": int(row["vf_alt_cm"]) / 100.0,
+                    "vf_vel_ms": int(row["vf_vel_cms"]) / 100.0,
+                    "gps_lat": int(row["gps_lat_1e6"]) / 1e6,
+                    "gps_lon": int(row["gps_lon_1e6"]) / 1e6,
+                    "gps_alt_m": int(row["gps_alt_m"]),
+                    "gps_sats": int(row["gps_sats"]),
+                    "gps_fix": int(row["gps_fix"]),
+                    "bat_mv": int(row["bat_mv"]),
+                    "peer_fsm": int(row["peer_fsm"]),
+                    # ★2026-07-30：下鏈的對端摘要只剩 VF（EKF 高度/速度、丟包率已從封包移除）
+                    "peer_vf_h_m": int(row["peer_vf_h_cm"]) / 100.0,
+                    "peer_vf_v_ms": int(row["peer_vf_v_cms"]) / 100.0,
+                    # ★飛行滾動極值：火箭端全速率追蹤、每包重複攜帶（見 telemetry.h）。
+                    # 下鏈只有 ~2Hz，抓不到真正的頂點與峰值 G，這三個才是可信數字。
+                    # 用 .get 容忍舊 CSV——直接 row["max_alt_m"] 會在舊檔上 KeyError，
+                    # 而外層 except 是 continue，等於「整份舊紀錄一列都讀不進來」。
+                    "max_alt_m": int(row.get("max_alt_m") or 0),
+                    "max_vel_ms": int(row.get("max_vel_ms") or 0),
+                    "max_acc_g": int(row.get("max_acc_cg") or 0) / 100.0,
+                    # 開傘高度；-32768 = 未開傘哨兵（telemetry.h TELEM_DEPLOY_ALT_NA）
+                    "drogue_alt_m": int(row.get("drogue_alt_m") or -32768),
+                    "main_alt_m": int(row.get("main_alt_m") or -32768),
+                    "gs_lat": int(row["gs_lat_1e6"]) / 1e6,
+                    "gs_lon": int(row["gs_lon_1e6"]) / 1e6,
+                    "gs_alt_m": int(row["gs_alt_m"]),
+                    "gs_fix": int(row["gs_fix"]),
+                })
+            except (KeyError, ValueError):
+                continue
+    return events
+
+
+def generate_relay_flight_chart(csv_path: str, output_dir="."):
+    """2x2 轉播飛行分析圖：高度（主 EKF/Baro + 副航電 peer）、垂直速度（主/副）、
+    雙鏈路 RSSI/SNR（依實際收到的時刻描點，看得出丟包造成的資料空隙）、電池電壓。"""
+    if not HAS_MATPLOTLIB:
+        print("[RELAY] 未安裝 matplotlib，略過轉播飛行圖表")
+        return None
+    all_events = load_relay_flight_csv(csv_path)
+    if not all_events:
+        print("[RELAY] CSV 內未解析到有效轉播飛行數據，略過圖表")
+        return None
+
+    # 只要 session 中有任何一筆拿到過地面站 GPS UTC 錨點，就整段用 t_utc（丟掉沒錨點前的
+    # 少數幾筆即可，不影響絕對牆鐘時間軸的意義）；若整段 session 地面站 GPS 全程沒 lock
+    # （室內/長凳測試常見），t_utc 全部是 None，改用不依賴地面 GPS 的 t_fallback（火箭
+    # tick+鏈路偏移量重建的相對時間），圖表照樣畫得出來，只是不能拿來對絕對時刻。
+    use_fallback_time = not any(e["t_utc"] is not None for e in all_events)
+    if use_fallback_time:
+        print("[RELAY] 本次匯出全程無地面站 GPS UTC 校時錨點，圖表時間軸改用「火箭 tick + 鏈路偏移量」重建的相對時間")
+        events = sorted(all_events, key=lambda e: e["t_fallback"])
+        for e in events:
+            e["t"] = e["t_fallback"]
+    else:
+        events = [e for e in all_events if e["t_utc"] is not None]
+        for e in events:
+            e["t"] = e["t_utc"]
+        events.sort(key=lambda r: r["t"])
+
+    t0 = events[0]["t"]
+    times = [e["t"] - t0 for e in events]
+
+    fig, axs = plt.subplots(2, 2, figsize=(16, 10), dpi=140, facecolor="#101010")
+    title = "RocketCom Ground-Relayed Flight Data"
+    if use_fallback_time:
+        title += "  (Relative Time — No GPS UTC Lock)"
+    fig.suptitle(title, fontsize=16, fontweight="bold", color="#00e676")
+    for ax in axs.flat:
+        ax.set_facecolor("#161616")
+        for spine in ax.spines.values():
+            spine.set_color("#444")
+        ax.tick_params(colors="#ccc")
+        ax.xaxis.label.set_color("#ccc"); ax.yaxis.label.set_color("#ccc")
+
+    ax1 = axs[0, 0]
+    ax1.plot(times, [e["ekf_alt_m"] for e in events], label="Primary EKF Alt", color="#00e676", linewidth=1.8)
+    ax1.plot(times, [e["baro_alt_m"] for e in events], label="Primary Baro Alt", color="#ff9f43",
+             linestyle="--", linewidth=1.1, alpha=0.8)
+    ax1.plot(times, [e["peer_vf_h_m"] for e in events], label="Backup VF Alt (peer)", color="#38bdf8",
+             linestyle=":", linewidth=1.3)
+    # 火箭端全速率追蹤的最大高度（階梯線）：下鏈 ~2Hz 的取樣點永遠低估真正頂點，
+    # 這條線的最終高度才是可信的 apogee。與上面的取樣曲線同屏對照。
+    if any(e["max_alt_m"] for e in events):
+        ax1.plot(times, [e["max_alt_m"] for e in events], label="MAX Alt (rocket-tracked)",
+                 color="#e879f9", linewidth=1.4, drawstyle="steps-post", alpha=0.9)
+    # 實際開傘高度（火箭端在開傘那一刻就地鎖存，非事後從稀疏取樣反推）
+    for key, colour, lbl in (("drogue_alt_m", "#f43f5e", "Drogue deploy"),
+                             ("main_alt_m", "#22d3ee", "Main deploy")):
+        vals = [e[key] for e in events if e[key] != -32768]
+        if vals:
+            ax1.axhline(vals[-1], color=colour, linewidth=1.0, linestyle="-.",
+                        alpha=0.85, label=f"{lbl} @ {vals[-1]}m")
+    ax1.set_title("Altitude (as relayed to ground)", color="#00e676")
+    ax1.set_xlabel("Time (s)"); ax1.set_ylabel("Altitude (m)")
+    ax1.grid(True, linestyle=":", alpha=0.25); ax1.legend(fontsize=8, facecolor="#161616", labelcolor="#ddd")
+
+    ax2 = axs[0, 1]
+    ax2.plot(times, [e["ekf_vel_ms"] for e in events], label="Primary Vz", color="#38ef7d", linewidth=1.6)
+    ax2.plot(times, [e["peer_vf_v_ms"] for e in events], label="Backup VF Vz (peer)", color="#fbbf24",
+             linestyle=":", linewidth=1.3)
+    if any(e["max_vel_ms"] for e in events):
+        ax2.plot(times, [e["max_vel_ms"] for e in events], label="MAX Vz (rocket-tracked)",
+                 color="#e879f9", linewidth=1.4, drawstyle="steps-post", alpha=0.9)
+    ax2.axhline(0, color="#888", linewidth=0.7, linestyle=":")
+    ax2.set_title("Vertical Velocity", color="#38ef7d")
+    ax2.set_xlabel("Time (s)"); ax2.set_ylabel("Velocity (m/s)")
+    ax2.grid(True, linestyle=":", alpha=0.25); ax2.legend(fontsize=8, facecolor="#161616", labelcolor="#ddd")
+
+    ax3 = axs[1, 0]
+    ax3t = ax3.twinx(); ax3t.tick_params(colors="#ccc")
+    l433 = [(t, e["rssi_dbm"]) for t, e in zip(times, events) if e["link_mhz"] == 433 and e["rssi_dbm"] != -32768]
+    l920 = [(t, e["rssi_dbm"]) for t, e in zip(times, events) if e["link_mhz"] == 920]
+    s920 = [(t, e["snr_cb"] / 4.0) for t, e in zip(times, events) if e["link_mhz"] == 920 and e["snr_cb"] != -32768]
+    handles = []
+    if l433:
+        handles += ax3.plot(*zip(*l433), '.', label="433 RSSI", color="#ff7675", markersize=3, alpha=0.6)
+    if l920:
+        handles += ax3.plot(*zip(*l920), '.', label="920 RSSI", color="#74b9ff", markersize=3, alpha=0.6)
+    if s920:
+        handles += ax3t.plot(*zip(*s920), '.', label="920 SNR", color="#ffeaa7", markersize=3, alpha=0.5)
+    ax3.set_title("Link Quality (as received)", color="#74b9ff")
+    ax3.set_xlabel("Time (s)"); ax3.set_ylabel("RSSI (dBm)"); ax3t.set_ylabel("SNR (dB)", color="#ccc")
+    ax3.grid(True, linestyle=":", alpha=0.25)
+    if handles:
+        ax3.legend(handles, [h.get_label() for h in handles], fontsize=8, facecolor="#161616", labelcolor="#ddd")
+
+    ax4 = axs[1, 1]
+    ax4.plot(times, [e["bat_mv"] / 1000.0 for e in events], color="#f1c40f", linewidth=1.6, label="Primary Battery (V)")
+    ax4.axhline(7.0, color="#e74c3c", linewidth=0.8, linestyle=":", alpha=0.7)
+    ax4.set_title("Battery Voltage (relayed)", color="#f1c40f")
+    ax4.set_xlabel("Time (s)"); ax4.set_ylabel("Voltage (V)")
+    ax4.grid(True, linestyle=":", alpha=0.25); ax4.legend(fontsize=8, facecolor="#161616", labelcolor="#ddd")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    chart_path = os.path.join(output_dir, f"ground_relay_analysis_{ts_str}.png")
+    plt.savefig(chart_path, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"[RELAY] 已生成轉播飛行分析圖: {chart_path}")
+    return chart_path
+
+
+def generate_relay_gps_map(csv_path: str, output_dir="."):
+    """互動式 GPS 地圖（folium）：火箭轉播的 GPS 航跡 + 地面站自身定位（固定點）。
+    無 folium 或雙方皆無有效定位點時安全略過（回傳 None）。只看 gps_fix/gs_fix，不碰
+    load_relay_flight_csv() 回傳的 t_utc/t_fallback——地面站自己有沒有 GPS UTC 校時錨點
+    跟「這筆封包裡的火箭/地面站定位點準不準」無關，不該互相拖累。"""
+    try:
+        import folium
+    except ImportError:
+        print("[RELAY] 未安裝 folium，略過轉播 GPS 地圖（pip install folium）")
+        return None
+
+    events = load_relay_flight_csv(csv_path)
+    rocket_pts = [e for e in events if e["gps_fix"] == 1 and abs(e["gps_lat"]) > 0.01]
+    gs_pts = [e for e in events if e["gs_fix"] == 1 and abs(e["gs_lat"]) > 0.01]
+    if not rocket_pts and not gs_pts:
+        print("[RELAY] CSV 內無有效 GPS 定位點（火箭與地面站皆無），略過地圖")
+        return None
+
+    center = [rocket_pts[0]["gps_lat"], rocket_pts[0]["gps_lon"]] if rocket_pts \
+        else [gs_pts[0]["gs_lat"], gs_pts[0]["gs_lon"]]
+    fmap = folium.Map(location=center, zoom_start=15, tiles="CartoDB dark_matter")
+    folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(fmap)
+
+    if len(rocket_pts) >= 2:
+        pts = [(e["gps_lat"], e["gps_lon"]) for e in rocket_pts]
+        folium.PolyLine(pts, color="#00e676", weight=4, opacity=0.85,
+                        tooltip="Rocket GPS track (as relayed to ground)").add_to(fmap)
+        folium.Marker(pts[0], tooltip="First relayed fix",
+                      icon=folium.Icon(color="green", icon="rocket", prefix="fa")).add_to(fmap)
+        folium.Marker(pts[-1], tooltip="Last relayed fix",
+                      icon=folium.Icon(color="red", icon="flag-checkered", prefix="fa")).add_to(fmap)
+
+    if gs_pts:
+        gs_lat = sum(e["gs_lat"] for e in gs_pts) / len(gs_pts)
+        gs_lon = sum(e["gs_lon"] for e in gs_pts) / len(gs_pts)
+        folium.Marker([gs_lat, gs_lon], tooltip="Ground Station",
+                      icon=folium.Icon(color="blue", icon="wifi", prefix="fa")).add_to(fmap)
+
+    folium.LayerControl().add_to(fmap)
+    all_lats = [e["gps_lat"] for e in rocket_pts] + [e["gs_lat"] for e in gs_pts]
+    all_lons = [e["gps_lon"] for e in rocket_pts] + [e["gs_lon"] for e in gs_pts]
+    if len(all_lats) >= 2:
+        fmap.fit_bounds([[min(all_lats), min(all_lons)], [max(all_lats), max(all_lons)]])
+
+    ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    map_path = os.path.join(output_dir, f"ground_relay_map_{ts_str}.html")
+    fmap.save(map_path)
+    print(f"[RELAY] 已生成轉播 GPS 地圖: {map_path}")
+    return map_path
+
+
+# ===========================================================================
 #  分析引擎
 # ===========================================================================
 class GsAnalyzerEngine:
@@ -493,7 +705,10 @@ class GsAnalyzerEngine:
                     pass  # gs GPS 由 analyze() 直接掃 pkt_events 算（CSV 模式每列都帶）
 
     # -----------------------------------------------------------------
-    def analyze(self, csv_mode=False) -> dict:
+    def analyze(self, csv_mode=False, synth_time=False) -> dict:
+        # synth_time=True（--file 純文字 log 模式）：時間戳是按行號合成的，不是真實到達
+        # 時間。所有以「時間間隔」為量測值的項目（gap / 紀錄管線停頓）在這個模式下沒有
+        # 物理意義，因此照算照印、但一律不判 WARN/FAIL，避免假 PASS 被當成鏈路健康。
         pkt_events, crc_bad_events, gs_stats, diag = self.snapshot()
         n = len(pkt_events)
         if n < 3:
@@ -539,14 +754,24 @@ class GsAnalyzerEngine:
                 rate_hz = (ok_count / span_s) if span_s > 0 else 0.0
                 rate_src = "本次擷取樣本(較不準)"
 
-            add_check(name, "有效通訊頻率 (CRC 正確)", rate_hz, 0.0, "pkt/s", ">",
-                      ok_count == 0, rate_hz <= 0.0 and ok_count > 0,
-                      f"{rate_src}；本次擷取到 {ok_count} 筆有效封包 / {bad_count} 筆 CRC 錯誤")
+            # ★這一項現在是本工具對該鏈路的主要 GO/NO-GO：不問「漏了幾包」（那需要猜
+            # 火箭端發了幾包），只問「有效封包進來的頻率夠不夠用」。門檻取韌體排定速率
+            # 的比例，與下面總頻率共用同一組比例。433 的排定速率含估計成分（見
+            # LORA433_AIRTIME_S），所以貼著門檻時要一併看 CRC 錯誤率再下結論。
+            nominal = NOMINAL_RATE_HZ[link]
+            add_check(name, "有效通訊頻率 (CRC 正確)", rate_hz,
+                      nominal * SPEC_LIMITS["total_rate_warn_ratio"], "pkt/s", ">=",
+                      ok_count == 0 or rate_hz < nominal * SPEC_LIMITS["total_rate_fail_ratio"],
+                      rate_hz < nominal * SPEC_LIMITS["total_rate_warn_ratio"],
+                      f"{rate_src}；本次擷取到 {ok_count} 筆有效封包 / {bad_count} 筆 CRC 錯誤"
+                      f"（排定速率≈{nominal:.2f}Hz，WARN<{SPEC_LIMITS['total_rate_warn_ratio']*100:.0f}%、"
+                      f"FAIL<{SPEC_LIMITS['total_rate_fail_ratio']*100:.0f}%）")
 
             # --- 總通訊頻率（含 CRC 無效）：只要有觸發同步/CRC 檢查就算「有通訊」，不論解碼
             # 是否成功。跟韌體設計排程(見 NOMINAL_RATE_HZ：920≈10Hz，433≈空中時間上限扣上行窗
-            # 後≈2.33Hz)比較，能分辨「RF 前端根本沒收到東西」(總頻率遠低於排定值) 跟「有收到
-            # 但解不出來」(總頻率接近排定值、但有效頻率偏低，即 CRC 錯誤率高) 這兩種完全不同的問題。
+            # 後≈1.55Hz，其中 433 這個空中時間本身是估計值、非實測，見 LORA433_AIRTIME_S 註解)
+            # 比較，能分辨「RF 前端根本沒收到東西」(總頻率遠低於排定值) 跟「有收到但解不出來」
+            # (總頻率接近排定值、但有效頻率偏低，即 CRC 錯誤率高) 這兩種完全不同的問題。
             if len(gs_stats) >= 2:
                 d_total = (gs_stats[-1][ok_key] + gs_stats[-1][crc_key]) - (gs_stats[0][ok_key] + gs_stats[0][crc_key])
                 d_t = gs_stats[-1]["t"] - gs_stats[0]["t"]
@@ -558,14 +783,16 @@ class GsAnalyzerEngine:
             else:
                 total_rate_hz = (ok_count + bad_count) / span_s if span_s > 0 else 0.0
                 total_src = "本次擷取樣本(較不準)"
-            nominal = NOMINAL_RATE_HZ[link]
             add_check(name, "總通訊頻率 (含 CRC 無效)", total_rate_hz, nominal, "pkt/s",
                       ">=", total_rate_hz < nominal * SPEC_LIMITS["total_rate_fail_ratio"],
                       total_rate_hz < nominal * SPEC_LIMITS["total_rate_warn_ratio"],
                       f"{total_src}；韌體排定速率≈{nominal:.2f}Hz（920 見 main.c "
-                      f"LORA_TELEM_PERIOD_MS；433 為空中時間物理上限(2400bps/116B)"
-                      f"扣掉 UPLINK_LISTEN_EVERY 上行接收窗後的值）。遠低於排定值代表 "
-                      f"RF 前端可能根本沒收到訊號，而非單純解碼品質問題")
+                      f"LORA_TELEM_PERIOD_MS；433 為空中時間物理上限扣掉上行接收窗"
+                      f"（每 {UPLINK_LISTEN_PERIOD_MS:.0f}ms 靜默 {UPLINK_LISTEN_HOLD_MS:.0f}ms）"
+                      f"後的值，★空中時間本身是估計值(580ms)非實測，見 "
+                      f"LORA433_AIRTIME_S 註解）。遠低於排定值代表 RF 前端可能根本沒收到訊號，"
+                      f"而非單純解碼品質問題——但若持續卡在排定值邊緣，也可能是這個估計值"
+                      f"本身偏樂觀，非真的異常")
 
             # --- CRC 錯誤率：優先用 [GS_STAT] 累計計數（跨整個連線期間，較不受擷取窗切點影響）
             if len(gs_stats) >= 1:
@@ -598,39 +825,41 @@ class GsAnalyzerEngine:
                 add_check(name, "Resync 比例 (雜訊指標)", 0.0, SPEC_LIMITS["resync_max_ratio"] * 100.0, "%",
                           "<=", False, False, "未見到 [GS_STAT] 行（純 CSV 離線分析無此資料）")
 
-            # --- 單鏈路 RF 到達率丟失：CRC 錯誤的封包仍證明「這個排定時槽有訊號進來」，
-            # 只是解不出來，不該跟「完全沒收到」混為一談——併入 any_rx 才能單獨反映真正
-            # 沒收到訊號的比例，跟上面的 CRC 錯誤率(解碼品質)分開看。433 額外扣掉
-            # UPLINK_LISTEN_EVERY 上行接收窗造成的規律性 seq 間隙(設計行為，不是丟包)。
-            # ★同一鏈路收到的順序就是真實傳送順序(韌體單執行緒同步解碼+印出，不會重排)，
-            # 直接用 seq 本身累加展開即可，不需要靠 wall-clock 時間反推(那是合併雙鏈路
-            # 才需要的做法，見 unwrap_seq_to_ticks 註解)。
-            any_rx = sorted(evs + bad_evs, key=lambda e: e["t"])
-            listen_skip = UPLINK_LISTEN_EVERY if link == LINK_433 else None
-            if len(any_rx) >= 2:
-                ticks = unwrap_seq_sequential([e["seq"] for e in any_rx])
-                loss = calc_tick_loss(ticks, step=SEQ_STEP[link], listen_skip_every=listen_skip)
-                step_note = (f"每{SEQ_STEP[link]}tick最多1次成功發射(空中時間限制)"
-                             if SEQ_STEP[link] > 1 else "step=1，每tick都是機會")
-                # ★這裡量到的「遺失」只代表「地面站沒收到」，成因可能是 RF 真的沒收到，
-                # 也可能是航電端自己卡住/排隊延遲(如 SPI3 mutex 跟 Flash 記錄搶用、任務
-                # 排程被高優先仼務搶佔)導致實際發射間隔比 step 假設的物理下限還長——單靠
-                # 地面站封包無法分辨這兩種成因，需要對照航電板自己的 [LORA_TX_LOG]
-                # (main.c，ok/try 計數，每 25 槽印一次)才能確認是哪一種。
-                add_check(name, "單鏈路 RF 到達率丟失", loss["ratio"] * 100.0,
-                          SPEC_LIMITS["single_link_loss_max_ratio"] * 100.0, "%",
-                          "<=", loss["ratio"] > SPEC_LIMITS["single_link_loss_max_ratio"] * 1.5,
-                          loss["ratio"] > SPEC_LIMITS["single_link_loss_max_ratio"],
-                          f"已依{step_note}"
-                          f"{f'、已扣除每{listen_skip}槽1次上行接收窗' if listen_skip else ''}正規化、"
-                          f"CRC 錯誤也算「有到達」："
-                          f"預期 {loss['expected']:.1f} 個時槽、遺失 {loss['lost']:.1f} 個"
-                          f"（僅此鏈路，未計入另一鏈路補收；地面站收不到訊號可能是 RF 真的沒收到，"
-                          f"也可能是航電端自己卡住晚發，需對照該板 [LORA_TX_LOG] 才能分辨）")
+            # --- 封包間隔（gap）：取代舊的「到達率丟失」。只看實際收到的相鄰兩包差多久，
+            # 不反推火箭端發了幾包。CRC 錯誤的封包仍證明「這個時刻有訊號進來」，所以併入
+            # any_rx 一起看間隔——這樣量到的是「RF 靜默多久」，跟 CRC 錯誤率(解碼品質)分開。
+            # ★433 的間隔天生較長且不規則：上行接收窗每 3000ms 有 800ms 完全不發，加上單包
+            # 空中時間本身就佔數百 ms，所以 433 的門檻是照它自己的名目速率放寬的。
+            # ★間隔變長的成因不只 RF：航電端卡住/排隊延遲(SPI3 mutex 跟 Flash 記錄搶用、
+            # 任務被高優先權搶佔)也會讓實際發射變稀疏。單靠地面站封包無法分辨，需對照
+            # 航電板自己的 [LORA_TX_LOG](main.c，ok/try 計數，每 25 槽印一次)。
+            gl = gap_limits(nominal)
+            any_rx_times = sorted(e["t"] for e in (evs + bad_evs))
+            lg = gap_stats(any_rx_times, gl["max_warn_ms"], gl["max_fail_ms"])
+            time_note = ("SD 卡 rx_utc_ms（GPS 紀律牆鐘）" if csv_mode else
+                         "★行號合成時間，非真實到達時間——本項僅供參考、不列入判定"
+                         if synth_time else
+                         "console 到達時間（含序列埠/列印延遲，僅供參考）")
+            if lg["count"] >= 1:
+                add_check(name, "平均封包間隔 (Gap)", lg["mean_ms"], gl["mean_warn_ms"], "ms", "<=",
+                          (not synth_time) and lg["mean_ms"] > gl["mean_fail_ms"],
+                          (not synth_time) and lg["mean_ms"] > gl["mean_warn_ms"],
+                          f"{lg['count']} 個間隔樣本（CRC 錯誤也算有到達）；名目間隔"
+                          f"≈{gl['nominal_gap_ms']:.0f}ms（=1/{nominal:.2f}Hz），"
+                          f"WARN>{gl['mean_warn_ms']:.0f}ms、FAIL>{gl['mean_fail_ms']:.0f}ms。"
+                          f"時間基準：{time_note}")
+                add_check(name, "最長封包空窗 (Max Gap)", lg["max_ms"], gl["max_warn_ms"], "ms", "<=",
+                          (not synth_time) and lg["max_ms"] > gl["max_fail_ms"],
+                          (not synth_time) and lg["max_ms"] > gl["max_warn_ms"],
+                          f"這段擷取內此鏈路最久一次連續收不到訊號（FAIL>{gl['max_fail_ms']:.0f}ms）；"
+                          f"共 {lg['stall_count']} 次落在警告值以上"
+                          f"（占 {lg['stall_ratio']*100:.1f}%）。單鏈路空窗未必等於失聯，"
+                          f"要看下面雙鏈路合併後的空窗。時間基準：{time_note}")
             else:
-                add_check(name, "單鏈路 RF 到達率丟失", 0.0,
-                          SPEC_LIMITS["single_link_loss_max_ratio"] * 100.0, "%",
-                          "<=", False, False, f"樣本不足（{len(any_rx)} 筆）")
+                add_check(name, "平均封包間隔 (Gap)", 0.0, gl["mean_warn_ms"], "ms",
+                          "<=", False, False, f"樣本不足（{len(any_rx_times)} 筆）")
+                add_check(name, "最長封包空窗 (Max Gap)", 0.0, gl["max_warn_ms"], "ms",
+                          "<=", False, False, f"樣本不足（{len(any_rx_times)} 筆）")
 
             link_summaries[link] = {"ok_count": ok_count, "bad_count": bad_count,
                                      "rate_hz": rate_hz, "total_rate_hz": total_rate_hz}
@@ -664,21 +893,36 @@ class GsAnalyzerEngine:
                           ">=", snr_avg_db < SPEC_LIMITS["snr_fail_db"], snr_avg_db < SPEC_LIMITS["snr_warn_db"],
                           f"{snr_src}（原始值/4 換算 dB，{len(snr_raw_vals)} 筆樣本）")
 
-        # --- 合併「到達率」丟失（雙鏈路去重後、CRC 好壞都算到達）：地面站「有沒有收到訊號」
-        # 的完整度，是本工具最關鍵的 GO/NO-GO 指標——即使某一鏈路整個掛掉，只要另一鏈路頂住，
-        # 這裡就該還在低位。step=1，因為 920 名義上每個全域 tick 都會發，兩鏈路合併後的涵蓋
-        # 範圍就是「有沒有漏掉任何一個 100ms tick」，跟 433 自己的降速排程無關。
+        # --- 合併封包間隔（雙鏈路去重後、CRC 好壞都算到達）：★這是本工具最關鍵的 GO/NO-GO。
+        # 「兩條鏈路同時都沒東西進來」持續多久，才是地面站真正失聯的時間——即使某一鏈路整個
+        # 掛掉，只要另一鏈路頂住，這裡就該維持在名目 tick 間隔附近。用 920 的名目速率(每個
+        # 100ms tick 都發)當基準，跟 433 自己的降速排程無關。
+        # ★不再算 Union Loss 百分比：那需要先算「這段時間本來共有幾個時槽該收到」，而該數字
+        # 得靠 seq/時間反推 tick，跨鏈路到達時間差一倒置就會炸掉分母（歷次 report 曾反推出
+        # 270~370Hz 這種遠超硬體上限的隱含頻率）。空窗時間是直接量到的，沒有這個問題。
         any_rx_all = sorted(pkt_events + crc_bad_events, key=lambda e: e["t"])
         merged_any = merge_dedupe_events(any_rx_all)
-        combined_ticks = unwrap_seq_to_ticks(merged_any, LORA_TELEM_PERIOD_MS / 1000.0,
-                                              any_rx_all[0]["t"] if any_rx_all else 0.0)
-        combined_loss = calc_tick_loss(combined_ticks, step=1)
-        add_check("封包完整性（雙鏈路合併）", "合併到達率丟失 (Union Loss)", combined_loss["ratio"] * 100.0,
-                  SPEC_LIMITS["combined_loss_max_ratio"] * 100.0, "%",
-                  "<=", combined_loss["ratio"] > SPEC_LIMITS["combined_loss_max_ratio"] * 1.5,
-                  combined_loss["ratio"] > SPEC_LIMITS["combined_loss_max_ratio"],
-                  f"去重後預期 {combined_loss['expected']:.1f} 個時槽、仍遺失 {combined_loss['lost']:.1f} 個"
-                  f"（兩鏈路都完全靜默才算真正遺失；CRC 錯誤也算到達，不計入此項）")
+        cgl = gap_limits(NOMINAL_RATE_HZ[LINK_920])
+        cg = gap_stats([e["t"] for e in merged_any], cgl["max_warn_ms"], cgl["max_fail_ms"])
+        if cg["count"] >= 1:
+            add_check("封包完整性（雙鏈路合併）", "合併平均封包間隔", cg["mean_ms"], cgl["mean_warn_ms"], "ms", "<=",
+                      (not synth_time) and cg["mean_ms"] > cgl["mean_fail_ms"],
+                      (not synth_time) and cg["mean_ms"] > cgl["mean_warn_ms"],
+                      f"雙鏈路去重後共 {len(merged_any)} 筆、{cg['count']} 個間隔；名目 tick 間隔"
+                      f"≈{cgl['nominal_gap_ms']:.0f}ms，WARN>{cgl['mean_warn_ms']:.0f}ms、"
+                      f"FAIL>{cgl['mean_fail_ms']:.0f}ms（CRC 錯誤也算有到達）"
+                      f"{'。★行號合成時間，不列入判定' if synth_time else ''}")
+            add_check("封包完整性（雙鏈路合併）", "合併最長空窗 (Union Max Gap)", cg["max_ms"],
+                      cgl["max_warn_ms"], "ms", "<=",
+                      (not synth_time) and cg["max_ms"] > cgl["max_fail_ms"],
+                      (not synth_time) and cg["max_ms"] > cgl["max_warn_ms"],
+                      f"★兩條鏈路同時靜默最久 {cg['max_ms']:.0f}ms（FAIL>{cgl['max_fail_ms']:.0f}ms）；"
+                      f"共 {cg['stall_count']} 次超過警告值（占 {cg['stall_ratio']*100:.1f}%）。"
+                      f"這是地面站真正「看不到火箭」的時間，飛行中最該盯的就是這一項")
+        else:
+            add_check("封包完整性（雙鏈路合併）", "合併最長空窗 (Union Max Gap)", 0.0,
+                      cgl["max_warn_ms"], "ms", "<=", False, False,
+                      f"樣本不足（去重後 {len(merged_any)} 筆）")
 
         # 雙鏈路重複「成功解碼」比例：只算 CRC 正確的封包，才是真正驗證到「備援真的幫上忙」
         # （CRC 壞掉的重複收到並沒有實質備援價值，資料仍然不可用）。
@@ -694,20 +938,22 @@ class GsAnalyzerEngine:
         # --- 紀錄管線：連續封包(不分鏈路，依到達/落地時間排序)間隔統計
         all_times = sorted(e["t"] for e in pkt_events)
         gaps = gap_stats(all_times, SPEC_LIMITS["pipeline_stall_warn_ms"], SPEC_LIMITS["pipeline_stall_fail_ms"])
-        time_basis = "SD 卡 rx_utc_ms（GPS 紀律牆鐘，最準確）" if csv_mode else \
-            "即時 console 列印到達時間（含序列埠/列印延遲，僅供參考）"
+        time_basis = ("SD 卡 rx_utc_ms（GPS 紀律牆鐘，最準確）" if csv_mode else
+                      "★行號合成時間，非真實落地時間——停頓偵測在此模式不列入判定"
+                      if synth_time else
+                      "即時 console 列印到達時間（含序列埠/列印延遲，僅供參考）")
         add_check("紀錄管線 (Recording Pipeline)", "平均封包落地間隔", gaps["mean_ms"], 0.0, "ms",
                   ">", False, False, f"時間基準：{time_basis}；共 {gaps['count']} 個間隔樣本")
         add_check("紀錄管線 (Recording Pipeline)", "最大停頓 (Stall)", gaps["max_ms"],
-                  SPEC_LIMITS["pipeline_stall_warn_ms"], "ms",
-                  "<=", gaps["max_ms"] > SPEC_LIMITS["pipeline_stall_fail_ms"],
-                  gaps["max_ms"] > SPEC_LIMITS["pipeline_stall_warn_ms"],
+                  SPEC_LIMITS["pipeline_stall_warn_ms"], "ms", "<=",
+                  (not synth_time) and gaps["max_ms"] > SPEC_LIMITS["pipeline_stall_fail_ms"],
+                  (not synth_time) and gaps["max_ms"] > SPEC_LIMITS["pipeline_stall_warn_ms"],
                   "疑似對應 Flash 用前才擦的 sector erase 阻塞（每 30+ 筆一次，約 400ms）"
                   if gaps["max_ms"] > SPEC_LIMITS["pipeline_stall_warn_ms"] else "無明顯停頓")
         add_check("紀錄管線 (Recording Pipeline)", "停頓次數比例", gaps["stall_ratio"] * 100.0,
-                  SPEC_LIMITS["pipeline_stall_ratio_max"] * 100.0, "%",
-                  "<=", gaps["stall_ratio"] > SPEC_LIMITS["pipeline_stall_ratio_max"] * 2.0,
-                  gaps["stall_ratio"] > SPEC_LIMITS["pipeline_stall_ratio_max"],
+                  SPEC_LIMITS["pipeline_stall_ratio_max"] * 100.0, "%", "<=",
+                  (not synth_time) and gaps["stall_ratio"] > SPEC_LIMITS["pipeline_stall_ratio_max"] * 2.0,
+                  (not synth_time) and gaps["stall_ratio"] > SPEC_LIMITS["pipeline_stall_ratio_max"],
                   f"{gaps['stall_count']}/{gaps['count']} 個間隔超過 {SPEC_LIMITS['pipeline_stall_warn_ms']:.0f}ms")
 
         # --- 地面站自身 GPS
@@ -762,7 +1008,9 @@ class GsAnalyzerEngine:
                 "warn_count": sum(1 for c in checks if c["status"] == "WARN"),
                 "pass_count": sum(1 for c in checks if c["status"] == "PASS"),
                 "n_433": n_433, "n_920": n_920,
-                "data_source": "CSV (SD 卡離線)" if csv_mode else "即時 Console 擷取",
+                "data_source": ("CSV (SD 卡離線)" if csv_mode else
+                                "文字 log 離線（時間戳為行號合成，間隔類指標不列入判定）"
+                                if synth_time else "即時 Console 擷取"),
             },
             "checks": checks,
             "link_summaries": {"433": link_summaries.get(LINK_433, {}), "920": link_summaries.get(LINK_920, {})},
@@ -932,15 +1180,19 @@ class ReportGenerator:
         lines.extend([
             "", "---", "",
             "## 排錯建議",
-            "1. **總通訊頻率遠低於排定值(920≈10Hz/433≈2.33Hz)**：RF 前端可能根本沒收到訊號"
-            "（天線/接線/供電/模組未初始化），先查這個再查 CRC，順序不能反。",
+            "1. **總通訊頻率遠低於排定值(920≈10Hz/433≈1.55Hz，433 這個值是估計非實測)**："
+            "RF 前端可能根本沒收到訊號（天線/接線/供電/模組未初始化），先查這個再查 CRC，"
+            "順序不能反；433 若卡在排定值邊緣、CRC 又是 0%，也可能是估計值本身偏樂觀。",
             "2. **總通訊頻率接近排定值，但 CRC 錯誤率偏高**：代表 RF 前端有收到東西、只是解不出來——"
             "檢查天線接頭/駐波、RF 參數(SF/BW/CR 兩端須一致)，或空中速率與雜訊環境不符。",
             "3. **Resync 比例偏高（433）**：多半是空中位元速率不符或強雜訊源干擾，非單純距離問題。",
-            "4. **單鏈路 RF 到達率丟失偏高**：433 已扣掉每 UPLINK_LISTEN_EVERY(=10) 個時槽固定"
-            "空出 1 槽讓地面站上行、以及每次成功發射至少間隔空中時間(~4 個 100ms tick)這兩項"
-            "正常設計行為，剩下的才是真正的 RF 靜默，需查天線/距離/遮蔽。",
-            "5. **合併到達率丟失偏高但單鏈路正常**：檢查是否兩鏈路收到的其實是同一時間窗（火箭端 TX 排程異常）。",
+            f"4. **單鏈路平均間隔/最長空窗偏長**：433 的間隔天生不規則——上行接收窗每 "
+            f"{UPLINK_LISTEN_PERIOD_MS:.0f}ms 會連續靜默 {UPLINK_LISTEN_HOLD_MS:.0f}ms"
+            f"（佔 {UPLINK_LISTEN_DUTY*100:.0f}% 時間），加上單包空中時間本身就數百 ms，"
+            f"門檻已照它自己的名目速率放寬；超標且合併空窗也跟著長，才要查天線/距離/遮蔽。"
+            f"另外，間隔變長不一定是 RF：航電端卡住晚發也會這樣，需對照該板 [LORA_TX_LOG] 分辨。",
+            "5. **合併最長空窗偏長但單鏈路正常**：檢查兩鏈路是不是在同一段時間一起斷"
+            "（火箭端 TX 排程/供電異常，而非各自的 RF 環境問題）——備援等於沒有備援。",
             "6. **紀錄管線停頓**：對應已知 Flash sector erase 阻塞，嚴重時可能造成飛行末段掉包，"
             "建議改用 --csv 對實際 SD 卡 GSLOGnnn.CSV 做離線分析確認真實影響。",
             "",
@@ -1051,11 +1303,12 @@ new Chart(document.getElementById('chartGap'), {{
 def generate_selftest_events(engine: GsAnalyzerEngine):
     """依 main.c LoRaTelemetry_Task 的真實排程模擬：兩鏈路共用同一個每 100ms 遞增的全域
     seq，920 幾乎每個 tick 都發；433 每個 tick 都嘗試呼叫 LoRaE22_Send()(LORA433_TX_EVERY=1)，
-    但 AUX busy（上一包空中時間還沒跑完，~4 個 tick）時會直接跳過不等待，所以兩次
-    成功發射之間最少要隔 LORA433_MIN_TX_SPACING_TICKS 個 tick；此外每 UPLINK_LISTEN_EVERY
-    (=10) 個 tick 固定空出 1 個不發、留給上行接收窗。這兩個規律間隙都是設計行為、不是
-    遺失，calc_tick_loss() 用 step/listen_skip_every 正規化，selftest 資料若不照這個
-    排程生成就測不出這項邏輯有沒有壞掉。"""
+    但 AUX busy（上一包空中時間還沒跑完，見 LORA433_AIRTIME_S 估計值）時會直接跳過不等待，
+    所以兩次成功發射之間最少要隔 LORA433_MIN_TX_SPACING_TICKS 個 tick；此外每
+    UPLINK_LISTEN_PERIOD_TICKS(=30) 個 tick 會有連續 UPLINK_LISTEN_HOLD_TICKS(=10) 個
+    tick 完全不發、留給上行接收窗（守衛帶 600ms + 窗 400ms，見常數宣告處）。這兩個規律間隙都是設計行為、不是遺失——433 的 gap
+    門檻就是照這個實際排程換算出的名目速率放寬的，selftest 資料若不照這個排程生成，
+    就測不出 gap 判定的門檻有沒有設歪。"""
     import random
     t = time.time() - 60.0
     gs_stat = {"hw433_ok": True, "hw920_ok": True, "raw433": 0, "ok433": 0, "crc433": 0, "rsync433": 0,
@@ -1078,9 +1331,11 @@ def generate_selftest_events(engine: GsAnalyzerEngine):
             gs_stat["crc920"] += 1
 
         # 433：每個 tick 都嘗試(LORA433_TX_EVERY=1)，但 AUX busy（兩次成功發射至少間隔
-        # LORA433_MIN_TX_SPACING_TICKS 個 tick）與 UPLINK_LISTEN_EVERY 上行接收窗都會
-        # 讓這次嘗試直接被跳過、不真的上空——跳過不佔用下一次的 spacing 起點。
-        listen_slot = (i % UPLINK_LISTEN_EVERY) == (UPLINK_LISTEN_EVERY - 1)
+        # LORA433_MIN_TX_SPACING_TICKS 個 tick）與上行接收窗都會讓這次嘗試直接被跳過、
+        # 不真的上空——跳過不佔用下一次的 spacing 起點。
+        # 接收窗比照韌體改成「連續一段不發」（每 PERIOD_TICKS 開頭連續 HOLD_TICKS 個
+        # tick），而不是舊的每 10 個跳 1 個。
+        listen_slot = (i % UPLINK_LISTEN_PERIOD_TICKS) < UPLINK_LISTEN_HOLD_TICKS
         aux_busy = (i - last_433_tx) < LORA433_MIN_TX_SPACING_TICKS
         if (i % LORA433_TX_EVERY) == 0 and not listen_slot and not aux_busy:
             last_433_tx = i
@@ -1126,6 +1381,7 @@ def main():
     engine = GsAnalyzerEngine()
     stop_event = threading.Event()
     csv_mode = False
+    synth_time = False     # --file 模式：時間戳由行號合成，間隔類指標不列入判定
 
     if args.selftest:
         print("[SELFTEST] 執行地面站接收品質分析邏輯測試...")
@@ -1149,8 +1405,10 @@ def main():
             print(f"[ERROR] 檔案不存在: {args.file}")
             sys.exit(1)
         parser = GsConsoleParser(engine.add_pkt, engine.add_pkt_bad, engine.add_gs_stat, engine.update_diag)
-        # 離線 log 檔沒有真實到達時間戳，退而以行號合成遞增秒數（僅供計數/比率類指標使用，
-        # 停頓偵測在此模式下不具意義，report 會標明資料來源避免誤讀）。
+        # 離線 log 檔沒有真實到達時間戳，退而以行號合成遞增秒數（僅供計數/比率類指標使用）。
+        # ★間隔(gap)/停頓偵測在此模式下沒有物理意義，analyze(synth_time=True) 會照算照印
+        # 但不判 WARN/FAIL，避免合成時間算出的漂亮數字被誤讀成鏈路健康。
+        synth_time = True
         synth_t = [0.0]
 
         def _feed_line_synth(line):
@@ -1246,7 +1504,7 @@ def main():
 
         print("\n\n[LIVE] 擷取完成！正在進行接收品質與紀錄管線分析...")
 
-    res = engine.analyze(csv_mode=csv_mode)
+    res = engine.analyze(csv_mode=csv_mode, synth_time=synth_time)
     if "error" in res:
         print(f"[ERROR] 分析失敗: {res['error']}")
         sys.exit(1)
@@ -1266,6 +1524,15 @@ def main():
     print(f"📝 Markdown 報告已生成: file://{os.path.abspath(md_file)}")
     print(f"📊 JSON 結構化數據檔已生成: file://{os.path.abspath(json_file)}")
     print(f"🌐 互動式 HTML Dashboard 已生成: file://{os.path.abspath(html_file)}")
+
+    # 離線 CSV 模式下，同一份紀錄還帶著完整飛行物理量 + 雙板 peer 摘要 + 兩端 GPS，
+    # 順手一併產出轉播飛行圖表 + GPS 地圖（與上面的鏈路品質報告互補，見函式註解）。
+    if csv_mode:
+        try:
+            generate_relay_flight_chart(args.csv, args.out_dir)
+            generate_relay_gps_map(args.csv, args.out_dir)
+        except Exception as e:
+            print(f"[RELAY] 轉播飛行圖表/地圖生成失敗: {e}")
 
     if res["summary"]["overall_status"] == "NOT_READY":
         sys.exit(2)

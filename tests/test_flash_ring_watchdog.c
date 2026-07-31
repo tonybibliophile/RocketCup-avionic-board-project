@@ -50,6 +50,27 @@ int main(void) {
     check("FLASH_RING_PREERASE_TARGET 覆蓋本 profile 的看門狗視窗",
           (uint64_t)FLASH_RING_PREERASE_TARGET >= needed_sectors);
 
+    /* ★2026-07-31 新增兩條：舊版只驗「飛行段」，漏了 PAD_ARMED 的 1Hz 消耗與熱重啟窗口。
+     * (a) 武裝期消耗：main.c ring_enabled 在 STATE_PAD_ARMED 為 1Hz，且該段同步擦除已禁止、
+     *     背景 PreEraseOne 只在 state <= STATE_PAD 才跑 ⇒ 池在武裝期只出不進。
+     * (b) 熱重啟逃生：卡在飛行狀態的板子要能靠「通電放久、flight_tick_ms 增長超過
+     *     FSM_HOTSTART_MAX_TICK_MS」老化出熱重啟窗口。但寫入會在池耗盡時停止、把
+     *     flight_tick_ms 凍住——若凍結值 <= 窗口，每次重開機都會熱重啟回同一狀態，
+     *     永遠出不來。故池的時間容量必須「嚴格大於」熱重啟窗口。 */
+    const uint64_t pool_packets   = (uint64_t)FLASH_RING_PREERASE_TARGET * packets_per_sector;
+    const uint64_t armed_budget_s = 30U * 60U;   /* 設計目標：台上武裝等待 30 分鐘 */
+    const uint64_t flight_ms_after_armed =
+        (pool_packets > armed_budget_s ? (pool_packets - armed_budget_s) : 0U) * 1000U / flight_hz;
+
+    printf("  池=%llu packets；武裝 %llus(1Hz) 後飛行段剩 %llums；熱重啟窗口=%lums\n",
+           (unsigned long long)pool_packets, (unsigned long long)armed_budget_s,
+           (unsigned long long)flight_ms_after_armed, (unsigned long)FSM_HOTSTART_MAX_TICK_MS);
+
+    check("扣掉 30 分鐘武裝(1Hz)後仍覆蓋看門狗視窗",
+          flight_ms_after_armed >= (uint64_t)window_ms);
+    check("池的時間容量 > FSM_HOTSTART_MAX_TICK_MS（卡死狀態要能靠通電放久老化出熱重啟窗口）",
+          (pool_packets * 1000U / flight_hz) > (uint64_t)FSM_HOTSTART_MAX_TICK_MS);
+
     printf("----------------------------------------\n");
     printf("%s：%d/%d 通過\n", g_fail ? "FAIL" : "ALL PASS", g_total - g_fail, g_total);
     return g_fail ? 1 : 0;

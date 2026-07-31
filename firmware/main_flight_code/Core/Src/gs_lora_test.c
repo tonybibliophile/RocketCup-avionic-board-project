@@ -15,6 +15,9 @@
 #include "uplink_text_proto.h" /* 上行文字命令框架（tx 中繼；與火箭端共用） */
 #include "lora_e22.h"
 #include "lora_e80.h"
+#include "w25qxx.h"        /* FlashRing_EraseAll()：`flash erase` 命令重用飛控角色既有的擦除實作 */
+#include "spi3_bus.h"      /* SPI3_Bus_Lock/Unlock：`flash dump`/`flash export` 讀取期間鎖 SPI3 */
+#include "ground_station.h" /* GroundStation_FlashResetAfterErase() */
 #include "main.h"
 #include "cmsis_os.h"
 #include <stdio.h>
@@ -26,9 +29,23 @@ extern UART_HandleTypeDef huart2;
 extern SPI_HandleTypeDef  hspi3;    /* E80 重新初始化用 */
 extern IWDG_HandleTypeDef hiwdg;    /* 上行 burst 期間餵狗 */
 
-/* 上行命令以 burst 重複送 ~3s，確保落在火箭每 ~2s 一次的 1/10 接收窗 */
-#define UPLINK_TX_REPEAT  24U
-#define UPLINK_TX_GAP_MS  120U
+/* ===== 上行命令 burst =========================================================
+ * ★2026-07-30 修正：舊版是「固定重複呼叫 LoRaE22_Send 24 次、每次間隔 120ms」，
+ *   而且完全不看回傳值。但 LoRaE22_Send 在 AUX(BUSY 腳) 為低時是「直接回 HAL_BUSY、
+ *   一個位元組都不送」——本機 E22 只要正在收火箭的下行封包（116B@2.4k 空中約 390ms）
+ *   就是這個狀態。結果是整個 burst 可能一次都沒真的發射，console 卻照樣印「送出完畢」，
+ *   操作者完全看不出來。實測 log（20260727_004510）：連按 10 次 ARM（seq 6~15）
+ *   全部印「送出完畢」，火箭端 fsm 一直是 1(PAD)、[ACK] 一筆都沒有。
+ * 改法：
+ *   ① 忙線不是放棄而是短間隔重試，AUX 一放開就立刻送 —— 火箭的上行接收窗
+ *      （main.c UPLINK_LISTEN_HOLD_MS）期間本機也剛好收不到東西、AUX 會拉高，
+ *      這個「忙就等、閒就送」的行為等於自動對準對方的窗口。
+ *   ② burst 時間必須 > 火箭的接收窗週期（main.c UPLINK_LISTEN_PERIOD_MS=3000ms），
+ *      否則整段 burst 可能塞在兩個窗口之間。故不做「送夠 N 次就提早結束」。
+ *   ③ 結束時印 ok/busy/err 實際次數，讓「到底有沒有發出去」變成看得見的事實。 */
+#define UPLINK_TX_WINDOW_MS    4500U  /* burst 總時長：須 > 火箭 UPLINK_LISTEN_PERIOD_MS */
+#define UPLINK_TX_GAP_MS        150U  /* 成功送出一筆後的間隔（別把鏈路完全佔滿） */
+#define UPLINK_TX_BUSY_POLL_MS   10U  /* AUX 忙線時的重試輪詢間隔 */
 static uint8_t s_uplink_seq = 0;
 
 /* ============================================================
@@ -111,6 +128,11 @@ static void print_help(void)
            "  e80 init          重新初始化 E80 並進入接收\r\n"
            "  e80 rxstart       重新進入連續接收\r\n"
            "  e80 airtime <len> 估算指定 payload 長度的空中時間\r\n"
+           "  flash erase       清空本機接收紀錄（約 30-60 秒，期間停止收包；兩種地面站\r\n"
+           "                    binary 皆可用，與下方發射鎖無關）\r\n"
+           "  flash dump        人眼 hex dump 整顆晶片前段區塊（沿用飛控角色共用實作）\r\n"
+           "  flash export      結構化匯出：Sector0 hex + 本機收到的下行遙測紀錄 CSV\r\n"
+           "                    （GsLog 格式，與 SD 卡 CSV 同源，供 GUI/分析工具解析）\r\n"
 #if GS_LORA_TX_ENABLE
            "  --- 遠端指令中繼到主航電（433 反向）---\r\n"
            "  tx <指令>         把整串原文送給主航電執行（複用其命令台：role/help/\r\n"
@@ -202,9 +224,7 @@ static void print_e80_params(void)
 
 static void print_e22_params(void)
 {
-    uint8_t ch = 0;
-    e22_mhz_to_ch(s_e22_freq_mhz, &ch);
-    printf("[E22] freq=%lu MHz  CH=%u\r\n", (unsigned long)s_e22_freq_mhz, (unsigned)ch);
+    LoRaE22_PrintConfig();
 }
 
 static void print_version(void)
@@ -215,13 +235,18 @@ static void print_version(void)
            (unsigned)hw, (unsigned)type, (unsigned)gs, rd_st, (unsigned)busy);
 }
 
-static void apply_e80_reconfig(void)
+static void apply_e80_reconfig(const char *subcmd)
 {
     print_e80_params();
     HAL_StatusTypeDef st = LoRaE80_Reconfig(s_e80_freq_hz, s_e80_sf, s_e80_bw,
                                              s_e80_cr, s_e80_pwr_dbm, s_e80_preamble);
-    printf(st == HAL_OK ? "[E80] reconfig OK -> RX restarted\r\n"
-                        : "[E80] reconfig FAIL (st=%d)\r\n", (int)st);
+    if (st == HAL_OK) {
+        printf("[E80] reconfig OK -> RX restarted\r\n");
+        printf("[ACK] status:OK cmd:\"e80 %s\"\r\n", subcmd ? subcmd : "config");
+    } else {
+        printf("[E80] reconfig FAIL (st=%d)\r\n", (int)st);
+        printf("[ACK] status:REJECTED cmd:\"e80 %s\"\r\n", subcmd ? subcmd : "config");
+    }
 }
 
 /* ============================================================
@@ -245,20 +270,50 @@ static uint8_t gs_tx_allowed(const char *label)
 /* ============================================================
  *  上行命令發送（手動開傘等，經 E22 433 反向打給火箭）
  * ============================================================ */
+/* 在 UPLINK_TX_WINDOW_MS 內反覆嘗試送同一筆幀：AUX 忙就短間隔重試、閒就立刻送。
+ * 回傳實際成功推入 E22 的次數（0 = 整段期間本機 E22 一次都沒空，命令根本沒上空中）。 */
+static uint32_t uplink_burst(const uint8_t *frame, uint8_t len, const char *label, uint8_t seq)
+{
+    uint32_t t0 = HAL_GetTick();
+    uint32_t ok = 0, busy = 0, err = 0;
+
+    while ((HAL_GetTick() - t0) < UPLINK_TX_WINDOW_MS) {
+        HAL_StatusTypeDef st = LoRaE22_Send(frame, len);
+        HAL_IWDG_Refresh(&hiwdg);
+        if (st == HAL_OK) {
+            ok++;
+            osDelay(UPLINK_TX_GAP_MS);
+        } else if (st == HAL_BUSY) {
+            busy++;                       /* AUX 低：本機 E22 正在收/發，等一下再試 */
+            osDelay(UPLINK_TX_BUSY_POLL_MS);
+        } else {
+            err++;
+            osDelay(UPLINK_TX_GAP_MS);
+        }
+    }
+
+    printf("[UPLINK] %s seq=%u burst 結束：實際送出 ok=%lu busy=%lu err=%lu（歷時 %lums）\r\n",
+           label, (unsigned)seq, (unsigned long)ok, (unsigned long)busy, (unsigned long)err,
+           (unsigned long)(HAL_GetTick() - t0));
+    if (ok == 0U) {
+        printf("[UPLINK] ⚠ ok=0：本機 E22 全程忙線（AUX 一直為低），這筆命令沒有上空中。"
+               "檢查 433 是否被下行流量佔滿，或模組 AUX 接線/供電。\r\n");
+    }
+    return ok;
+}
+
 static void uplink_send(uint8_t cmd, uint8_t arg, const char *label)
 {
     if (!gs_tx_allowed(label)) return;
     uint8_t f[UPLINK_FRAME_SIZE];
     uint8_t seq = s_uplink_seq++;
     UplinkProto_Build(f, cmd, arg, seq);
-    printf("[UPLINK] 送 %s (cmd=0x%02X seq=%u) ×%u burst (~3s)…\r\n",
-           label, (unsigned)cmd, (unsigned)seq, (unsigned)UPLINK_TX_REPEAT);
-    for (uint8_t i = 0; i < UPLINK_TX_REPEAT; i++) {
-        LoRaE22_Send(f, UPLINK_FRAME_SIZE);   /* 忙線跳過；burst 重複確保命中接收窗 */
-        HAL_IWDG_Refresh(&hiwdg);
-        osDelay(UPLINK_TX_GAP_MS);
+    printf("[UPLINK] 送 %s (cmd=0x%02X seq=%u) burst %lums…\r\n",
+           label, (unsigned)cmd, (unsigned)seq, (unsigned long)UPLINK_TX_WINDOW_MS);
+    if (uplink_burst(f, UPLINK_FRAME_SIZE, label, seq) > 0U) {
+        printf("[UPLINK] %s 已上空中（等火箭下行 [ACK]；開傘另看 DROGUE_FIRED/MAIN_DEPLOYED 旗標）\r\n",
+               label);
     }
-    printf("[UPLINK] %s 送出完畢（看下行 DROGUE_FIRED/MAIN_DEPLOYED 旗標確認）\r\n", label);
 }
 
 /* 中繼文字命令到主航電（tx <原文>）：以 uplink_text_proto 幀 burst 送。text 為「原始大小寫」
@@ -275,14 +330,11 @@ static void uplink_send_text(const char *text)
     uint8_t f[UPLINK_TEXT_FRAME_MAX];
     uint8_t seq = s_uplink_seq++;
     uint8_t n = UplinkTextProto_Build(f, text, len, seq);
-    printf("[UPLINK] 送文字命令 seq=%u \"%.*s\" ×%u burst (~3s)…\r\n",
-           (unsigned)seq, (int)len, text, (unsigned)UPLINK_TX_REPEAT);
-    for (uint8_t i = 0; i < UPLINK_TX_REPEAT; i++) {
-        LoRaE22_Send(f, n);
-        HAL_IWDG_Refresh(&hiwdg);
-        osDelay(UPLINK_TX_GAP_MS);
+    printf("[UPLINK] 送文字命令 seq=%u \"%.*s\" burst %lums…\r\n",
+           (unsigned)seq, (int)len, text, (unsigned long)UPLINK_TX_WINDOW_MS);
+    if (uplink_burst(f, n, "TEXT", seq) > 0U) {
+        printf("[UPLINK] 文字命令已上空中（等火箭下行 [ACK]）\r\n");
     }
-    printf("[UPLINK] 文字命令送出完畢（等火箭下行 [ACK]）\r\n");
 }
 
 /* ============================================================
@@ -378,6 +430,10 @@ static void dispatch_cmd(char *line)
             print_stats();
         }
 
+    } else if (strcmp(tok[0], "show") == 0) {
+        print_e22_params();
+        print_e80_params();
+
     } else if (strcmp(tok[0], "e22") == 0 && n >= 2) {
         if (strcmp(tok[1], "show") == 0) {
             print_e22_params();
@@ -385,31 +441,49 @@ static void dispatch_cmd(char *line)
             uint32_t mhz = (uint32_t)strtoul(tok[2], NULL, 10);
             uint8_t ch;
             if (!e22_mhz_to_ch(mhz, &ch)) {
-                printf("[E22] freq 範圍 410-493 MHz\r\n"); return;
+                printf("[E22] freq 範圍 410-493 MHz\r\n");
+                printf("[ACK] status:BADARG cmd:\"e22 freq\"\r\n");
+                return;
             }
             s_e22_freq_mhz = mhz;
             HAL_StatusTypeDef st = LoRaE22_SetFreqMHz(mhz);
-            if (st == HAL_OK) printf("[E22] freq set %lu MHz (CH=%u) OK\r\n",
-                                     (unsigned long)mhz, (unsigned)ch);
-            else              printf("[E22] freq set FAIL (st=%d)\r\n", (int)st);
+            if (st == HAL_OK) {
+                printf("[E22] freq set %lu MHz (CH=%u) OK\r\n", (unsigned long)mhz, (unsigned)ch);
+                printf("[ACK] status:OK cmd:\"e22 freq\"\r\n");
+            } else {
+                printf("[E22] freq set FAIL (st=%d)\r\n", (int)st);
+                printf("[ACK] status:REJECTED cmd:\"e22 freq\"\r\n");
+            }
         } else if (strcmp(tok[1], "pwr") == 0 && n >= 3) {
             uint32_t lvl = (uint32_t)strtoul(tok[2], NULL, 10);
             if (lvl > 3U) {
                 printf("[E22] pwr 等級 0=30dBm 1=27dBm 2=24dBm 3=21dBm（3V3 供電建議 3）\r\n");
+                printf("[ACK] status:BADARG cmd:\"e22 pwr\"\r\n");
                 return;
             }
             HAL_StatusTypeDef st = LoRaE22_SetPowerLevel((uint8_t)lvl);
-            if (st == HAL_OK) printf("[E22] pwr set level %lu OK\r\n", (unsigned long)lvl);
-            else              printf("[E22] pwr set FAIL (st=%d)\r\n", (int)st);
+            if (st == HAL_OK) {
+                printf("[E22] pwr set level %lu OK\r\n", (unsigned long)lvl);
+                printf("[ACK] status:OK cmd:\"e22 pwr\"\r\n");
+            } else {
+                printf("[E22] pwr set FAIL (st=%d)\r\n", (int)st);
+                printf("[ACK] status:REJECTED cmd:\"e22 pwr\"\r\n");
+            }
         } else if (strcmp(tok[1], "air") == 0 && n >= 3) {
             uint32_t ar = (uint32_t)strtoul(tok[2], NULL, 10);
             if (ar > 7U) {
                 printf("[E22] air 速率 0=0.3k 1=1.2k 2=2.4k 3=4.8k 4=9.6k 5=19.2k 6=38.4k 7=62.5k\r\n");
+                printf("[ACK] status:BADARG cmd:\"e22 air\"\r\n");
                 return;
             }
             HAL_StatusTypeDef st = LoRaE22_SetAirRate((uint8_t)ar);
-            if (st == HAL_OK) printf("[E22] air rate set %lu OK（兩端須一致）\r\n", (unsigned long)ar);
-            else              printf("[E22] air rate set FAIL (st=%d)\r\n", (int)st);
+            if (st == HAL_OK) {
+                printf("[E22] air rate set %lu OK（兩端須一致）\r\n", (unsigned long)ar);
+                printf("[ACK] status:OK cmd:\"e22 air\"\r\n");
+            } else {
+                printf("[E22] air rate set FAIL (st=%d)\r\n", (int)st);
+                printf("[ACK] status:REJECTED cmd:\"e22 air\"\r\n");
+            }
         } else if (strcmp(tok[1], "dump") == 0 && n >= 3) {
             if (strcmp(tok[2], "on") == 0) {
                 s_e22_raw_dump = 1U;
@@ -448,39 +522,155 @@ static void dispatch_cmd(char *line)
             if (hz < 862000000UL || hz > 928000000UL)
                 printf("[E80] 注意：頻率建議 862-928 MHz，仍套用\r\n");
             s_e80_freq_hz = hz;
-            apply_e80_reconfig();
+            apply_e80_reconfig("freq");
 
         } else if (strcmp(tok[1], "sf") == 0 && n >= 3) {
             uint8_t sf = (uint8_t)atoi(tok[2]);
-            if (sf < 7 || sf > 12) { printf("[E80] SF 範圍 7-12\r\n"); return; }
-            s_e80_sf = sf; apply_e80_reconfig();
+            if (sf < 7 || sf > 12) {
+                printf("[E80] SF 範圍 7-12\r\n");
+                printf("[ACK] status:BADARG cmd:\"e80 sf\"\r\n");
+                return;
+            }
+            s_e80_sf = sf; apply_e80_reconfig("sf");
 
         } else if (strcmp(tok[1], "bw") == 0 && n >= 3) {
             uint8_t bw = (uint8_t)strtoul(tok[2], NULL, 10);
             if (!lora_bw_valid(bw)) {
                 printf("[E80] BW idx 合法值: 0 1 2 3 4(125k) 5(250k) 6(500k) 8 9 10\r\n");
+                printf("[ACK] status:BADARG cmd:\"e80 bw\"\r\n");
                 return;
             }
-            s_e80_bw = bw; apply_e80_reconfig();
+            s_e80_bw = bw; apply_e80_reconfig("bw");
 
         } else if (strcmp(tok[1], "cr") == 0 && n >= 3) {
             uint8_t cr = (uint8_t)atoi(tok[2]);
-            if (cr < 1 || cr > 4) { printf("[E80] CR 範圍 1-4\r\n"); return; }
-            s_e80_cr = cr; apply_e80_reconfig();
+            if (cr < 1 || cr > 4) {
+                printf("[E80] CR 範圍 1-4\r\n");
+                printf("[ACK] status:BADARG cmd:\"e80 cr\"\r\n");
+                return;
+            }
+            s_e80_cr = cr; apply_e80_reconfig("cr");
 
         } else if (strcmp(tok[1], "pwr") == 0 && n >= 3) {
             int pwr = atoi(tok[2]);
-            if (pwr < -9 || pwr > 22) { printf("[E80] pwr 範圍 -9~22 dBm\r\n"); return; }
-            s_e80_pwr_dbm = (int8_t)pwr; apply_e80_reconfig();
+            if (pwr < -9 || pwr > 22) {
+                printf("[E80] pwr 範圍 -9~22 dBm\r\n");
+                printf("[ACK] status:BADARG cmd:\"e80 pwr\"\r\n");
+                return;
+            }
+            s_e80_pwr_dbm = (int8_t)pwr; apply_e80_reconfig("pwr");
 
         } else if (strcmp(tok[1], "pre") == 0 && n >= 3) {
             long pre = atol(tok[2]);
-            if (pre < 6 || pre > 65535) { printf("[E80] preamble 6~65535\r\n"); return; }
-            s_e80_preamble = (uint16_t)pre; apply_e80_reconfig();
+            if (pre < 6 || pre > 65535) {
+                printf("[E80] preamble 6~65535\r\n");
+                printf("[ACK] status:BADARG cmd:\"e80 pre\"\r\n");
+                return;
+            }
+            s_e80_preamble = (uint16_t)pre; apply_e80_reconfig("pre");
 
         } else {
             printf("[E80] 未知子命令，輸入 help\r\n");
         }
+
+    } else if (strcmp(tok[0], "flash") == 0 && n >= 2 && strcmp(tok[1], "erase") == 0) {
+        /* 地面站自己的接收紀錄（GsLogRecord_t ring，非火箭飛行紀錄）——只有整段清除，
+         * 沒有 ring/all 之分（地面站不記校準/總結）。仍接受 `flash erase ring`/`flash erase all`
+         * 當作同義詞：gui_monitor.py 的 Flash 面板固定送這兩種字串，讓它接上地面站板也不會
+         * 撞到「未知命令」。
+         * 直接重用 FlashRing_EraseAll()（w25qxx.c，已被 primary/backup 使用、已測）——地面站
+         * 與飛控角色共用同一段 Flash 位址範圍（FLASH_RINGBUF_ADDR/END），只是寫入者/紀錄格式
+         * 不同，block-erase 本身與格式無關，可以直接借用。
+         * 擦除期間（~30-60s）GsLoraTest_Tick() 所在的接收主迴圈整段被佔用：433/920 收包全部
+         * 停擺，事後會自我恢復（920 靜默看門狗會重新 StartRx），先印警告讓操作者知情。 */
+        if (n >= 3 && strcmp(tok[2], "ring") != 0 && strcmp(tok[2], "all") != 0) {
+            printf("[FLASH] 未知擦除範圍 '%s'（地面站僅支援 flash erase，無 ring/all 之分）\r\n", tok[2]);
+        } else {
+            printf("[FLASH] ⚠ 擦除期間停止接收下行遙測約 30-60 秒，請勿於飛行中執行。\r\n");
+            {
+                IWDG_HandleTypeDef iwdg_wide = hiwdg;
+                iwdg_wide.Init.Prescaler = IWDG_PRESCALER_256;
+                iwdg_wide.Init.Reload    = 1250;   /* 32kHz/256=125Hz -> 1250/125 = 10s，比照 main.c flash erase */
+                HAL_IWDG_Init(&iwdg_wide);
+            }
+            W25QXX_StatusTypeDef st = FlashRing_EraseAll();
+            HAL_IWDG_Init(&hiwdg);       /* 還原正常視窗 */
+            HAL_IWDG_Refresh(&hiwdg);
+            GroundStation_FlashResetAfterErase();
+            if (st == W25QXX_OK) {
+                printf("[FLASH] 接收紀錄已清空並重設寫入頭 OK\r\n");
+            } else {
+                printf("[FLASH] ERROR: 擦除回報失敗 (st=%d)，已強制重設寫入頭\r\n", (int)st);
+            }
+        }
+
+    } else if (strcmp(tok[0], "flash") == 0 && n >= 2 && strcmp(tok[1], "dump") == 0) {
+        /* 人眼讀 hex dump（沿用飛控角色共用的 Flash_DumpAll，純角色無關的原始讀取，
+         * 與寫入者無關）——地面站晶片若曾被燒錄過飛控角色會在這裡看到殘留校準值，
+         * 全新/已清空的地面站專用晶片則第一區塊會是一片 FF。 */
+        SPI3_Bus_Lock();
+        Flash_DumpAll();
+        SPI3_Bus_Unlock();
+
+    } else if (strcmp(tok[0], "flash") == 0 && n >= 2 && strcmp(tok[1], "export") == 0) {
+        /* 結構化匯出（供 GUI 解析存檔）：
+         *   ① Sector 0 hex —— 與 main.c 飛控角色 `flash export` 完全同格式（SYSFLAGS_START/
+         *      END + 16-byte hex 行），故 GUI／flash_analyzer.py 的 sysflags 解析器可原封不動
+         *      重用；地面站本身不寫這區，讀出來若非全 FF 表示晶片曾被燒成飛控角色。
+         *   ② 地面站自己收到的下行遙測紀錄（GsLogRecord_t ring）——CSV 表頭/欄位改用
+         *      gs_log.c 既有的 GsLog_CsvHeader()/GsLog_FormatCsvRow()，與 SD 卡 CSV 同源
+         *      同格式，讓 ground_station_analyzer.py --csv 可直接分析剛匯出的這份檔案。 */
+        SPI3_Bus_Lock();
+        printf("--- SYSFLAGS_START ---\r\n");
+        {
+            uint8_t dump_buf[16];
+            for (uint32_t dump_addr = FLASH_SYSFLAGS_ADDR;
+                 dump_addr < FLASH_SYSFLAGS_ADDR + FLASH_SYSFLAGS_SIZE;
+                 dump_addr += 16U) {
+                if (W25QXX_ReadData(dump_addr, dump_buf, sizeof(dump_buf)) != W25QXX_OK) break;
+                printf("%06lX:", (unsigned long)dump_addr);
+                for (uint32_t i = 0; i < sizeof(dump_buf); i++) {
+                    printf(" %02X", dump_buf[i]);
+                }
+                printf("\r\n");
+                if (((dump_addr - FLASH_SYSFLAGS_ADDR) & 0x3FFU) == 0U) HAL_IWDG_Refresh(&hiwdg);
+            }
+        }
+        printf("--- SYSFLAGS_END ---\r\n");
+
+        printf("--- CSV_START ---\r\n");
+        {
+            char hdr[GS_LOG_CSV_MAX];
+            if (GsLog_CsvHeader(hdr, sizeof(hdr)) > 0) printf("%s", hdr);
+        }
+
+        {
+            GsLogRecord_t rec;
+            char row[GS_LOG_CSV_MAX];
+            uint32_t addr = FLASH_RINGBUF_ADDR;
+            uint32_t read_count = 0;
+
+            while (addr + GS_LOG_RECORD_SIZE <= FLASH_RINGBUF_END + 1UL) {
+                if (W25QXX_ReadData(addr, (uint8_t*)&rec, sizeof(rec)) != W25QXX_OK) break;
+                if (rec.magic0 == 0xFFU && rec.magic1 == 0xFFU) break;   /* 擦除後未寫入區 */
+
+                if (GsLog_RecordValid(&rec)) {
+                    if (GsLog_FormatCsvRow(row, sizeof(row), &rec) > 0) printf("%s", row);
+                    read_count++;
+                }
+                addr += GS_LOG_RECORD_SIZE;
+                if ((read_count & 0x3FU) == 0U) HAL_IWDG_Refresh(&hiwdg);
+            }
+            printf("--- CSV_END ---\r\n");
+            if (read_count == 0U) {
+                printf("[FLASH] Notice: 地面站接收紀錄為空（尚未收到下行遙測，或剛清空過）。\r\n");
+            }
+            printf("[FLASH] Export finished. Total %lu records.\r\n", (unsigned long)read_count);
+        }
+        SPI3_Bus_Unlock();
+
+    } else if (strcmp(tok[0], "flash") == 0) {
+        printf("[FLASH] 子命令：erase / dump / export\r\n");
 
     } else {
         printf("[TEST] 未知命令 '%s'，輸入 help\r\n", tok[0]);

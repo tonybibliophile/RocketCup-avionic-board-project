@@ -96,8 +96,19 @@ uint8_t UplinkCmd_IsArmed(void);
 /** @brief 手動設定武裝狀態（供本地串口指令 arm/disarm 同步）。 */
 void UplinkCmd_SetArmedState(uint8_t armed);
 
-/** @brief 診斷統計：有效命令數 / CRC 錯誤數 / 最後命令碼。可傳 NULL。 */
-void UplinkCmd_GetStats(uint32_t *rx_ok, uint32_t *rx_crc_err, uint8_t *last_cmd);
+/** 上行接收診斷統計（由 main.c 的 1Hz [UPLINK_STAT] 行印出，供地面站/GUI 判讀）。 */
+typedef struct {
+    uint32_t raw_bytes;      /* USART3 原始位元組總數（含雜訊）：0 = 射頻層完全沒東西進來 */
+    uint32_t bin_ok;         /* 二進制幀（ARM/DEPLOY/...）CRC 通過數 */
+    uint32_t bin_crc_err;    /* 二進制幀湊滿但 CRC 不符 */
+    uint32_t bin_resync;     /* 二進制幀 sync 對齊退回次數 */
+    uint32_t text_ok;        /* 文字幀（tx 中繼）CRC 通過數 */
+    uint32_t text_crc_err;   /* 文字幀湊滿但 CRC 不符 */
+    uint8_t  last_cmd;       /* 最後一筆二進制命令碼 */
+} UplinkCmdStats_t;
+
+/** @brief 診斷統計快照。out 為 NULL 時直接返回。 */
+void UplinkCmd_GetStats(UplinkCmdStats_t *out);
 
 #else
 static inline uint8_t UplinkCmd_IsArmed(void) { return 0U; }

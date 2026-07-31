@@ -60,8 +60,15 @@ static uint8_t           s_ack_seq = 0;
 static uint8_t           s_ack_status = 0;
 static volatile uint8_t  s_ack_valid = 0;   /* 最後寫，確保緩衝先填妥 */
 
-/* ---- 診斷 ---- */
+/* ---- 診斷 ----
+ * s_raw_bytes：USART3 上收到的原始位元組總數（含雜訊、含下行 ACK 的回音）。
+ * ★這個計數器是上行鏈路除錯的第一個問題「地面站到底有沒有打到我」的唯一答案：
+ *   raw=0 → 射頻層面完全沒進來（頻道/空速不符、地面站根本沒發、或發射時本機正在發射）；
+ *   raw↑ 但 ok=0 且 crc/resync↑ → 有訊號但幀壞掉（誤碼或被自己的發射截斷）；
+ *   ok↑ → 命令真的收到了，問題在後面的 ARM/狀態閘。
+ *   先前完全沒有這個資訊，地面站按 ARM 沒反應時無從判斷斷在哪一段。 */
 static uint8_t  s_last_cmd = 0;
+static volatile uint32_t s_raw_bytes = 0;
 
 static void ring_push(uint8_t b)
 {
@@ -120,9 +127,11 @@ void UplinkCmd_OnUart3RxEvent(uint16_t size)
 
     if (size > old) {
         for (uint16_t i = old; i < size; i++) ring_push(s_rxbuf[i]);
+        s_raw_bytes += (uint32_t)(size - old);
     } else {
         for (uint16_t i = old; i < U3R_DMA_SZ; i++) ring_push(s_rxbuf[i]);
         for (uint16_t i = 0; i < size; i++)         ring_push(s_rxbuf[i]);
+        s_raw_bytes += (uint32_t)(U3R_DMA_SZ - old) + size;
     }
     s_dma_old_pos = (size >= U3R_DMA_SZ) ? 0U : size;
 }
@@ -141,9 +150,18 @@ void UplinkCmd_OnUart3Error(void)
     /* ★DMA 接收下 ORE 屬「非阻斷錯誤」：HAL 只發錯誤回呼，接收其實還活著。
      * 這種情況不可重掛（會回 HAL_BUSY），也不可把 s_dma_old_pos 歸零——DMA 寫入
      * 位置沒有跟著回到 0，歸零會讓下一次事件重讀一整段舊資料。
-     * 只有 HAL 真的把接收停掉時才需要、也才能重掛。 */
+     * 只有 HAL 真的把接收停掉時才需要、也才能重掛。
+     * ★但「RxState != BUSY_RX」不等於「現在可以重掛」——lora_e22.c 的設定模式一開始
+     *   就用 HAL_UART_AbortReceive() 把 RxState 打回 READY，一路到離開設定模式前都
+     *   是這個狀態；若這個 ISR（不受任何任務優先權節制）在這段窗口內被 M1 切換/baud
+     *   改變觸發的雜訊 ORE 打進來，重掛的 DMA 會硬生生把 lora_e22.c 正在阻塞輪詢等待
+     *   的模組回應位元組搶走（DMA 永遠比軟體輪詢快），造成 `e22 freq/pwr/air` 每次
+     *   都 st=3(HAL_TIMEOUT)、回讀全 0。故先查 LoRaE22_IsInConfigMode()：正在設定
+     *   模式就不搶，離開時 lora_e22.c 自己會呼叫這支重掛。 */
     if (huart3.RxState != HAL_UART_STATE_BUSY_RX) {
-        uplink_u3_rx_rearm();
+        if (!LoRaE22_IsInConfigMode()) {
+            uplink_u3_rx_rearm();
+        }
     } else {
         UplinkRx_Init(&s_rx);        /* 位元組流缺了一段：解析器仍需回到重找 sync */
         UplinkTextRx_Init(&s_trx);
@@ -178,13 +196,27 @@ void UplinkCmd_Poll(uint32_t now_ms)
                 UplinkCmd_SetAck(seq, ACK_OK, "ping");
                 break;
             case UPLINK_CMD_ARM:
+                {
+                    extern volatile uint8_t g_flash_erase_in_progress;
+                    if (g_flash_erase_in_progress) {
+                        /* flash erase 阻塞式跑在另一個任務，此時擦除區塊可能尚未淨空，
+                         * 不可讓 ARM 生效並開始記錄（見 main.c 的 g_flash_erase_in_progress）。 */
+                        printf("[UPLINK] ARM 忽略：flash erase 進行中 seq=%u\r\n", (unsigned)seq);
+                        UplinkCmd_SetAck(seq, ACK_REJECTED, "arm");
+                        break;
+                    }
+                }
                 s_armed = 1; s_arm_tick = now_ms;
                 {
                     extern FlightState_t current_fsm_state;
                     extern FSM_Context_t g_fsm_ctx;
+                    extern void ExtremaTrack_Reset(void);
                     if (current_fsm_state == STATE_INIT || current_fsm_state == STATE_PAD) {
                         FSM_SetState(&g_fsm_ctx, STATE_PAD_ARMED);
                     }
+                    /* 下鏈滾動極值歸零：ARM 即本次飛行的起算點，把先前地面測試/搬動
+                     * 累積的最大高度/速度/G 清掉（見 main.c ExtremaTrack_Reset）。 */
+                    ExtremaTrack_Reset();
                 }
                 printf("[UPLINK] *** ARMED -> STATE_PAD_ARMED ***\r\n");
                 UplinkCmd_SetAck(seq, ACK_OK, "arm");
@@ -363,11 +395,16 @@ void UplinkCmd_SetArmedState(uint8_t armed)
     s_arm_tick = HAL_GetTick();
 }
 
-void UplinkCmd_GetStats(uint32_t *rx_ok, uint32_t *rx_crc_err, uint8_t *last_cmd)
+void UplinkCmd_GetStats(UplinkCmdStats_t *out)
 {
-    if (rx_ok)      *rx_ok      = s_rx.ok;
-    if (rx_crc_err) *rx_crc_err = s_rx.crc_err;
-    if (last_cmd)   *last_cmd   = s_last_cmd;
+    if (!out) return;
+    out->raw_bytes    = s_raw_bytes;
+    out->bin_ok       = s_rx.ok;
+    out->bin_crc_err  = s_rx.crc_err;
+    out->bin_resync   = s_rx.resync;
+    out->text_ok      = s_trx.ok;
+    out->text_crc_err = s_trx.crc_err;
+    out->last_cmd     = s_last_cmd;
 }
 
 #endif /* FEATURE_UPLINK_DEPLOY */

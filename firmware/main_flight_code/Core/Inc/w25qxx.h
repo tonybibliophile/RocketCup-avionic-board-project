@@ -309,7 +309,26 @@ typedef struct __attribute__((packed)) {
     int16_t  gps_spd_cms;    /* [78..79] GPS 地速 (cm/s) */
     uint8_t  gps_sats;       /* [80]     GPS 衛星數 */
     uint8_t  gps_fix;        /* [81]     GPS 定位品質 */
-    uint8_t  reserved[44];   /* [82..125] 預留，維持 128B sector 對齊 */
+    uint8_t  reserved0[2];   /* [82..83] 對齊 flight_tick_ms 至 4-byte 邊界 */
+    uint32_t flight_tick_ms; /* [84..87] ★起飛後經過時間 (ms)＝HAL_GetTick()−flight_start_tick；
+                              *          未起飛(PAD_ARMED/LANDED 前)為 0。熱重啟判斷與
+                              *          flight_start_tick 還原只能用這個欄位——tick_ms 是
+                              *          「開機以來」的絕對 tick，重啟後歸零、跨重啟無意義。 */
+
+    /* === [88..97] 跨熱重啟保存的飛行摘要（★2026-07-30 自 reserved 切出，封包仍是 128B）===
+     * 這些值平時只活在 RAM（main.c g_max_*／g_drogue_alt_m／g_main_alt_m），飛行中一次
+     * brownout/IWDG 重置就會全部歸零——而它們正是「火箭無法回收時唯一能知道飛多高／多快／
+     * 幾 G／傘在什麼高度開」的資料，歸零等於整場飛行的關鍵數字消失。
+     * 每筆 ring 封包都重複寫入（成本 0，本來就是 reserved 空間），熱重啟時由
+     * FlashRing_GetLastPacket() 讀最後一筆還原（見 main.c hs.restore 區塊）。
+     * ⚠ 語意與下鏈 telemetry.h 的同名欄位完全一致（單位/哨兵值都相同），改動要同步。 */
+    uint16_t max_alt_m;      /* [88..89] 起飛後最大相對高度 (m) */
+    int16_t  max_vel_ms;     /* [90..91] 起飛後最大垂直速度 (m/s) */
+    uint16_t max_acc_cg;     /* [92..93] 起飛後最大合加速度 |a| (cg = 0.01g)，BMI088 */
+    int16_t  drogue_alt_m;   /* [94..95] 副傘實際開傘相對高度 (m)；未開傘 = -32768 */
+    int16_t  main_alt_m;     /* [96..97] 主傘實際開傘相對高度 (m)；未開傘 = -32768 */
+
+    uint8_t  reserved[28];   /* [98..125] 預留，維持 128B sector 對齊 */
     uint16_t crc16;          /* [126..127] CRC-16/CCITT */
 } FlashRingPacket_t;
 _Static_assert(sizeof(FlashRingPacket_t) == FLASH_RING_PACKET_SIZE,
@@ -326,6 +345,43 @@ _Static_assert(sizeof(FlashRingPacket_t) == FLASH_RING_PACKET_SIZE,
 void FlashRing_Init(void);
 void FlashRing_InitEx(void (*progress_cb)(uint32_t current, uint32_t total));
 uint8_t FlashRing_GetErasePct(void);
+
+/**
+ * @brief  ★P0：僅掃描寫入頭，不擦除。開機序列須先呼叫此函式、用 FlashRing_GetLastPacket()
+ *         讀出最後一筆封包並完成「是否為空中熱重啟」判斷後，才可呼叫 FlashRing_RunPreErase()
+ *         或 FlashRing_SkipPreErase()。絕不可在讀最後一筆封包前跑 bulk 預擦，否則會把
+ *         熱重啟判斷要讀的資料連同寫入頭所在 Sector 一起擦掉。
+ */
+void FlashRing_ScanWriteHeadOnly(void);
+
+/**
+ * @brief  ★P0：確定不是空中熱重啟後才呼叫，執行 960-sector bulk 預擦（行為同舊版
+ *         FlashRing_InitEx 的預擦段）。
+ */
+void FlashRing_RunPreErase(void (*progress_cb)(uint32_t current, uint32_t total));
+
+/**
+ * @brief  ★2026-07-31：唯讀認領已擦區並更新池，全程零擦除（開機序列冷/熱兩條路徑共用）。
+ *         開機不再自動 bulk 預擦，池改由使用者觸發的 `flash erase` / `flash pool` 建立，
+ *         本函式負責重開機後把那片已擦區找回來。誤差方向安全：只會低估、不會高估。
+ * @return 認領到的池大小（sectors），上限 FLASH_RING_PREERASE_TARGET
+ */
+uint32_t FlashRing_ProbePoolNoErase(void);
+
+/**
+ * @brief  ★2026-07-31：快速填池（`flash pool` 指令）。只補到 FLASH_RING_PREERASE_TARGET
+ *         達標，已擦部分不重擦。飛前正規流程仍應走 `flash erase`（整環全擦）。
+ * @return 補完後的池大小（sectors）
+ */
+uint32_t FlashRing_TopUpPool(void (*progress_cb)(uint32_t current, uint32_t total));
+
+/**
+ * @brief  ★P0：確定是空中熱重啟時呼叫，全程零擦除；改以唯讀探測把開機序列留在 flash 上的
+ *         已擦區找回來當池（上限仍是 FLASH_RING_PREERASE_TARGET），讓重啟後能繼續記錄。
+ *         呼叫端應緊接著呼叫 FlashRing_SetEraseAllowed(0) 關閉飛行中同步擦除——池耗盡時
+ *         仍走既有的「池滿即丟包」保護，絕不在飛行中擦除。
+ */
+void FlashRing_SkipPreErase(void);
 
 /**
  * @brief  寫入一筆飛行數據封包至環形緩衝區
@@ -391,7 +447,8 @@ W25QXX_StatusTypeDef Flash_WriteSysFlags(FlashSysFlags_t *flags);
 W25QXX_StatusTypeDef Flash_ReadSysFlags(FlashSysFlags_t *flags);
 W25QXX_StatusTypeDef Flash_WriteMissionSummary(FlashMissionSummary_t *summary);
 
-/** @brief 開機完整 Dump 三分區至 USART2（USER_BT1 按住開機觸發；P2 自 w25q128.c 併入）。
+/** @brief 開機完整 Dump 三分區至 USART2（USER_BT1 按住開機觸發，需 FEATURE_USER_BUTTONS=1；
+ *         預設關閉，見 board_config.h。P2 自 w25q128.c 併入）。
  *         呼叫端須持 SPI3 鎖（main.c 既有作法），內部每頁讀取自動餵狗。 */
 void Flash_DumpAll(void);
 

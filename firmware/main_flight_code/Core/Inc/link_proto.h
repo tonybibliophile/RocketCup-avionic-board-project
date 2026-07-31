@@ -47,11 +47,14 @@ typedef struct __attribute__((packed)) {
     int16_t  q_x;          /* 四元數 qx * 10000 [-10000, 10000] */
     int16_t  q_y;          /* 四元數 qy * 10000 [-10000, 10000] */
     int16_t  q_z;          /* 四元數 qz * 10000 [-10000, 10000] */
-    uint8_t  main_arb;     /* D2 主傘舵機互斥握手狀態（SERVO_ARB_MSG_*，servo_arb.h） */
+    uint8_t  main_arb;     /* 主傘共開 / BENCH 狀態（SERVO_ARB_MSG_*，servo_arb.h；互斥握手已取消） */
     uint8_t  flash_ready;  /* 1 = 本板 Flash 預擦池已達目標 (960 sectors) */
     uint8_t  erase_pct;    /* 本板 Flash 預擦進度 0..100% */
     int32_t  vf_h_cm;      /* 垂直濾波器 (VF) 高度 (cm)：供對端中繼下鏈，與 EKF 對照 */
     int32_t  vf_v_cms;     /* 垂直濾波器 (VF) 垂直速度 (cm/s) */
+    int16_t  bmi_mag_cg;   /* BMI088 加速度模長 |a| (cg = 0.01g)：供對端中繼下鏈，與本板原始加速度對照 */
+    int16_t  adxl_mag_cg;  /* ADXL375 加速度模長 |a| (cg = 0.01g) */
+    uint8_t  profile_flags; /* TELEM_PROFILE_SELF_ELEVATOR：本板是否仍以電梯測試 profile 編譯（供對端/地面站中繼） */
     uint16_t crc16;        /* CRC-16/CCITT-FALSE，覆蓋本封包前面所有位元組 */
 } LinkPacket_t;
 
@@ -73,11 +76,14 @@ typedef struct {
     int16_t  q_x;
     int16_t  q_y;
     int16_t  q_z;
-    uint8_t  main_arb;     /* D2 主傘舵機互斥握手狀態（呼叫端填 ServoArb 廣播值） */
+    uint8_t  main_arb;     /* 主傘共開 / BENCH 狀態（呼叫端填 ServoArb 廣播值） */
     uint8_t  flash_ready;  /* 1 = 本板 Flash 預擦池已達目標 (960 sectors) */
     uint8_t  erase_pct;    /* 本板 Flash 預擦進度 0..100% */
     int32_t  vf_h_cm;      /* 垂直濾波器 (VF) 高度 (cm) */
     int32_t  vf_v_cms;     /* 垂直濾波器 (VF) 垂直速度 (cm/s) */
+    int16_t  bmi_mag_cg;   /* BMI088 加速度模長 |a| (cg = 0.01g) */
+    int16_t  adxl_mag_cg;  /* ADXL375 加速度模長 |a| (cg = 0.01g) */
+    uint8_t  profile_flags; /* 呼叫端填 TELEM_PROFILE_SELF_ELEVATOR（本板 FLIGHT_PROFILE_ELEVATOR 編譯期值） */
 } LinkStatus_t;
 
 /**

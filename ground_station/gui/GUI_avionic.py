@@ -92,8 +92,19 @@ class AvionicMonitorGUI:
         self.chart_dirty = False
         _N = 6000
         self.ts_alt_ekf = deque(maxlen=_N)
-        self.ts_alt_baro = deque(maxlen=_N)
+        self.ts_alt_baro = deque(maxlen=_N)      # 氣壓高度，已扣掉 pad_ref → 相對起點 (m)
+        self.ts_alt_ground = deque(maxlen=_N)    # 航電原生 braw_cm（1Hz），未經 VF/EKF 融合
         self.ts_alt_vf = deque(maxlen=_N)
+        self.pad_ref = gt.PadRefTracker()
+        # 電梯測試 profile 醒目警示：本 GUI 直連 USB，來源只有航電板自己印的
+        # [PAD_CFG] Flight Profile:（10s 一行，權威、會明講已切回正式版）與
+        # [ELEVATOR_TEST_WARNING]（1s 一行，只在仍是電梯 profile 時才印）。
+        # 兩個時間戳走 3 秒新鮮度窗口，語意與 gui_monitor.py 同一套。
+        self._elevator_self_ts = 0.0
+        self._elevator_peer_ts = 0.0
+        # ★2026-07-31：Flash 未擦除提醒（來源＝航電 1Hz 的 [FLASH_NOT_READY] 行）
+        self._flash_need_erase_ts = 0.0
+        self._flash_need_erase_detail = ""
         self.ts_vz_ekf = deque(maxlen=_N)
         self.ts_vz_vf = deque(maxlen=_N)
         self.ts_acc_bmi = deque(maxlen=_N)
@@ -134,6 +145,12 @@ class AvionicMonitorGUI:
     def build_ui(self):
         top_container = tk.Frame(self.root, bg=gt.BG_ROOT)
         top_container.pack(fill=tk.X, side=tk.TOP, padx=10, pady=(5, 0))
+        # 橫幅擠在最上方（pack(before=...)，見 gui_theme.update_elevator_banner），
+        # 平時不 pack、偵測到電梯 profile 才出現並閃爍。
+        self.elevator_banner = gt.make_elevator_banner(self.root)
+        # ★2026-07-31：Flash 未擦除橫幅。航電開機不再自動擦除，池未達標會擋 ARM——
+        # 本工具是直連 USB 的操作台，[FLASH_NOT_READY] 1Hz 行直接進得來。
+        self.flash_banner = gt.make_flash_banner(self.root)
 
         top_bar = tk.Frame(top_container, bg=gt.BG_ROOT)
         top_bar.pack(fill=tk.X, side=tk.TOP)
@@ -253,6 +270,8 @@ class AvionicMonitorGUI:
             ("MMC5983", "mag", "0.00 Hz", gt.RED),
             ("GPS Update", "gps", "0.00 Hz", gt.MAGENTA),
             ("高度 (EKF)", "alt", "-- m", gt.GREEN),
+            ("相對起點 (baro)", "ground_alt", "-- m", gt.ORANGE),
+            ("零點 pad_ref", "pad_ref", "-- m", gt.TXT_MUTED),
             ("Vz 垂直速度", "vz", "-- m/s", gt.GREEN),
             ("加速度 |a|", "acc", "-- g", gt.GREEN),
             ("電池", "bat", "-- V", gt.ORANGE),
@@ -375,8 +394,13 @@ class AvionicMonitorGUI:
             gt.style_axes(ax, ylab)
         self.ax_acc.set_xlabel("t (s)", color=gt.TXT_DIM, fontsize=9)
 
+        # 三條線同零點（發射台）：EKF/VF 本來就是相對值，Baro 這條在 append 時已扣掉
+        # pad_ref。原本畫的是絕對海拔，跟另兩條差一個發射台海拔的常數偏移（場測 log 出現過
+        # 25 m / 47.6 m / 101 m），高度軸被撐開後相對線全糊在一起。
         self.ln_alt_ekf, = self.ax_alt.plot([], [], color=gt.CYAN_HI, lw=1.6, label="EKF")
-        self.ln_alt_baro, = self.ax_alt.plot([], [], color="#ff9800", lw=0.9, label="Baro raw")
+        self.ln_alt_baro, = self.ax_alt.plot([], [], color="#ff9800", lw=0.9, label="Baro 相對 10Hz")
+        self.ln_alt_ground, = self.ax_alt.plot([], [], color="#ffffff", lw=1.0, ls="-.", alpha=0.85,
+                                                label="航電 braw 1Hz")
         self.ln_alt_vf, = self.ax_alt.plot([], [], color=gt.AMBER, lw=1.1, label="VF")
 
         self.ln_vz_ekf, = self.ax_vel.plot([], [], color=gt.CYAN_HI, lw=1.6, label="EKF Vz")
@@ -470,6 +494,53 @@ class AvionicMonitorGUI:
         # 本 GUI 沒有獨立「指令/回應」小視窗，直接標記進終端即可（tag=rate 高亮 CMD 回音）
         self.append_console(text + "\n", "rate" if tag == "cmd" else ("ok" if tag == "resp" else tag))
 
+    # ---------------- 電梯測試 profile 醒目警示（語意同 gui_monitor.py） ----------------
+    def _handle_pad_cfg_profile_line(self, line):
+        """[PAD_CFG] Flight Profile: ELEVATOR_TEST(...) / REAL_FLIGHT(...)，10s 一行，只講本板。
+        是唯一會明講「已切回正式版」的權威來源，故 REAL_FLIGHT 直接歸零、不等窗口逾時。"""
+        self._elevator_self_ts = time.time() if "ELEVATOR_TEST" in line else 0.0
+        self._refresh_elevator_banner()
+
+    def _handle_elevator_warning_line(self, line):
+        """!!! [ELEVATOR_TEST_WARNING] THIS BOARD / PEER BOARD ... !!!（1s 一行，見 main.c）"""
+        now = time.time()
+        who = []
+        if "THIS BOARD" in line:
+            self._elevator_self_ts = now
+            who.append("本板")
+        if "PEER BOARD" in line:
+            self._elevator_peer_ts = now
+            who.append("對端(副板)")
+        self._refresh_elevator_banner()
+        gt.spam_elevator_console_warning(self.console, "+".join(who))
+
+    def _refresh_elevator_banner(self):
+        """3 秒新鮮度窗口；由 poll_queue 每輪呼叫，故不需要另設逾時計時器。"""
+        now = time.time()
+        self_active = (now - self._elevator_self_ts) < 3.0
+        peer_active = (now - self._elevator_peer_ts) < 3.0
+        who = []
+        if self_active: who.append("本板")
+        if peer_active: who.append("對端(副板)")
+        gt.update_elevator_banner(self.root, self.elevator_banner,
+                                  self_active or peer_active, "+".join(who))
+
+    # ---- ★2026-07-31：Flash 未擦除提醒 ----
+    def _handle_flash_not_ready_line(self, line):
+        """[FLASH_NOT_READY] 已擦池 320/1500 sectors —— ARM 已被擋下（航電 1Hz 輸出）。
+        航電開機不再自動擦除，這是操作員在按 ARM 之前唯一的提醒來源。"""
+        self._flash_need_erase_ts = time.time()
+        m = re.search(r"已擦池\s*(\d+)\s*/\s*(\d+)", line)
+        self._flash_need_erase_detail = (f"池 {m.group(1)}/{m.group(2)} sectors"
+                                         if m else "池未達標")
+        self._refresh_flash_banner()
+
+    def _refresh_flash_banner(self):
+        """5 秒新鮮度窗口（來源是 1Hz，容忍少量丟行）；擦完航電就不再送，橫幅自動消失。"""
+        active = (time.time() - self._flash_need_erase_ts) < 5.0
+        gt.update_flash_banner(self.root, self.flash_banner, active,
+                               self._flash_need_erase_detail if active else "")
+
     # ------------------------------------------------------------------
     def poll_queue(self):
         max_lines = 80
@@ -481,7 +552,15 @@ class AvionicMonitorGUI:
                 self.console.insert(tk.END, line + "\n", "err")
                 self.disconnect_serial()
                 break
-            tag = ("ack" if "[ACK]" in line else
+            # 電梯測試 profile：先於一般 tag 判斷（否則會被下面的 "WARNING"→err 吃掉）
+            if "[ELEVATOR_TEST_WARNING]" in line:
+                self._handle_elevator_warning_line(line)
+            elif "[PAD_CFG]" in line and "Flight Profile:" in line:
+                self._handle_pad_cfg_profile_line(line)
+            elif "[FLASH_NOT_READY]" in line:
+                self._handle_flash_not_ready_line(line)
+            tag = ("elevator_warn" if "[ELEVATOR_TEST_WARNING]" in line else
+                   "ack" if "[ACK]" in line else
                    "rate" if "[RATE]" in line else
                    "mag" if "[MAG]" in line else
                    "gps" if "[GPS]" in line else
@@ -502,6 +581,11 @@ class AvionicMonitorGUI:
                 self.console.see(tk.END)
             except tk.TclError:
                 pass
+        # 新鮮度窗口逾時（斷線或已切回正式版）要自動收合橫幅
+        try:
+            self._refresh_elevator_banner()
+        except tk.TclError:
+            pass
         try:
             if self.root.winfo_exists():
                 self.root.after(10, self.poll_queue)
@@ -541,6 +625,10 @@ class AvionicMonitorGUI:
             return
 
         if "[FSM]" in line:
+            # 發射台氣壓零點重零（PAD 期每 30s，ARM 後停）——相對起點高度的分母
+            if self.pad_ref.feed(line):
+                self._refresh_pad_ref_card()
+                return
             m_hb = re.search(r"state=([A-Z_]+)\s+role=(\w+)", line)
             m_ev = re.search(r"(STATE_[A-Z_]+)", line)
             _SHORTNAME_MAP = {
@@ -606,10 +694,14 @@ class AvionicMonitorGUI:
             t = self.now_t()
             acc_bmi = (v[0] ** 2 + v[1] ** 2 + v[2] ** 2) ** 0.5 / 1000.0
             acc_adxl = (v[3] ** 2 + v[4] ** 2 + v[5] ** 2) ** 0.5 / 1000.0
-            baro_alt = v[8] / 100.0
+            baro_alt = v[8] / 100.0          # 絕對海拔（韌體 baro_data.altitude）
             self.ts_acc_bmi.append((t, acc_bmi))
             self.ts_acc_adxl.append((t, acc_adxl))
-            self.ts_alt_baro.append((t, baro_alt))
+            # 扣掉當下生效的 pad_ref（逐點扣，不是畫圖時才扣）——這樣重零後舊點仍保留
+            # 當時航電實際採用的零點，跟韌體 in.baro_alt_rel 的逐筆算法一致。
+            baro_rel = self.pad_ref.rel(baro_alt)
+            if baro_rel is not None:
+                self.ts_alt_baro.append((t, baro_rel))
             self.cards["acc"].config(text=f"{acc_bmi:.2f} g")
             self.chart_dirty = True
             return
@@ -622,6 +714,14 @@ class AvionicMonitorGUI:
                 vfv = int(m.group(2)) / 100.0
                 self.ts_alt_vf.append((t, vfh))
                 self.ts_vz_vf.append((t, vfv))
+                self.chart_dirty = True
+            # braw_cm = 航電自己算的 baro_alt_rel（未經 VF/EKF 融合），1Hz。
+            # 這是「航電認為自己相對起點多高」的原始值，優先於上面 10Hz 推導版顯示於卡片。
+            m_braw = re.search(r"braw_cm=(-?\d+)", line)
+            if m_braw:
+                braw = int(m_braw.group(1)) / 100.0
+                self.ts_alt_ground.append((self.now_t(), braw))
+                self.cards["ground_alt"].config(text=f"{braw:+.1f} m")
                 self.chart_dirty = True
             return
 
@@ -821,17 +921,28 @@ class AvionicMonitorGUI:
     def _on_bench_test(self):
         ans = messagebox.askyesno(
             "手動桌面測試確認 (BENCH)",
-            "確定要發送『桌面點火/舵機測試 (BENCH)』指令嗎？\n\n"
-            "⚠️ 注意：\n"
-            "1. 航電將依序執行 PD13 點火通電 (8 秒)、1s Guard 意圖確認與 PD14 舵機轉動測試。\n"
-            "2. 全程耗時約 25 秒，測試完成後自動復位並回歸正常 FSM。\n"
-            "3. 航電必須處於解鎖狀態 (STATE_PAD_ARMED)。\n\n"
+            "確定要發送『桌面開傘測試 (BENCH)』指令嗎？\n\n"
+            "⚠️ 注意（時序與飛行邏輯 1:1 對應）：\n"
+            "1. 引傘 PD13：主板 t=0 起通電 8s；副板延後 4s（模擬頂點提前量）後通電 3s，\n"
+            "   兩板通電窗會重疊（PD13 為 diode-OR 準位訊號，同時拉高無妨）。\n"
+            "2. 主傘 PD14：★不啟動 PWM，兩板『同時』純 GPIO 拉高 1.5s（已取消互斥握手）。\n"
+            "3. 全程耗時約 20 秒，測試完成後自動復位並回歸正常 FSM。\n"
+            "4. 航電必須處於解鎖狀態 (STATE_PAD_ARMED)。\n\n"
             "是否立即執行？")
         if ans:
             self.send_command("bench")
 
     # ------------------------------------------------------------------
+    def _refresh_pad_ref_card(self):
+        """零點卡片：值 + 「幾秒前重零」/「已凍結」。文字沒變就不動 widget。"""
+        text, color = self.pad_ref.label_text()
+        if getattr(self, "_pad_ref_text", None) != text:
+            self._pad_ref_text = text
+            self.cards["pad_ref"].config(text=text, foreground=color)
+
     def charts_redraw_loop(self):
+        # 「幾秒前重零」要自己走鐘，不能只在收到 pad_ref 行時更新
+        self._refresh_pad_ref_card()
         if self.chart_dirty:
             self.redraw_charts()
             self.chart_dirty = False
@@ -854,6 +965,7 @@ class AvionicMonitorGUI:
 
         self.ln_alt_ekf.set_data(*clipped(self.ts_alt_ekf))
         self.ln_alt_baro.set_data(*clipped(self.ts_alt_baro))
+        self.ln_alt_ground.set_data(*clipped(self.ts_alt_ground))
         self.ln_alt_vf.set_data(*clipped(self.ts_alt_vf))
         self.ln_vz_ekf.set_data(*clipped(self.ts_vz_ekf))
         self.ln_vz_vf.set_data(*clipped(self.ts_vz_vf))

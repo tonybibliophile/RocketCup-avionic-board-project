@@ -78,6 +78,19 @@ static float    EKF_gps_meas_E CCMRAM = 0.0f;           // pending measured East
 static float    EKF_gps_meas_N CCMRAM = 0.0f;           // pending measured North (m, rel. launchpad)
 static float    EKF_gps_R CCMRAM = 25.0f;               // pending measurement variance (m^2)
 
+// Launchpad origin is locked from the mean of several fixes rather than a single
+// sample: one lucky/unlucky fix under a hard hAcc threshold still carries its full
+// noise into a permanent, never-revisited reference; averaging N fixes divides
+// that noise by sqrt(N) instead.
+#define EKF_GPS_ORIGIN_AVG_N        25U      // ~1s of fixes @ GPS's configured 25Hz rate
+#define EKF_GPS_ORIGIN_MAX_HACC_MM  50000U   // loose sanity ceiling (50m): reject only clearly-broken
+                                              // outlier fixes (e.g. multipath) from entering the average;
+                                              // the averaging itself is what brings the noise down, this
+                                              // just stops one bad sample from skewing a small-N mean
+static int64_t  EKF_gps_origin_lat_sum CCMRAM = 0;      // accumulating deg x1e6 for origin averaging
+static int64_t  EKF_gps_origin_lon_sum CCMRAM = 0;
+static uint16_t EKF_gps_origin_sample_count CCMRAM = 0;
+
 // --- Magnetometer heading (yaw) fusion ---
 // Written by defaultTask via EKF_SubmitMag(), consumed once per buffer in EKF_Task.
 static volatile uint8_t EKF_mag_pending CCMRAM = 0;     // 1 = a mag vector awaits application
@@ -90,7 +103,7 @@ static const float Q_pos = 0.005f;  // Position process noise variance
 static const float Q_vel = 0.1f;    // Velocity process noise variance
 
 // Measurement noise covariance for Barometer altitude
-static const float R_baro = 0.36f;  // ~0.6m altitude measurement stddev
+static const float R_baro = 0.04f;  // ~0.2m altitude measurement stddev (2026-07-13 static bench measurement, was 0.36f/0.6m)
 
 // Gravity constant in ENU
 static const float GRAVITY = 9.80665f;
@@ -211,6 +224,9 @@ void EKF_Init(void) {
     EKF_gps_meas_E = 0.0f;
     EKF_gps_meas_N = 0.0f;
     EKF_gps_R = 25.0f;
+    EKF_gps_origin_lat_sum = 0;
+    EKF_gps_origin_lon_sum = 0;
+    EKF_gps_origin_sample_count = 0;
 
     // Magnetometer fusion: clear pending
     EKF_mag_pending = 0;
@@ -583,16 +599,31 @@ static void EKF_UpdateGPS(float meas_E, float meas_N, float R) {
 
 // GPS injection from defaultTask (~1 Hz). Captures the launchpad origin on the
 // first valid post-calibration fix, then publishes a pending ENU measurement.
-void EKF_SubmitGPS(int32_t lat_1e6, int32_t lon_1e6, uint8_t satellites) {
+void EKF_SubmitGPS(int32_t lat_1e6, int32_t lon_1e6, uint8_t satellites, uint32_t hacc_mm) {
     // Only fuse once stationary calibration is done, so the GPS origin coincides
     // with the same launchpad reference the rest of the EKF state is relative to.
     if (!EKF_calibrated) return;
 
-    // First valid fix defines the launchpad origin (dE = dN = 0 by definition).
+    // Launchpad origin: accumulate EKF_GPS_ORIGIN_AVG_N fixes and lock the origin
+    // to their mean (dE = dN = 0 at the origin by definition) instead of trusting
+    // a single fix — averaging divides the origin's noise by sqrt(N) rather than
+    // just hoping one sample happens to be good.
     if (!EKF_gps_origin_set) {
-        EKF_gps_lat0_1e6 = lat_1e6;
-        EKF_gps_lon0_1e6 = lon_1e6;
-        EKF_gps_coslat0  = cosf((float)lat_1e6 * 1e-6f * DEG2RAD);
+        if (hacc_mm > 0U && hacc_mm > EKF_GPS_ORIGIN_MAX_HACC_MM) {
+            return; // clearly-broken outlier fix: don't let it into the average
+        }
+
+        EKF_gps_origin_lat_sum += lat_1e6;
+        EKF_gps_origin_lon_sum += lon_1e6;
+        EKF_gps_origin_sample_count++;
+
+        if (EKF_gps_origin_sample_count < EKF_GPS_ORIGIN_AVG_N) {
+            return; // still accumulating
+        }
+
+        EKF_gps_lat0_1e6 = (int32_t)(EKF_gps_origin_lat_sum / (int64_t)EKF_gps_origin_sample_count);
+        EKF_gps_lon0_1e6 = (int32_t)(EKF_gps_origin_lon_sum / (int64_t)EKF_gps_origin_sample_count);
+        EKF_gps_coslat0  = cosf((float)EKF_gps_lat0_1e6 * 1e-6f * DEG2RAD);
         EKF_gps_origin_set = 1;
         return;
     }
@@ -604,12 +635,29 @@ void EKF_SubmitGPS(int32_t lat_1e6, int32_t lon_1e6, uint8_t satellites) {
     float meas_N = dlat_deg * DEG2RAD * EARTH_RADIUS_M;
     float meas_E = dlon_deg * DEG2RAD * EARTH_RADIUS_M * EKF_gps_coslat0;
 
-    // Inflate measurement noise when the fix is weak (few satellites).
+    // Measurement noise from the receiver's own per-fix horizontal accuracy
+    // estimate (UBX-NAV-PVT hAcc, mm) instead of a satellite-count guess: the
+    // module already solves for this every fix, so R = hAcc^2 directly. Floored
+    // at 1 m sigma (a real fix is never trusted better than that here, even if
+    // hAcc briefly reports less right after acquisition) and capped at the old
+    // worst-case tier so a garbage value can't blow up P. hacc_mm == 0 means no
+    // UBX PVT accuracy estimate was available (e.g. NMEA-only fallback path) —
+    // fall back to the old satellite-count tiers in that case only.
     float R;
-    if      (satellites >= 8) R = 6.25f;    // ~2.5 m sigma
-    else if (satellites >= 6) R = 25.0f;    // ~5 m
-    else if (satellites >= 4) R = 100.0f;   // ~10 m
-    else                      R = 2500.0f;  // barely trust a 3-sat fix
+    if (hacc_mm > 0U) {
+        float hacc_m = (float)hacc_mm * 0.001f;
+        R = hacc_m * hacc_m;
+        if (R < 1.0f) R = 1.0f;
+        if (R > 2500.0f) R = 2500.0f;
+    } else if (satellites >= 8) {
+        R = 6.25f;    // ~2.5 m sigma
+    } else if (satellites >= 6) {
+        R = 25.0f;    // ~5 m
+    } else if (satellites >= 4) {
+        R = 100.0f;   // ~10 m
+    } else {
+        R = 2500.0f;  // barely trust a 3-sat fix
+    }
 
     // Publish atomically; EKF_Task (higher priority) may preempt mid-write.
     taskENTER_CRITICAL();

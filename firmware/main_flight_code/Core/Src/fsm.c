@@ -84,9 +84,14 @@ FSM_Action_t FSM_Step(FSM_Context_t *ctx, const FSM_Input_t *in)
 
     /* === P0-B：頂點絕對失效保護（最後防線，不依賴任何感測器/EKF） ===
      * BOOST 與 COAST 皆生效：即使燒完判定失效卡在 BOOST、或 EKF 向上發散使
-     * 頂點條件永不成立，起飛後 FSM_FAILSAFE_APOGEE_MS 仍強制點火副傘。 */
+     * 頂點條件永不成立，起飛後失效保護仍強制點火副傘。
+     * 主/副航電各用各的失效保護時限：主航電提前 DROGUE_LEAD_TIME_S 開傘，用
+     * FSM_FAILSAFE_APOGEE_MS；副航電改為只在真頂點才開，用 FSM_FAILSAFE_APOGEE_BACKUP_MS
+     * （= FSM_FAILSAFE_APOGEE_MS + DROGUE_LEAD_TIME_S），避免與副航電自身正常偵測搶跑。 */
+    const uint32_t failsafe_apogee_ms = IS_PRIMARY ? FSM_FAILSAFE_APOGEE_MS
+                                                    : FSM_FAILSAFE_APOGEE_BACKUP_MS;
     if ((ctx->state == STATE_BOOST || ctx->state == STATE_COAST) &&
-        (now - ctx->flight_start_ms) >= FSM_FAILSAFE_APOGEE_MS) {
+        (now - ctx->flight_start_ms) >= failsafe_apogee_ms) {
         ctx->state            = STATE_DEPLOY_DROGUE;   // 走同一顆馬達狀態，非直接跳 APOGEE
         ctx->state_entered_ms = now;
         ctx->drogue_start_ms   = now;   // 記錄馬達啟動 tick
@@ -205,35 +210,40 @@ FSM_Action_t FSM_Step(FSM_Context_t *ctx, const FSM_Input_t *in)
                 baro_apogee = (ctx->consec_baro_drop >= FSM_BARO_APOGEE_CONSEC) ? 1U : 0U;
             }
 
-            // 頂點判定條件（三路徑，估計器健康時皆生效；路徑1 由 FSM_APOGEE_DYNAMIC_PREDICT_ENABLED
+            // 頂點判定條件（估計器健康時皆生效；路徑1 由 FSM_APOGEE_DYNAMIC_PREDICT_ENABLED
             // 依 profile 開關 —— 該路徑的 decel fallback 假設「v_est 隨時間由大降到0」，僅真實彈道
             // COAST 段成立，電梯全程近似等速違反此假設，關閉見 fsm.h 該巨集註解）：
-            // 1. 主路徑：動態預測時間 <= DROGUE_LEAD_TIME_S(3.0s)，且仍處於上升狀態 (v_est > 0)
-            // 2. 備用路徑：垂直速度過零 (v_est < -FSM_APOGEE_VFALL_MPS)
-            // 3. 備用路徑：高度自峰值下降超過 FSM_APOGEE_ALT_DROP_M
-            // 4. P0-B：baro 原始趨勢交叉檢查（上方 baro_apogee，不依賴估計器，恆生效）
+            // 1. 主路徑（僅主航電 IS_PRIMARY）：動態預測時間 <= DROGUE_LEAD_TIME_S(4.0s)，
+            //    且仍處於上升狀態 (v_est > 0)——主航電提前開引傘。
+            //    副航電不走此路徑，改為只在真正頂點才開（路徑 2/3/4，見下）。
+            // 2. 真頂點路徑：垂直速度過零 (v_est < -FSM_APOGEE_VFALL_MPS)
+            // 3. 真頂點路徑：高度自峰值下降超過 FSM_APOGEE_ALT_DROP_M
+            // 4. P0-B：baro 原始趨勢交叉檢查（上方 baro_apogee，不依賴估計器，恆生效，亦屬真頂點路徑）
             // 同時 1~3 必須滿足起飛時間鎖（起飛後累計大於 3.0 秒）
             // P0-C：估計器 unhealthy 時停用 1~3（發散的 h_est/v_est 會誤點火），僅留 4 + 失效計時器
             uint8_t apogee_condition = 0;
             if (in->est_healthy) {
 #if FSM_APOGEE_DYNAMIC_PREDICT_ENABLED
-                if (t_to_apogee <= DROGUE_LEAD_TIME_S && v_est > 0.0f) {
-                    apogee_condition = 1;                       /* 主路徑：動態預測 */
+                if (IS_PRIMARY && t_to_apogee <= DROGUE_LEAD_TIME_S && v_est > 0.0f) {
+                    apogee_condition = 1;                       /* 主路徑：動態預測（僅主航電提前開） */
                 } else
 #endif
                 if (v_est < -FSM_APOGEE_VFALL_MPS) {
-                    apogee_condition = 1;                       /* 備用：速度過零 */
+                    apogee_condition = 1;                       /* 真頂點：速度過零 */
                 } else if ((ctx->max_altitude - h_est) >= FSM_APOGEE_ALT_DROP_M) {
-                    apogee_condition = 1;                       /* 備用：高度自峰值回落 */
+                    apogee_condition = 1;                       /* 真頂點：高度自峰值回落 */
                 }
             }
-            if (baro_apogee) apogee_condition = 1;              /* P0-B：baro 趨勢交叉檢查 */
+            if (baro_apogee) apogee_condition = 1;              /* P0-B：baro 趨勢交叉檢查（真頂點） */
 
-            /* D1 加法 OR 互救：對端已開副傘 → 本板亦視為到頂點（感測靜默失效時被健康
-             * 鄰板拉著一起開）。嚴格加法：對端沉默則上方各路徑照舊獨立判斷、零回歸。
+            /* D1 加法 OR 互救：僅主航電接受——對端（副航電）已開副傘即視為到頂點，讓主航電
+             * 跟著一起開（副航電只走真頂點路徑 2/3/4，其開傘信號等同「真頂點已到」，可信）。
+             * 反向刻意停用：副航電不接受主航電的提前預測（路徑1）拉動，否則會被主航電
+             * 提前 4s 的動態預測牽走，失去「副航電在真正頂點才開」的設計目的。副航電自身
+             * 偵測若全失效，仍有 P0-B 頂點絕對失效保護 (FSM_FAILSAFE_APOGEE_MS) 兜底。
              * arm-interlock：本 case 僅在 STATE_COAST 執行（必經 BOOST 起飛+燒完），
              * 且下方 FSM_APOGEE_MIN_FLIGHT_MS 起飛時間鎖同樣套用於此路徑，彈射台不誤觸。 */
-            if (in->peer_drogue_cmd) apogee_condition = 1;
+            if (IS_PRIMARY && in->peer_drogue_cmd) apogee_condition = 1;
 
             if (apogee_condition &&
                 (now - ctx->flight_start_ms) > FSM_APOGEE_MIN_FLIGHT_MS) {
@@ -333,7 +343,7 @@ FSM_Action_t FSM_Step(FSM_Context_t *ctx, const FSM_Input_t *in)
                 (now - ctx->flight_start_ms) > FSM_MAIN_WATCHDOG_MS) {
                 ctx->state            = STATE_MAIN_DEPLOY;
                 ctx->state_entered_ms = now;
-                act.deploy_main       = 1U;   // 部署主傘：PD14 釋放舵機 (PWM 脈寬 2000)
+                act.deploy_main       = 1U;   // 部署主傘：PD14 純 GPIO 拉高 SERVO_MAIN_HIGH_MS(1.5s)，不啟 PWM
                 act.event             = FSM_EVT_MAIN_DEPLOY;
             }
             break;
