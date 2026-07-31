@@ -10,9 +10,13 @@
  * static inline，firmware 與 tests/test_vertical_filter.c 共用同一份。
  * 必須 header-only：CubeIDE 產生的 Debug/makefile 不會自動納入新 .c。
  *
- * 參數依據（由 tests/test_vertical_filter.c 五案例調校鎖定）：
- *   VF_R_BARO 0.36  — BMP388 高度噪聲 σ≈0.6m（與 EKF R_baro 同值）
- *   VF_R_ACC  4.0   — ADXL375 高G 換算垂直加速度 σ≈2 m/s²（含傾斜誤差餘裕）
+ * 參數依據（由 tests/test_vertical_filter.c 五案例調校鎖定；2026-07-28 依
+ * 2026-07-13/14 平放靜置實測重新推導 R_BARO/R_ACC，見 p0_flight_safety 記憶）：
+ *   VF_R_BARO 0.04  — BMP388 高度噪聲 σ≈0.2m（2026-07-13 靜置實測；與 EKF R_baro 同值）
+ *   VF_R_ACC  0.25  — 垂直加速度來源現為 BMI088（2026-07-13 起 accel 更新已改餵
+ *                     imu_data.az，非 ADXL375）。BMI088 平放靜置實測 σ≈5mg≈0.05 m/s²，
+ *                     乘 ×10 餘裕（涵蓋飛行中震動/姿態投影誤差，靜置測試並未涵蓋這些
+ *                     動態誤差源）取 σ≈0.5 m/s² → R_ACC=0.25
  *   VF_Q_A    120.0 — 加速度隨機游走密度 (m/s²)²/s：需足以在燒完瞬間
  *                     （+50 → −12 m/s² 步階）數十 ms 內跟上，且 baro-only
  *                     模式仍能單靠氣壓觀測出 coast 段減速度（測試 [2]）
@@ -38,8 +42,8 @@ extern "C" {
 #endif
 
 /* === 參數（調校依據見檔頭） === */
-#define VF_R_BARO        0.36f    /* baro 高度量測噪聲變異數 (m²) */
-#define VF_R_ACC         4.0f     /* 垂直加速度量測噪聲變異數 ((m/s²)²) */
+#define VF_R_BARO        0.04f    /* baro 高度量測噪聲變異數 (m²)：σ≈0.2m，2026-07-13 靜置實測 */
+#define VF_R_ACC         0.25f    /* 垂直加速度量測噪聲變異數 ((m/s²)²)：σ≈0.5m/s²，BMI088 靜置實測×10餘裕 */
 #define VF_Q_H           0.01f    /* 高度過程噪聲密度 (m²/s) */
 #define VF_Q_V           0.10f    /* 速度過程噪聲密度 ((m/s)²/s) */
 #define VF_Q_A           120.0f   /* 加速度過程噪聲密度 ((m/s²)²/s) */

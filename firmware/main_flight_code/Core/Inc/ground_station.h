@@ -28,6 +28,12 @@ void GroundStation_OnUart3RxEvent(uint16_t Size);
  *  不做則一次溢位就讓 433 RX 永久停擺（收一包後 raw 凍結）。 */
 void GroundStation_OnUart3Error(void);
 
+/** @brief 手動抹除後重設 Flash 寫入頭（gs_flash_append 的 append 指標）。
+ *  僅供 gs_lora_test.c 的 `flash erase` 命令在 FlashRing_EraseAll() 之後呼叫——
+ *  該函式已把整段 Flash 實體擦淨，這裡只是把地面站自己的 write/erase 指標重設
+ *  回起點，讓下一筆收到的封包從頭開始 append。 */
+void GroundStation_FlashResetAfterErase(void);
+
 #ifdef __cplusplus
 }
 #endif

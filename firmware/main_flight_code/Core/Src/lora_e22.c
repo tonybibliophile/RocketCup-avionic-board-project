@@ -6,6 +6,7 @@
  */
 #include "lora_e22.h"
 #include "main.h"   /* LORA433_* 腳位巨集 */
+#include "cmsis_os2.h"   /* e22_hw_lock() 逾時輪詢用 osDelay */
 #include <stdio.h>
 #include <string.h>
 
@@ -156,6 +157,56 @@ void LoRaE22_SetRxRearmCallback(void (*cb)(void))
     s_rx_rearm_cb = cb;
 }
 
+/* ★★ 真正根因（比先前「命令台被 EKF_Task 搶佔」的猜測更根本）★★
+ * UplinkCmd_OnUart3Error()/GroundStation_OnUart3Error() 是掛在 HAL_UART_ErrorCallback
+ * 上、由 USART3 錯誤中斷直接呼叫的 —— 是 ISR context，不受任何 RTOS 任務優先權節制
+ * （幫命令台任務拉 osPriorityRealtime 完全擋不住中斷）。它們的邏輯是
+ * 「RxState != BUSY_RX 就重掛 DMA 接收」；而 e22_enter_config_baud() 一開始就呼叫
+ * HAL_UART_AbortReceive() 把 RxState 打回 READY，之後一路到 e22_exit_config_mode()
+ * 呼叫 s_rx_rearm_cb() 前，RxState 都不是 BUSY_RX。M1 腳位切換 / baud 改變在這段
+ * 期間很容易在 RX 線上產生雜訊觸發 ORE/FE，一旦 USART3 錯誤中斷在這個窗口內觸發，
+ * 就會呼叫 uplink_u3_rx_rearm()/gs_u3_rx_rearm() 在本函式的阻塞輪詢
+ * HAL_UART_Transmit/Receive 「中途」重新掛上 DMA 接收——DMA 是硬體直接搶著把 DR
+ * 讀空，永遠比軟體輪詢快，模組的回應位元組於是被 DMA 吃掉，輪詢端讀到的就是全 0、
+ * 逾時回 HAL_TIMEOUT(st=3)。這就是「開機 probe 會成功、飛行/測試中下 e22 指令卻
+ * 每次 st=3」的真正根因：開機時通常還沒有 ORE 中斷在恰好的時間點打進來，測試中
+ * 反覆進出設定模式、M1 反覆切換，遇到的機會大增。
+ * 對策：用 s_e22_in_cfg_mode 旗標告訴那兩支 ISR 回呼「目前在設定模式輪詢中，先別
+ * 重掛」，離開設定模式時才由本檔自己呼叫 s_rx_rearm_cb() 重新掛好。 */
+static volatile uint8_t s_e22_in_cfg_mode = 0;
+
+uint8_t LoRaE22_IsInConfigMode(void)
+{
+    return s_e22_in_cfg_mode;
+}
+
+/* ★另一個獨立的競爭條件：LoRaE22_Init() 不是只有開機呼叫一次——LoRaTelemetry_Task
+ * 每 10s 會在 `!lora433_ok` 時重試呼叫它，而這個重試判斷只在該任務 for(;;) 迴圈「最
+ * 頂端」檢查 g_lora_cfg_pause；LoRaE22_Init() 本身要跑好幾輪進出設定模式，可能耗時
+ * 數百 ms。若命令台這時候呼叫 LoRaE22_SetFreqMHz()/SetAirRate()/SetPowerLevel()，
+ * cmd_lora_pause() 設旗標時 LoRaTelemetry_Task 可能已經在 LoRaE22_Init() 執行「中
+ * 途」，不會回頭看旗標——兩個任務同時搶 UART3/M1/AUX，比 ISR 那個 race 更直接，
+ * 結果就是「時好時壞」：只有兩者真的撞在一起的那幾次才會失敗。
+ * 用這個簡易忙線鎖讓 LoRaE22_Init() 與三個 Set* 函式互斥：誰先進來誰就把硬體鎖住，
+ * 另一邊改成有限時間輪詢等待，逾時就回 HAL_BUSY 而不是硬闖（Init 由呼叫端 10s 後
+ * 自動再試；Set* 由命令台印出 FAIL 讓使用者重下一次，皆是可接受的 best-effort）。 */
+static volatile uint8_t s_e22_hw_busy = 0;
+
+static uint8_t e22_hw_lock(uint32_t timeout_ms)
+{
+    uint32_t t0 = HAL_GetTick();
+    for (;;) {
+        if (!s_e22_hw_busy) { s_e22_hw_busy = 1; return 1; }
+        if ((HAL_GetTick() - t0) > timeout_ms) return 0;
+        osDelay(5);
+    }
+}
+
+static void e22_hw_unlock(void)
+{
+    s_e22_hw_busy = 0;
+}
+
 /* 進入設定模式的 UART 準備：停掉進行中的接收，再切到設定模式固定的 9600 8N1。
  * ★停接收是 DMA 化之後的硬性要求：透傳期間 USART3 掛的是循環 DMA 接收，CR3.DMAR
  *   一旦致能，DMA 控制器會在每次 RXNE 由硬體把 DR 讀走 —— 底下那些設定模式的
@@ -166,6 +217,7 @@ void LoRaE22_SetRxRearmCallback(void (*cb)(void))
  * 離開設定模式時由 e22_exit_config_mode() 通知擁有者重新掛載接收。 */
 static void e22_enter_config_baud(void)
 {
+    s_e22_in_cfg_mode = 1;   /* 見上方說明：告訴 ISR 端的 rearm 先別搶著重掛 */
     HAL_UART_AbortReceive(s_huart);
     s_huart->Init.BaudRate = 9600;
     HAL_UART_Init(s_huart);
@@ -185,6 +237,7 @@ static void e22_exit_config_mode(void)
     HAL_GPIO_WritePin(LORA433_M1_GPIO_Port, LORA433_M1_Pin, GPIO_PIN_RESET);
     HAL_Delay(20);
     if (s_rx_rearm_cb != NULL) s_rx_rearm_cb();
+    s_e22_in_cfg_mode = 0;   /* 本檔已自行重掛好接收，ISR 端的 rearm 現在可以恢復正常運作 */
 }
 
 /* 進入設定模式，寫入指定頻道後回透傳模式（帶 ch 參數版，供外部呼叫） */
@@ -202,8 +255,8 @@ static HAL_StatusTypeDef e22_write_channel(uint8_t ch)
 
     /* 讀回 CH 暫存器，若已一致則跳過寫入 */
     uint8_t rd[3] = {0xC1, 0x05, 0x01};
-    HAL_UART_Transmit(s_huart, rd, sizeof(rd), 50);
     uint8_t rd_resp[4] = {0};
+    HAL_UART_Transmit(s_huart, rd, sizeof(rd), 50);
     HAL_UART_Receive(s_huart, rd_resp, sizeof(rd_resp), 100);
     printf("[LORA433] CH read-back: %02X %02X %02X %02X (want C1 05 01 %02X)\r\n",
            rd_resp[0], rd_resp[1], rd_resp[2], rd_resp[3], ch);
@@ -214,8 +267,8 @@ static HAL_StatusTypeDef e22_write_channel(uint8_t ch)
                ch, (unsigned)(E22_FREQ_BASE_MHZ + ch));
     } else {
         uint8_t wr[4] = {0xC0, 0x05, 0x01, ch};
-        HAL_UART_Transmit(s_huart, wr, sizeof(wr), 50);
         uint8_t wr_resp[4] = {0};
+        HAL_UART_Transmit(s_huart, wr, sizeof(wr), 50);
         HAL_UART_Receive(s_huart, wr_resp, sizeof(wr_resp), 100);
         printf("[LORA433] CH write resp: %02X %02X %02X %02X\r\n",
                wr_resp[0], wr_resp[1], wr_resp[2], wr_resp[3]);
@@ -264,8 +317,8 @@ static HAL_StatusTypeDef e22_write_reg1(uint8_t pwr_level, uint8_t noise_en, uin
     e22_enter_config_baud();   /* 停接收(清 DMAR) + 切設定模式固定 9600 */
 
     uint8_t wr[4] = {0xC0, 0x04, 0x01, reg1};
-    HAL_UART_Transmit(s_huart, wr, sizeof(wr), 50);
     uint8_t wr_resp[4] = {0};
+    HAL_UART_Transmit(s_huart, wr, sizeof(wr), 50);
     HAL_UART_Receive(s_huart, wr_resp, sizeof(wr_resp), 100);
     printf("[LORA433] REG1 write resp: %02X %02X %02X %02X (set pwr=%s noise=%u subpkt=%s)\r\n",
            wr_resp[0], wr_resp[1], wr_resp[2], wr_resp[3],
@@ -307,8 +360,8 @@ static HAL_StatusTypeDef e22_write_reg3_rssi(uint8_t en)
     e22_enter_config_baud();   /* 停接收(清 DMAR) + 切設定模式固定 9600 */
 
     uint8_t wr[4] = {0xC0, 0x06, 0x01, reg3};
-    HAL_UART_Transmit(s_huart, wr, sizeof(wr), 50);
     uint8_t wr_resp[4] = {0};
+    HAL_UART_Transmit(s_huart, wr, sizeof(wr), 50);
     HAL_UART_Receive(s_huart, wr_resp, sizeof(wr_resp), 100);
     printf("[LORA433] REG3 write resp: %02X %02X %02X %02X (set RSSI byte=%s)\r\n",
            wr_resp[0], wr_resp[1], wr_resp[2], wr_resp[3], en ? "ON" : "OFF");
@@ -354,8 +407,8 @@ static HAL_StatusTypeDef e22_write_reg0(uint8_t air_rate, uint8_t baud_code)
     e22_enter_config_baud();   /* 停接收(清 DMAR) + 切設定模式固定 9600 */
 
     uint8_t wr[4] = {0xC0, 0x03, 0x01, reg0};
-    HAL_UART_Transmit(s_huart, wr, sizeof(wr), 50);
     uint8_t wr_resp[4] = {0};
+    HAL_UART_Transmit(s_huart, wr, sizeof(wr), 50);
     HAL_UART_Receive(s_huart, wr_resp, sizeof(wr_resp), 100);
     printf("[LORA433] REG0 write resp: %02X %02X %02X %02X (set AirRate=%s UART=%sbps)\r\n",
            wr_resp[0], wr_resp[1], wr_resp[2], wr_resp[3],
@@ -398,8 +451,21 @@ static uint8_t e22_probe(void)
     return present;
 }
 
+/* 是否已經對模組做過一次「強制寫死基準值」。★只在這個旗標還是 0 的時候（開機後第一次
+ * 真正偵測到模組在線）才寫入 E22_CH/E22_TX_POWER_LEVEL/E22_AIR_RATE/E22_RSSI_BYTE_EN
+ * 這組固定基準值，寫過一次後就再也不覆寫。
+ * 原本每次呼叫 LoRaE22_Init()（含 LoRaTelemetry_Task 每 10s 的離線重試）都會無條件
+ * 覆寫回這組固定值，代表使用者用 `e22 freq/pwr/air` 手動調的參數，只要模組之後又觸發
+ * 一次重試（例如飛行中短暫斷訊又復原），就會被無聲蓋掉、退回韌體寫死的頻率/功率/
+ * 空速——這正是「參數改了、過一陣子又跳回去」的根因之一。改成只在真正第一次上線時
+ * 建立基準（確保雙板不依賴各自 EEPROM 殘留、起手式一致），之後的每次重試只重新
+ * probe 確認模組還活著，不再動使用者已經設定過的值。 */
+static uint8_t s_e22_synced_once = 0;
+
 HAL_StatusTypeDef LoRaE22_Init(UART_HandleTypeDef *huart)
 {
+    if (!e22_hw_lock(500)) return HAL_BUSY;   /* 見 e22_hw_lock 註解：避免與命令台的 Set* 撞車 */
+
     s_huart = huart;
 
     /* 透傳模式 M1=0, M0=0 */
@@ -418,30 +484,38 @@ HAL_StatusTypeDef LoRaE22_Init(UART_HandleTypeDef *huart)
 
     /* 設定模式回讀偵測模組是否真的在線（誠實回報；呼叫端據此印訊息 / 主航電每 10s 重試）。 */
     if (!e22_probe()) {
+        e22_hw_unlock();
         return HAL_TIMEOUT;
     }
 
-    /* probe 已把 MCU UART baud 對齊到模組實際 REG0 值（見 e22_transparent_baud）；
-     * 此處只再「強制寫入固定頻道 E22_CH」，保證主航電/地面站兩端一定落在同一頻率，
-     * 不依賴各模組 EEPROM 殘留的舊頻道。只寫 CH(REG2)，刻意不動 baud/air rate
-     * （空中速率維持模組現值以保留射程；避免改寫 REG0 UART 位的失聯風險）。
-     * 頻道寫入為 best-effort：即使逾時，模組仍在線、鏈路可用，故仍回 HAL_OK；
-     * 實際生效頻道由呼叫端隨後的 LoRaE22_PrintConfig() 印出供人工核對。 */
-    (void)e22_write_channel(E22_CH);
-    /* 3V3 供電：把發射功率降到 21dBm（見 E22_TX_POWER_LEVEL 註解），並一併寫入環境噪聲
-     * RSSI 致能與子封包長度 240B（三者同屬 REG1，合併一次寫入）。
-     * ★子封包長度必須 240B，否則 116-byte 封包會被拆成多個空中子封包、每個都附加一個
-     *   RSSI 位元組插進封包中間，framing 必壞（見 E22_SUBPKT_CODE 註解）。
-     * 已是目標值時內部會跳過寫入，故穩態開機不增加時間。best-effort，同上仍回 HAL_OK。 */
-    (void)e22_write_reg1(E22_TX_POWER_LEVEL, E22_RSSI_NOISE_EN, E22_SUBPKT_CODE);
-    /* REG0：空中速率 2.4k（見 E22_AIR_RATE 註解，增加鏈路餘裕）+ UART 115200bps
-     * （見 E22_UART_BAUD_CODE 註解，還原舊 log 中 RSSI 正常運作的已知能動組態）。
-     * 已是目標值時跳過。best-effort，仍回 HAL_OK。 */
-    (void)e22_write_reg0(E22_AIR_RATE, E22_UART_BAUD_CODE);
-    /* REG3 bit7「每包附加 RSSI 位元組」：明確寫入而非沿用 EEPROM 殘留 —— 先前韌體
-     * 從不寫此位，模組 EEPROM 殘留什麼就是什麼，接收端卻寫死假設，framing 才會
-     * 莫名其妙壞掉。現在兩端都由韌體釘死，接收端以 LoRaE22_RssiByteEnabled() 對齊。 */
-    (void)e22_write_reg3_rssi(E22_RSSI_BYTE_EN);
+    if (!s_e22_synced_once) {
+        /* probe 已把 MCU UART baud 對齊到模組實際 REG0 值（見 e22_transparent_baud）；
+         * 此處只再「強制寫入固定頻道 E22_CH」，保證主航電/地面站兩端一定落在同一頻率，
+         * 不依賴各模組 EEPROM 殘留的舊頻道。只寫 CH(REG2)，刻意不動 baud/air rate
+         * （空中速率維持模組現值以保留射程；避免改寫 REG0 UART 位的失聯風險）。
+         * 頻道寫入為 best-effort：即使逾時，模組仍在線、鏈路可用，故仍回 HAL_OK；
+         * 實際生效頻道由呼叫端隨後的 LoRaE22_PrintConfig() 印出供人工核對。 */
+        (void)e22_write_channel(E22_CH);
+        /* 3V3 供電：把發射功率降到 21dBm（見 E22_TX_POWER_LEVEL 註解），並一併寫入環境噪聲
+         * RSSI 致能與子封包長度 240B（三者同屬 REG1，合併一次寫入）。
+         * ★子封包長度必須 240B，否則 116-byte 封包會被拆成多個空中子封包、每個都附加一個
+         *   RSSI 位元組插進封包中間，framing 必壞（見 E22_SUBPKT_CODE 註解）。
+         * 已是目標值時內部會跳過寫入，故穩態開機不增加時間。best-effort，同上仍回 HAL_OK。 */
+        (void)e22_write_reg1(E22_TX_POWER_LEVEL, E22_RSSI_NOISE_EN, E22_SUBPKT_CODE);
+        /* REG0：空中速率 2.4k（見 E22_AIR_RATE 註解，增加鏈路餘裕）+ UART 115200bps
+         * （見 E22_UART_BAUD_CODE 註解，還原舊 log 中 RSSI 正常運作的已知能動組態）。
+         * 已是目標值時跳過。best-effort，仍回 HAL_OK。 */
+        (void)e22_write_reg0(E22_AIR_RATE, E22_UART_BAUD_CODE);
+        /* REG3 bit7「每包附加 RSSI 位元組」：明確寫入而非沿用 EEPROM 殘留 —— 先前韌體
+         * 從不寫此位，模組 EEPROM 殘留什麼就是什麼，接收端卻寫死假設，framing 才會
+         * 莫名其妙壞掉。現在兩端都由韌體釘死，接收端以 LoRaE22_RssiByteEnabled() 對齊。 */
+        (void)e22_write_reg3_rssi(E22_RSSI_BYTE_EN);
+        s_e22_synced_once = 1;
+    }
+    /* 之後每次重試（模組曾離線又復原）只到這裡為止：probe 已確認在線、s_e22_cfg[]
+     * 也已回讀最新值，不再覆寫使用者可能已手動調整過的頻率/功率/空速。 */
+
+    e22_hw_unlock();
     return HAL_OK;
 }
 
@@ -510,7 +584,10 @@ HAL_StatusTypeDef LoRaE22_SetFreqMHz(uint32_t freq_mhz)
         return HAL_ERROR;
     }
     uint8_t ch = (uint8_t)(freq_mhz - E22_FREQ_BASE_MHZ);
-    return e22_write_channel(ch);   /* 只改頻道(REG2)，不動 baud/air rate */
+    if (!e22_hw_lock(1000)) return HAL_BUSY;   /* 見 e22_hw_lock 註解：避免與 LoRaE22_Init 撞車 */
+    HAL_StatusTypeDef ret = e22_write_channel(ch);   /* 只改頻道(REG2)，不動 baud/air rate */
+    e22_hw_unlock();
+    return ret;
 }
 
 HAL_StatusTypeDef LoRaE22_SetPowerLevel(uint8_t pwr_level)
@@ -518,10 +595,13 @@ HAL_StatusTypeDef LoRaE22_SetPowerLevel(uint8_t pwr_level)
     if (!s_inited || s_huart == NULL) return HAL_ERROR;
     if (pwr_level > 3U) return HAL_ERROR;
     if (!s_e22_cfg_valid) return HAL_ERROR;
+    if (!e22_hw_lock(1000)) return HAL_BUSY;
     /* 只改 REG1 功率位；噪聲致能位沿用模組現值（不因調功率而被關掉）。
      * 子封包長度一律帶 E22_SUBPKT_CODE：那是 framing 正確性的前提，不可因調功率而被
      * 沿用成 EEPROM 殘留值（見 E22_SUBPKT_CODE 註解）。 */
-    return e22_write_reg1(pwr_level, (uint8_t)((s_e22_cfg[4] >> 5) & 0x01), E22_SUBPKT_CODE);
+    HAL_StatusTypeDef ret = e22_write_reg1(pwr_level, (uint8_t)((s_e22_cfg[4] >> 5) & 0x01), E22_SUBPKT_CODE);
+    e22_hw_unlock();
+    return ret;
 }
 
 uint8_t LoRaE22_RssiByteEnabled(void)
@@ -536,8 +616,11 @@ HAL_StatusTypeDef LoRaE22_SetAirRate(uint8_t air_rate)
     if (!s_inited || s_huart == NULL) return HAL_ERROR;
     if (air_rate > 7U) return HAL_ERROR;
     if (!s_e22_cfg_valid) return HAL_ERROR;
+    if (!e22_hw_lock(1000)) return HAL_BUSY;
     /* 只改 REG0 空速位；UART baud 位沿用模組現值（不因調空速而被改動） */
-    return e22_write_reg0(air_rate, (uint8_t)((s_e22_cfg[3] >> 5) & 0x07));
+    HAL_StatusTypeDef ret = e22_write_reg0(air_rate, (uint8_t)((s_e22_cfg[3] >> 5) & 0x07));
+    e22_hw_unlock();
+    return ret;
 }
 
 void LoRaE22_PrintConfig(void)

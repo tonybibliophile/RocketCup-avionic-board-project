@@ -5,8 +5,11 @@
  *
  * 這份測試「就是」地面站解碼契約的機器驗證：
  *   [1] CRC-16/CCITT-FALSE 黃金向量："123456789" → 0x29B1（crc16.h 單一實作）
- *   [2] TelemetryPacket_t 大小 = 116 bytes（93 + 本板 VF 摘要 8B + peer baro/accel/VF 14B
- *       + peer_bench_arb 1B）
+ *   [2] TelemetryPacket_t 大小 = 99 bytes
+ *       （2026-07-30：先移除 cpu_ekf_x10 + 對端 EKF/丟包率/高G 共 14B → 103B；
+ *         再砍 baro_press_pa 4B、mag 三軸 6B、高G 三軸縮成模長 4B（共 -14B），
+ *         加入飛行滾動極值 max_alt_m/max_vel_ms/max_acc_cg 6B → 95B；
+ *         最後加入實際開傘高度 drogue_alt_m/main_alt_m 4B → 99B）
  *   [3] 每個欄位的 byte offset 逐一鎖定（GroundStation/telemetry_decoder.py
  *       的 struct.unpack 格式依據此表）
  *   [4] CRC 欄位語意：覆蓋前 sizeof-2 bytes
@@ -34,8 +37,8 @@ static void test_crc_golden(void) {
 
 static void test_packet_layout(void) {
     printf("[2] 封包大小與欄位 offset（地面站解碼契約）\n");
-    check("sizeof(TelemetryPacket_t) == 116", sizeof(TelemetryPacket_t) == 116);
-    check("TELEM_PACKET_SIZE == 116",         TELEM_PACKET_SIZE == 116);
+    check("sizeof(TelemetryPacket_t) == 99", sizeof(TelemetryPacket_t) == 99);
+    check("TELEM_PACKET_SIZE == 99",         TELEM_PACKET_SIZE == 99);
 
 #define OFF(field, expect) \
     check("offsetof " #field " == " #expect, offsetof(TelemetryPacket_t, field) == (expect))
@@ -52,45 +55,40 @@ static void test_packet_layout(void) {
     OFF(ekf_q2,        20);
     OFF(ekf_q3,        22);
     OFF(baro_alt_cm,   24);
-    OFF(baro_press_pa, 28);
-    OFF(imu_ax_mg,     32);
-    OFF(imu_ay_mg,     34);
-    OFF(imu_az_mg,     36);
-    OFF(gyro_x_dps,    38);
-    OFF(gyro_y_dps,    40);
-    OFF(gyro_z_dps,    42);
-    OFF(hg_ax_cg,      44);
-    OFF(hg_ay_cg,      46);
-    OFF(hg_az_cg,      48);
-    OFF(mag_x_mg,      50);
-    OFF(mag_y_mg,      52);
-    OFF(mag_z_mg,      54);
-    OFF(gps_lat_1e6,   56);
-    OFF(gps_lon_1e6,   60);
-    OFF(gps_alt_m,     64);
-    OFF(gps_sats,      66);
-    OFF(gps_fix,       67);
-    OFF(bat_mv,        68);
-    OFF(cpu_main_x10,  70);
-    OFF(cpu_ekf_x10,   72);
-    OFF(flags,         74);
-    OFF(health_bits,   75);
-    OFF(sensor_bits,   76);
-    OFF(vf_pos_z_cm,   77);
-    OFF(vf_vel_z_cms,  81);
-    OFF(peer_fsm_state,85);
-    OFF(peer_flags,    86);
-    OFF(peer_h_cm,     87);
-    OFF(peer_v_cms,    91);
-    OFF(peer_baro_cm,  95);
-    OFF(peer_link,     99);
-    OFF(peer_loss_pmil,100);
-    OFF(peer_az_cg,    102);
-    OFF(peer_vf_h_cm,  104);
-    OFF(peer_vf_v_cms, 108);
-    OFF(arm_flags,     112);
-    OFF(peer_bench_arb,113);
-    OFF(crc16,         114);
+    OFF(imu_ax_mg,     28);
+    OFF(imu_ay_mg,     30);
+    OFF(imu_az_mg,     32);
+    OFF(gyro_x_dps,    34);
+    OFF(gyro_y_dps,    36);
+    OFF(gyro_z_dps,    38);
+    OFF(hg_mag_cg,     40);
+    OFF(gps_lat_1e6,   42);
+    OFF(gps_lon_1e6,   46);
+    OFF(gps_alt_m,     50);
+    OFF(gps_sats,      52);
+    OFF(gps_fix,       53);
+    OFF(bat_mv,        54);
+    OFF(cpu_main_x10,  56);
+    OFF(flags,         58);
+    OFF(health_bits,   59);
+    OFF(sensor_bits,   60);
+    OFF(vf_pos_z_cm,   61);
+    OFF(vf_vel_z_cms,  65);
+    OFF(max_alt_m,     69);
+    OFF(max_vel_ms,    71);
+    OFF(max_acc_cg,    73);
+    OFF(drogue_alt_m,  75);
+    OFF(main_alt_m,    77);
+    OFF(peer_fsm_state,79);
+    OFF(peer_flags,    80);
+    OFF(peer_baro_cm,  81);
+    OFF(peer_link,     85);
+    OFF(peer_vf_h_cm,  86);
+    OFF(peer_vf_v_cms, 90);
+    OFF(arm_flags,     94);
+    OFF(peer_bench_arb,95);
+    OFF(profile_flags, 96);
+    OFF(crc16,         97);
 #undef OFF
 }
 
@@ -113,7 +111,7 @@ static void test_packet_crc_semantics(void) {
     const uint8_t *raw = (const uint8_t *)&pkt;
     check("sync bytes 位於 [0],[1]", raw[0] == 0xA5 && raw[1] == 0x5A);
     uint16_t crc_calc = crc16_ccitt_false(raw, (uint16_t)(sizeof(pkt) - 2));
-    uint16_t crc_recv = (uint16_t)(raw[114] | ((uint16_t)raw[115] << 8));  /* little-endian */
+    uint16_t crc_recv = (uint16_t)(raw[97] | ((uint16_t)raw[98] << 8));  /* little-endian */
     check("重算 CRC == 封包尾 2 bytes (LE)", crc_calc == crc_recv);
 
     /* 位元翻轉必須被偵測 */

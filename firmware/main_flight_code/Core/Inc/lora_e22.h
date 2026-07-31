@@ -63,7 +63,8 @@ void LoRaE22_PrintConfig(void);
  *        CH = freq_mhz - 410；合法範圍 410~493 MHz（CH 0~83）。
  *        設定存入 EEPROM，掉電不遺失。僅供地面站通訊測試使用。
  * @param freq_mhz 目標頻率 MHz (410~493)
- * @return HAL_OK 成功；HAL_ERROR 範圍錯誤或未初始化；HAL_TIMEOUT AUX 等待逾時。
+ * @return HAL_OK 成功；HAL_ERROR 範圍錯誤或未初始化；HAL_TIMEOUT AUX 等待逾時；
+ *         HAL_BUSY LoRaE22_Init() 的離線重試正在進行中，稍後重下即可。
  */
 HAL_StatusTypeDef LoRaE22_SetFreqMHz(uint32_t freq_mhz);
 
@@ -71,7 +72,8 @@ HAL_StatusTypeDef LoRaE22_SetFreqMHz(uint32_t freq_mhz);
  * @brief 動態修改 E22 發射功率等級（寫 REG1 bit[1:0]，保留其餘位元）。
  *        0=30dBm 1=27dBm 2=24dBm 3=21dBm。設定存入 EEPROM，掉電不遺失。
  *        ★本板 3V3 供電無法穩定驅動 30dBm（突波電流會拉垮 3V3），建議維持 3(21dBm)。
- * @return HAL_OK 成功；HAL_ERROR 未初始化/未回讀到暫存器；HAL_TIMEOUT AUX 逾時。
+ * @return HAL_OK 成功；HAL_ERROR 未初始化/未回讀到暫存器；HAL_TIMEOUT AUX 逾時；
+ *         HAL_BUSY LoRaE22_Init() 的離線重試正在進行中，稍後重下即可。
  */
 HAL_StatusTypeDef LoRaE22_SetPowerLevel(uint8_t pwr_level);
 
@@ -79,7 +81,8 @@ HAL_StatusTypeDef LoRaE22_SetPowerLevel(uint8_t pwr_level);
  * @brief 動態修改 E22 空中速率（寫 REG0 bit[2:0]，保留 UART baud/parity 位元）。
  *        0=0.3k 1=1.2k 2=2.4k 3=4.8k 4=9.6k 5=19.2k 6=38.4k 7=62.5k。
  *        ★兩端（火箭/地面站）必須相同才能通訊；速率越低射程/餘裕越好。
- * @return HAL_OK 成功；HAL_ERROR 未初始化/未回讀到暫存器；HAL_TIMEOUT AUX 逾時。
+ * @return HAL_OK 成功；HAL_ERROR 未初始化/未回讀到暫存器；HAL_TIMEOUT AUX 逾時；
+ *         HAL_BUSY LoRaE22_Init() 的離線重試正在進行中，稍後重下即可。
  */
 HAL_StatusTypeDef LoRaE22_SetAirRate(uint8_t air_rate);
 void LoRaE22_GetParams(uint32_t *freq_mhz, uint8_t *pwr_level, uint8_t *air_rate);
@@ -105,6 +108,17 @@ uint8_t LoRaE22_RssiByteEnabled(void);
  * 傳 NULL 可取消註冊。回呼在呼叫者的執行緒情境下執行，不是 ISR。
  */
 void LoRaE22_SetRxRearmCallback(void (*cb)(void));
+
+/**
+ * @brief 是否正處於設定模式的阻塞輪詢收發窗口中（M1=1，UART3 暫時無 DMA 接收掛載）。
+ *        供 USART3 錯誤中斷回呼（UplinkCmd_OnUart3Error/GroundStation_OnUart3Error）
+ *        判斷：此時絕不可搶著重掛 DMA 接收，否則會把本驅動輪詢等待中的模組回應
+ *        位元組吃掉，造成 `e22 freq/pwr/air` 每次都 st=3(HAL_TIMEOUT)、回讀全 0
+ *        （中斷不受任何 RTOS 任務優先權節制，只能用此旗標主動避讓）。離開設定模式
+ *        時本驅動會自行呼叫已註冊的 rearm 回呼，之後此旗標歸零、ISR 端才恢復重掛。
+ * @return 1 = 設定模式輪詢中（ISR 端應跳過重掛）；0 = 一般透傳模式（照常重掛）。
+ */
+uint8_t LoRaE22_IsInConfigMode(void);
 
 #ifdef __cplusplus
 }

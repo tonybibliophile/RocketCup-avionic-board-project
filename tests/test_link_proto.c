@@ -42,13 +42,16 @@ static LinkStatus_t sample_status(void) {
     st.erase_pct   = 75;
     st.vf_h_cm     = 24950;        /* 249.50 m */
     st.vf_v_cms    = -1480;        /* -14.80 m/s */
+    st.bmi_mag_cg  = 1015;         /* 10.15 g */
+    st.adxl_mag_cg = 1032;         /* 10.32 g */
+    st.profile_flags = TELEM_PROFILE_SELF_ELEVATOR;
     return st;
 }
 
 static void test_layout(void) {
     printf("[1] 封包大小與欄位 offset（解碼契約）\n");
-    check("sizeof(LinkPacket_t) == 46", sizeof(LinkPacket_t) == 46);
-    check("LINK_PACKET_SIZE == 46",     LINK_PACKET_SIZE == 46);
+    check("sizeof(LinkPacket_t) == 51", sizeof(LinkPacket_t) == 51);
+    check("LINK_PACKET_SIZE == 51",     LINK_PACKET_SIZE == 51);
 #define OFF(field, expect) \
     check("offsetof " #field " == " #expect, offsetof(LinkPacket_t, field) == (expect))
     OFF(sync0,       0);
@@ -72,7 +75,10 @@ static void test_layout(void) {
     OFF(erase_pct,   35);
     OFF(vf_h_cm,     36);
     OFF(vf_v_cms,    40);
-    OFF(crc16,       44);
+    OFF(bmi_mag_cg,  44);
+    OFF(adxl_mag_cg, 46);
+    OFF(profile_flags, 48);
+    OFF(crc16,       49);
 #undef OFF
 }
 
@@ -81,7 +87,7 @@ static void test_roundtrip(void) {
     LinkStatus_t st = sample_status();
     uint8_t buf[LINK_PACKET_SIZE];
     uint16_t n = LinkProto_Build(buf, &st);
-    check("Build 回傳長度 == 46", n == LINK_PACKET_SIZE);
+    check("Build 回傳長度 == 51", n == LINK_PACKET_SIZE);
     check("buf[0],buf[1] == sync", buf[0] == LINK_SYNC0 && buf[1] == LINK_SYNC1);
 
     LinkRx_t rx; LinkRx_Init(&rx);
@@ -110,6 +116,9 @@ static void test_roundtrip(void) {
     check("erase_pct 一致",   out.erase_pct   == st.erase_pct);
     check("vf_h_cm 一致",     out.vf_h_cm     == st.vf_h_cm);
     check("vf_v_cms 一致",    out.vf_v_cms    == st.vf_v_cms);
+    check("bmi_mag_cg 一致",  out.bmi_mag_cg  == st.bmi_mag_cg);
+    check("adxl_mag_cg 一致", out.adxl_mag_cg == st.adxl_mag_cg);
+    check("profile_flags 一致", out.profile_flags == st.profile_flags);
 }
 
 static void test_bad_crc(void) {

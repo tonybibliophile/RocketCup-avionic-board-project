@@ -24,8 +24,11 @@ run: $(BINS)
 test_sensor_axis: test_sensor_axis.c ../firmware/main_flight_code/Core/Inc/sensor_axis.h ../firmware/main_flight_code/Core/Inc/attitude_math.h
 	$(CC) $(CFLAGS) -o $@ test_sensor_axis.c $(LDLIBS)
 
-# 板上刻意停用熱啟動（board_config.h FEATURE_HOTSTART=0），但 FSM_HotStartDecide
-# 的決策邏輯仍須驗證（golden test [8]），故 host 測試以 -DFEATURE_HOTSTART=1 強制開啟。
+# 熱啟動決策鏈（golden test [8]）以 -DFEATURE_HOTSTART=1 明確開啟編譯，不吃
+# board_config.h 的預設值——避免板上旗標被暫時關掉時，這組測試跟著整段被
+# `#if !FEATURE_HOTSTART → return PAD` 短路，全部「通過」卻什麼都沒驗到。
+# ★測試傳入的 tick 一律是「起飛後經過時間」，與 main.c 現在傳的
+# last_pkt.flight_tick_ms 同語意（不是封包的開機絕對 tick_ms）。
 # ★必須明確 -DFLIGHT_PROFILE_ELEVATOR=0：board_config.h 的預設值會隨上板前準備哪個
 # profile 而變動（電梯場測期間預設為 1），若不覆寫，這份「飛行剖面黃金測試」會悄悄
 # 吃到電梯常數而非真實飛行常數，卻不會報錯——曾實際踩過（大量對不上的黃金值一度

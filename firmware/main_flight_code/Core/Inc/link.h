@@ -30,7 +30,7 @@ typedef struct {
     uint8_t  drogue_latched; /* 對端曾通報 DROGUE_FIRED（鎖存，不清除） */
     uint8_t  main_latched;   /* 對端曾通報 MAIN_DEPLOYED（鎖存，不清除） */
     uint8_t  peer_ack_state; /* 對端封包 ack_state：對端回送「它所認知的『我方』狀態」 */
-    uint8_t  peer_main_arb;  /* 對端 D2 主傘舵機握手狀態（SERVO_ARB_MSG_*） */
+    uint8_t  peer_main_arb;  /* 對端主傘共開 / BENCH 狀態（SERVO_ARB_MSG_*，servo_arb.h） */
     uint8_t  peer_flash_ready; /* 對端 Flash 預擦池是否已達目標 (1=已就緒) */
     uint8_t  peer_erase_pct;   /* 對端 Flash 預擦進度 0..100% */
     int32_t  h_est_cm;       /* 對端最近回報的 EKF 高度 (cm)（供下鏈中繼/監看） */
@@ -40,6 +40,9 @@ typedef struct {
     int16_t  q_w, q_x, q_y, q_z; /* 對端最近回報的姿態四元數 * 10000 */
     int32_t  vf_h_cm;        /* 對端最近回報的 VF 高度 (cm) */
     int32_t  vf_v_cms;       /* 對端最近回報的 VF 垂直速度 (cm/s) */
+    int16_t  bmi_mag_cg;     /* 對端最近回報的 BMI088 加速度模長 (cg = 0.01g) */
+    int16_t  adxl_mag_cg;    /* 對端最近回報的 ADXL375 加速度模長 (cg = 0.01g) */
+    uint8_t  profile_flags;  /* 對端最近回報的 TELEM_PROFILE_SELF_ELEVATOR（電梯測試 profile 標示） */
     /* --- 鏈路品質（QoS）：以 seq 差偵測丟包 --- */
     uint8_t  last_seq;       /* 上一筆封包的 seq（seq_valid 後才有效） */
     uint8_t  seq_valid;      /* 已收過至少一筆、last_seq 可用 */

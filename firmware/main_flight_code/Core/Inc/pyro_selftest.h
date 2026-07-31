@@ -4,19 +4,24 @@
  * 用途：在工作台上驗證「開傘」完整電火動作。MCU 一上電/重啟就自動執行「一次」序列，
  *       跑完停在原地（持續餵看門狗、SYS LED 續閃），不進正常飛控 FSM，故「每次重啟＝一次測試」。
  *
- * ─── 測試序列（主/副兩板同一序列，各自獨立）───
+ * ─── 測試序列（主/副兩板同一序列，各自獨立；★時序刻意 1:1 對應飛行邏輯）───
  *   開機：Buzzer 響兩聲（TIM2 CH1）。
  *   全程：SYS LED (PE2) 1Hz 持續閃爍 = 韌體存活。
- *   1. PD13 (FIRE / 副傘 DC 馬達) 拉高 FSM_DROGUE_MOTOR_RUN_MS(8s)（同時 State1 LED / PE3 亮），再拉低。
+ *   1. PD13 (FIRE / 引傘 DC 馬達) —— 對應飛行「主板提前 DROGUE_LEAD_TIME_S 開、副板真頂點才開」：
+ *      1a 主板 t=0 拉高 FSM_DROGUE_MOTOR_RUN_PRIMARY_MS(8s)（State1 LED / PE3 亮）；
+ *      1b 副板見主板通電後等 DROGUE_LEAD_TIME_S(4s)（模擬提前量），期間雙板時序錯開；
+ *      1c 副板 t=4s 起拉高 FSM_DROGUE_MOTOR_RUN_BACKUP_MS(3s)，與主板窗重疊——PD13 為
+ *         diode-OR 準位訊號，兩板同時拉高無害，飛行時本來就會重疊。
  *   2. 等待 PYRO_SELFTEST_GAP_MS。
- *   3. PD14 (PWM_Servo / TIM4 CH3) 由 GPIO 低切回 AF，產生 PWM 期間 State2 LED (PE4) 亮：
- *      舵機 0°→180°，於 180° 等待 PYRO_SELFTEST_SERVO_HOLD_MS，再 180°→0°，停 PWM、State2 熄。
+ *   3. PD14 主傘 —— 對應飛行「不啟 PWM、純 GPIO 拉高 1.5s、兩板同時共開」：
+ *      雙板**同時**拉高 SERVO_MAIN_HIGH_MS（主板廣播 BENCH_MAIN_HIGH，副板見訊號即跟上），
+ *      State2 LED (PE4) 同步亮，時間到拉回 LOW、State2 熄。★不再有互斥握手/讓位/PWM 掃描。
  *   （PD14 部署前為硬體低、無訊號，比照飛行；序列最前面另有退避倒數 PYRO_SELFTEST_COUNTDOWN_S。）
  *
  * ─── LED / Buzzer 腳位（GPIOE，active-high；如硬體為 active-low 改 PYRO_LED_ON/OFF）───
  *   SYS    = PE2 (LED_SYS)      : 持續閃爍
  *   State1 = PE3               : PD13 拉高時亮
- *   State2 = PE4 (LED_STAT2)   : PD14 產生 PWM 時亮
+ *   State2 = PE4 (LED_STAT2)   : PD14 拉高時亮
  *   Buzzer = TIM2 CH1          : 開機兩聲
  *
  * ─── 如何啟用 ───  board_config.h 把 FEATURE_PYRO_SELFTEST 設 1，重新燒錄。
@@ -25,8 +30,9 @@
  *   2. 徹底：刪本檔 + pyro_selftest.c，移除 main.c「PYRO SELF-TEST」段（含 #include），
  *      並從 Main_Code/Debug/objects.list 與 subdir.mk 移除 pyro_selftest.o / .c。
  *
- * ⚠ 安全：步驟 1 會實際導通副傘 DC 馬達（PD13）FSM_DROGUE_MOTOR_RUN_MS(8s) —— 若已接火藥/
- *   電熱絲會真的點火！上台前務必確認負載安全或以電表/假負載替代；序列開頭保留退避倒數供人員退避。
+ * ⚠ 安全：步驟 1 會實際導通引傘 DC 馬達（PD13）——主板 8s（t=0~8s）、副板 3s（t=4~7s，與主板
+ *   重疊），若已接火藥/電熱絲會真的點火！上台前務必確認負載安全或以電表/假負載替代；
+ *   序列開頭保留退避倒數供人員退避。
  */
 #ifndef PYRO_SELFTEST_H
 #define PYRO_SELFTEST_H
@@ -46,27 +52,20 @@
 #if PYRO_SELFTEST_AVAILABLE
 
 /* === 可調參數 ===
- * 步驟 1（PD13 副傘馬達導通時間）改為直接沿用飛行常數 FSM_DROGUE_MOTOR_RUN_MS(8s)，
- * 使桌面測試與飛行一致；下方 PYRO_SELFTEST_FIRE_MS 已不再被 pyro_selftest.c 使用（保留相容）。 */
+ * ★步驟 1/3 的時間一律直接沿用飛行常數，桌面測試與飛行 1:1 對應、不另立一套數字：
+ *   步驟 1 PD13：FSM_DROGUE_MOTOR_RUN_PRIMARY_MS(8s) / _BACKUP_MS(3s) + DROGUE_LEAD_TIME_S(4s) 錯開。
+ *   步驟 3 PD14：SERVO_MAIN_HIGH_MS(1.5s)，雙板同時。
+ * 下方 PYRO_SELFTEST_FIRE_MS / PYRO_SELFTEST_SERVO_HIGH_MS 已不再被 pyro_selftest.c 使用（保留相容）。 */
 #ifndef PYRO_SELFTEST_FIRE_MS
-#define PYRO_SELFTEST_FIRE_MS       8000U   /* 已由 FSM_DROGUE_MOTOR_RUN_MS 取代（步驟 1 不再引用） */
+#define PYRO_SELFTEST_FIRE_MS       8000U   /* 已由 FSM_DROGUE_MOTOR_RUN_*_MS 取代（步驟 1 不再引用） */
 #endif
-/* 步驟 2：引爆後、動舵機前的等待 */
+/* 步驟 2：引傘通電結束後、動主傘前的等待 */
 #ifndef PYRO_SELFTEST_GAP_MS
 #define PYRO_SELFTEST_GAP_MS        5000U   /* 等待 5s */
 #endif
 
-/* 步驟 3：PWM 舵機角度對應脈寬（TIM4 Prescaler=83→1MHz，1 tick=1µs，比較值＝脈寬 µs）。
- * 標準 180° 舵機常見 0°≈500µs、180°≈2500µs；若你的舵機是 1000–2000µs 行程請改這兩個值。 */
-#ifndef PYRO_SELFTEST_SERVO_0DEG_US
-#define PYRO_SELFTEST_SERVO_0DEG_US    500U    /* 0°   */
-#endif
-#ifndef PYRO_SELFTEST_SERVO_180DEG_US
-#define PYRO_SELFTEST_SERVO_180DEG_US  2500U   /* 180° */
-#endif
-/* 舵機停在 180° 的保持時間 */
-#ifndef PYRO_SELFTEST_SERVO_HOLD_MS
-#define PYRO_SELFTEST_SERVO_HOLD_MS    5000U   /* 180° 停留 5s，再轉回 0° */
+#ifndef PYRO_SELFTEST_SERVO_HIGH_MS
+#define PYRO_SELFTEST_SERVO_HIGH_MS    4000U   /* 已由 SERVO_MAIN_HIGH_MS 取代（步驟 3 不再引用） */
 #endif
 
 /* 序列最前面的退避倒數（0 = 立即開始點火） */
@@ -96,10 +95,10 @@
 #endif
 
 /*
- * 執行「一次」開傘電火自測序列後「返回」（含退避倒數、Buzzer、LED、PD13/舵機動作）。
- * 阻塞約 ~25s，過程自行餵 IWDG。呼叫端須確保周邊已初始化，且結束後負責把輸出恢復到
- * 部署前安全狀態（PD13 已於序列尾拉低；PD14 舵機由呼叫端 Servo_HoldLow 復位——遠端 BENCH
- * 走此函式，見 main.c 診斷任務）。開機自測（FEATURE_PYRO_SELFTEST）則由 RunOnce 呼叫本函式。
+ * 執行「一次」開傘電火自測序列後「返回」（含退避倒數、Buzzer、LED、PD13/PD14 動作）。
+ * 阻塞約 ~20s，過程自行餵 IWDG。呼叫端須確保周邊已初始化，且結束後負責把輸出恢復到
+ * 部署前安全狀態（PD13/PD14 皆已於序列尾拉低；呼叫端仍再 Servo_HoldLow 復位一次——遠端
+ * BENCH 走此函式，見 main.c 診斷任務）。開機自測（FEATURE_PYRO_SELFTEST）由 RunOnce 呼叫。
  */
 void PyroSelfTest_RunSequence(void);
 void PyroSelfTest_RunSequence_Ex(uint8_t skip_countdown);

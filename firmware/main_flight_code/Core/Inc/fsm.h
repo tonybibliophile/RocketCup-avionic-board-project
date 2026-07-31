@@ -34,7 +34,8 @@ typedef enum {
     STATE_APOGEE = 6,         // 頂點狀態記錄（純遙測標記，馬達已停，不驅動任何硬體，
                               // 同一週期即轉入 DESCENT）
     STATE_DESCENT = 7,        // 副傘下降（監控主傘部署高度）
-    STATE_MAIN_DEPLOY = 8,    // 主傘部署（動態高度觸發舵機旋轉）
+    STATE_MAIN_DEPLOY = 8,    // 主傘部署（動態高度觸發：PD14 純 GPIO 拉高
+                              // SERVO_MAIN_HIGH_MS，不再驅動 PWM 舵機）
     STATE_LANDED = 9          // 安全著陸（尋標蜂鳴器與安全關檔）
 } FlightState_t;
 
@@ -43,7 +44,10 @@ typedef enum {
  * ~35m，150m 飛行目標不合理，電梯改回落 10m 觸發主傘。 */
 #define MAIN_DEPLOY_DELAY_S      3.5f    // 主傘機構部署延遲時間 (s)
 /* DROGUE_LEAD_TIME_S（副傘頂點預估提前開傘時間）依 profile 分流，見下方 Profile 隔離區塊：
- * 飛行 4.0s（DC 馬達機構需時展開）、電梯 1.0s（井道僅 ~30m，4s lead 不合尺度）。 */
+ * 飛行 4.0s（DC 馬達機構需時展開）、電梯 1.0s（井道僅 ~30m，4s lead 不合尺度）。
+ * ⚠ 僅主航電（IS_PRIMARY）採用此提前預測路徑開引傘；副航電改為只在真正頂點才開
+ * （fsm.c STATE_COAST 的路徑 2/3/4：速度過零 / 高度回落 / baro 趨勢交叉），兩板故意
+ * 錯開時間，非同時點火。詳見 fsm.c apogee_condition 判定區塊註解。 */
 
 #define FSM_LIFTOFF_ACCEL_G      3.0f    // 起飛觸發：高G垂直加速度門檻 (g)
 #define FSM_LIFTOFF_ACCEL_CONSEC_N 20U   // a_z 路徑防手震：連續 20 週期(200ms)超過門檻才算數。
@@ -64,10 +68,20 @@ typedef enum {
 #define FSM_APOGEE_CONSEC_N      5U      // 頂點判定：連續成立週期數（5×10ms=50ms 防雜訊）
 #define FSM_APOGEE_VFALL_MPS     0.2f    // 頂點備用判定：速度過零門檻 (v_est < -0.2)
 #define FSM_APOGEE_ALT_DROP_M    5.0f    // 頂點備用判定：自峰值下降高度 (m)
-#define FSM_DROGUE_MOTOR_RUN_MS  8000U   // 副傘 DC 馬達持續導通時間 (ms)：PD13 現為馬達
-                                          // 驅動（非點火 MOSFET 瞬間脈衝），使用者確認
-                                          // 8s 為機構完整展開所需時間（原 4000ms→8000ms；
-                                          // main.c 手動副傘上行指令沿用同一常數，一併更新為 8s）
+/* 副傘（引傘）DC 馬達導通時間 (ms)：PD13 為馬達驅動準位訊號（非點火 MOSFET 瞬間脈衝），
+ * ★主/副航電不同值（使用者決策，對應兩板刻意錯開的開傘時序）：
+ *   主航電：頂點前提前 DROGUE_LEAD_TIME_S(4s) 觸發，拉高 8s——提前量已吃掉一部分時間，
+ *           且主航電是主要開傘路徑，給滿機構完整展開所需的導通時間。
+ *   副航電：只在「真頂點」才觸發（見 fsm.c apogee_condition：副航電不走提前預測路徑），
+ *           拉高 3s——此時主航電多半已把引傘拉出來，副板只是補一段冗餘推力，不需 8s。
+ * 兩板 PD13 於開傘板以 diode-OR 合流，準位訊號同時拉高無害，故兩窗重疊不需互斥。
+ * main.c 手動副傘上行指令沿用同一常數（各板依自身角色取值）。 */
+#define FSM_DROGUE_MOTOR_RUN_PRIMARY_MS 8000U   // 主航電：提前 4s 觸發，拉高 8s
+#define FSM_DROGUE_MOTOR_RUN_BACKUP_MS  3000U   // 副航電：真頂點觸發，拉高 3s
+#define FSM_DROGUE_MOTOR_RUN_MS  (IS_PRIMARY ? FSM_DROGUE_MOTOR_RUN_PRIMARY_MS \
+                                              : FSM_DROGUE_MOTOR_RUN_BACKUP_MS)
+                                          // ⚠ 這是三元運算式（非整數字面值），不可用於 #if；
+                                          //   IS_PRIMARY 為編譯期常數，最佳化後與常數等價。
 #define FSM_MAIN_INFLATE_MS      3000U   // 主傘充氣張開等待時間 (ms)
 #define FSM_TOUCHDOWN_V_MPS      0.3f    // 落地判定：|v_est| 門檻 (m/s)
 #define FSM_TOUCHDOWN_ALT_M      20.0f   // 落地判定：高度門檻 (m)
@@ -88,6 +102,9 @@ typedef enum {
 #define FSM_BARO_APOGEE_DROP_M   2.0f     // 頂樓僅 30m，10m 飛行門檻在電梯剖面不會回落
 #define FSM_BARO_APOGEE_CONSEC   40U      // 400ms：電梯氣壓瞬變（開關門/風壓）比火箭噪聲更慢，需更長防雜訊窗
 #define FSM_FAILSAFE_APOGEE_MS   120000U  // 電梯單趟可達分鐘級，15s 飛行版失效保護會誤點火，大幅放寬
+#define FSM_FAILSAFE_APOGEE_BACKUP_MS FSM_FAILSAFE_APOGEE_MS  // 電梯 profile 動態預測本就關閉
+                                          // （FSM_APOGEE_DYNAMIC_PREDICT_ENABLED=0），主/副無提前量
+                                          // 差異，副航電失效保護沿用同一值即可。
 #define FSM_MAIN_WATCHDOG_MS     300000U  // 同上，看門狗跟著放寬避免誤觸發主傘
 #define FSM_FB_MAIN_ALT_M        8.0f     // 電梯頂樓 30m，150m 飛行降級門檻不會觸發，改用接近地面高度
 #define FSM_FB_TOUCHDOWN_ALT_M   5.0f     // 電梯地面基準附近即視為「落地」（頂樓/1樓皆遠低於 30m 飛行門檻）
@@ -112,6 +129,9 @@ typedef enum {
 #define FSM_BARO_APOGEE_CONSEC   20U      // 連續 20 週期（200ms）成立（防雜訊）
 #define FSM_FAILSAFE_APOGEE_MS   28221U   // 起飛起算強制點火副傘 (ms)：依 OpenRocket V3 模擬最高點時間 (t_apogee=27.221s) + 1.0s 設定 (27.221s + 1.0s = 28.221s = 28221ms)
                                           // 強制失效保護點火 timer 設定為最高點 + 1s，確保感測器失靈時於頂點過後 1 秒內強制開引傘。
+                                          // ⚠ 僅供主航電使用（主航電正常觸發點在 t_apogee−DROGUE_LEAD_TIME_S
+                                          // ≈23.2s，此失效保護與之相距 5s 餘裕）；副航電專用值見下方
+                                          // DROGUE_LEAD_TIME_S 定義後的 FSM_FAILSAFE_APOGEE_BACKUP_MS。
 #define FSM_MAIN_WATCHDOG_MS     248000U  // 主傘部署：飛行總時間看門狗 (ms)。依 v2/v3 兩份 OpenRocket 模擬重推：
                                           // 須 > 標稱主傘高度路徑觸發時間 (v2 t=241.57s / v3 t=241.47s) + 餘裕，
                                           // 且 < 「高度路徑全程未觸發」失效情境下副傘單獨墜地的時間估計
@@ -126,6 +146,14 @@ typedef enum {
 #define TARGET_MAIN_ALTITUDE     300.0f   // 目標主傘完全張開高度 (m)
 #define DROGUE_LEAD_TIME_S       4.0f     // 飛行副傘頂點提前開傘 (s)：改回 4.0s（曾一度調整為 3.0s，
                                           // 使用者決策改回原值）
+#define FSM_FAILSAFE_APOGEE_BACKUP_MS (FSM_FAILSAFE_APOGEE_MS + (uint32_t)(DROGUE_LEAD_TIME_S * 1000.0f))
+                                          // 副航電專用失效保護 (ms)：副航電已改為只在「真頂點」才開引傘
+                                          // （見 fsm.c apogee_condition），正常觸發點在 t_apogee≈27.221s，
+                                          // 比主航電晚了 DROGUE_LEAD_TIME_S(4s)。若沿用主航電那顆
+                                          // FSM_FAILSAFE_APOGEE_MS(28.221s)，與副航電正常觸發點只差 1s，
+                                          // 餘裕過薄、容易與正常偵測搶跑；故整段順延 DROGUE_LEAD_TIME_S，
+                                          // 得 32.221s（32221ms），與副航電正常觸發點維持與主航電相同的
+                                          // 5s 餘裕。
 #define FSM_MAIN_MAX_ALT_LIMIT_M 600.0f   // 主傘高度上限門檻 (m)：高度至少低於 600m 才允許觸發主傘
 #define FSM_APOGEE_DYNAMIC_PREDICT_ENABLED 1  // 飛行 profile：COAST 段 v_est 由大降到 0，動態預測
                                           // fallback 假設（減速度收斂到重力）成立，見電梯 profile
@@ -144,12 +172,16 @@ typedef enum {
                                           // 掉點不得使 BOOST 永久提前結束（COAST 無回頭路）。
 
 /* === P0-B：頂點失效保護與 baro 原始趨勢交叉檢查（皆不依賴 EKF） === */
-/* FSM_FAILSAFE_APOGEE_MS（飛行 profile）已依 OpenRocket 模擬數據推導完成，
+/* FSM_FAILSAFE_APOGEE_MS（飛行 profile，主航電專用）已依 OpenRocket 模擬數據推導完成，
  * 見下方 Profile 隔離區塊之飛行 profile 分支（唯一真實來源，勿在此重複抄值）。
  * 日後若重新模擬或更換火箭組態，務必回到該處更新，並仍需滿足：
  * ≥ t_apogee_sim + 4s（使用者決策：寧可餘裕薄一點提早於頂點附近點火，也不要餘裕
  * 拉大到下降已有明顯速度才觸發——副傘高速展開有繩索斷裂風險，見該巨集旁註解）、
- * ≤ FSM_MAIN_WATCHDOG_MS − 5s，保留副傘→主傘序列安全餘裕。 */
+ * ≤ FSM_MAIN_WATCHDOG_MS − 5s，保留副傘→主傘序列安全餘裕。
+ * ⚠ 主/副航電各自有獨立的失效保護計時器（fsm.c 依 IS_PRIMARY 二選一）：主航電用
+ * FSM_FAILSAFE_APOGEE_MS，副航電用 FSM_FAILSAFE_APOGEE_BACKUP_MS——因副航電已改為
+ * 只在真頂點才開引傘（不再提前 DROGUE_LEAD_TIME_S），若沿用同一顆計時器，餘裕會被
+ * 提前量吃掉，見 FSM_FAILSAFE_APOGEE_BACKUP_MS 定義旁註解。 */
 
 /* sensor_bits 輸入位元契約（P0-D 起由 sensor_health 餵入；P0-B 起 FSM 即依此閘控 baro 路徑） */
 #define FSM_SB_BARO_FAULT        0x01U   // baro 失效/不可信 → 停用 baro 交叉檢查與 baro 起飛冗餘
@@ -167,7 +199,25 @@ typedef enum {
 #define FSM_FB_TOUCHDOWN_DELTA_M 2.0f    // 視窗內 baro 變化量門檻
 
 /* === P0-F：熱啟動驗證鏈參數 === */
-#define FSM_HOTSTART_MAX_TICK_MS    60000U  // 封包飛行 tick 合理上限（防上次飛行殘留資料誤恢復）
+/* ★ 這個上限比對的是「起飛後經過時間」（FlashRingPacket_t::flight_tick_ms），
+ * 不是封包的 tick_ms（開機以來的絕對 tick，重啟後歸零、跨重啟無意義）。
+ *
+ * ★2026-07-31：60000 → 300000（使用者決策：完整飛行約 278s，取整加餘裕 300s）。
+ * 舊值 60s 只蓋到頂點（t≈27s）後約 30s，整段傘降都落在窗外——而開傘衝擊、低溫、
+ * 電池接觸不良這些 brownout 來源正好集中在傘降段，等於把最需要熱重啟的時段排除掉。
+ * 上界的物理意義：熱重啟只還原 BOOST..DESCENT（見 FSM_HotStartDecide），板子最晚
+ * 還寫得出這個範圍封包的時刻＝離開 DESCENT，最壞情況由主傘看門狗
+ * FSM_MAIN_WATCHDOG_MS（飛行 248s／電梯 300s，皆自 flight_start_ms 起算）決定；
+ * 300s 已涵蓋飛行 profile 全程並留 52s 餘裕。
+ * ⚠ 本上限「不是」防陳舊資料的機制：flight_tick_ms 是寫入當下就凍住的值，上一場飛行
+ *   t+45s 的封包與這一場 t+45s 的封包數值完全相同，此閘分不出來。真正在擋殘留資料的是
+ *   ①冷開機預擦會擦掉上一場最後一筆（CRC 直接不過）②FSM_HOTSTART_MAX_ALT_DIFF_M 高度
+ *   連續性（★電梯 profile 井道僅 ~30m，該閘形同虛設）。若要真正防陳舊，應改讀 RCC 重置
+ *   原因暫存器（IWDG/SOFT/PIN reset ⇒ 板子上一刻仍在跑；POR ⇒ 重新上電），main.c 已讀取
+ *   reset_csr 但目前僅供列印。
+ * ⚠ 電梯 profile 的看門狗恰好也是 300s，故電梯測試中「看門狗觸發前最後一瞬間」的封包會
+ *   剛好落在窗外（門檻用 >=）。實務上無妨；若在意可改 305000。 */
+#define FSM_HOTSTART_MAX_TICK_MS    300000U // 起飛後經過時間上限（完整飛行 ~278s + 餘裕）
 #define FSM_HOTSTART_MAX_ALT_DIFF_M 300.0f  // 封包 baro 與當下 baro 容許差（IWDG 2.05s + 開機期下落餘裕）
 
 /* === 事件（供呼叫端列印 / 記錄；一次 FSM_Step 至多一個事件） === */
@@ -216,7 +266,8 @@ typedef struct {
 typedef struct {
     uint8_t fire_drogue;     // 1 = 啟動副傘 DC 馬達（PD13 HIGH，持續 FSM_DROGUE_MOTOR_RUN_MS）
     uint8_t release_drogue;  // 1 = 停止馬達（PD13 LOW）
-    uint8_t deploy_main;     // 1 = 主傘釋放舵機（TIM4_CH3 CCR=2000）
+    uint8_t deploy_main;     // 1 = 主傘釋放：PD14 純 GPIO 拉高 SERVO_MAIN_HIGH_MS(1.5s)，
+                              //     不啟動 PWM；同時經板間鏈路呼叫對端一起拉高（無互斥握手）
     uint8_t start_buzzer;    // 1 = 開啟尋標蜂鳴器
     uint8_t event;           // FSM_Event_t
     float   apogee_t_pred;   // EVT_APOGEE 時的預估頂點時間 (s)，供事件列印

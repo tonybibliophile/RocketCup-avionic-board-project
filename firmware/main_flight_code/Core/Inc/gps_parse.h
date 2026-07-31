@@ -74,6 +74,9 @@ typedef struct {
     uint8_t  satellites;       /* GGA 使用衛星數                               */
     int32_t  lat_1e6;          /* 緯度 ×1e6 (deg)，+北 / −南                    */
     int32_t  lon_1e6;          /* 經度 ×1e6 (deg)，+東 / −西                    */
+    uint32_t hacc_mm;          /* UBX-NAV-PVT hAcc：接收器自估水平精度 (mm)；
+                                 * NMEA 路徑（無 UBX PVT）留 0，呼叫端須視 0 為
+                                 * 「無估計」並自行 fallback。 */
     float    altitude_m;       /* GGA 海拔高度 (m, MSL)                         */
     float    geoid_sep_m;      /* GGA 大地水準面分離 (m)                        */
     float    speed_mps;        /* RMC 地速 (m/s，由 knots 換算)                 */
@@ -479,6 +482,7 @@ static inline void gps_parse_ubx_pvt(GPS_Data_t *d, const UbxNavPvt_t *pvt, uint
 
     d->fix_quality = pvt->fixType;
     d->satellites = pvt->numSV;
+    d->hacc_mm = pvt->hAcc;
     d->lat_1e6 = pvt->lat / 10;
     d->lon_1e6 = pvt->lon / 10;
     d->altitude_m = (float)pvt->hMSL / 1000.0f;

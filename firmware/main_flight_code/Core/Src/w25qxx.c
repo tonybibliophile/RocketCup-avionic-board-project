@@ -524,14 +524,11 @@ uint16_t ring_crc16(const uint8_t *data, uint16_t len)
     return crc16_ccitt_false(data, len);   /* P1：統一至 crc16.h 單一實作（符號保留，多處引用） */
 }
 
-void FlashRing_InitEx(void (*progress_cb)(uint32_t current, uint32_t total))
+/* 掃描寫入頭：讀取 FLASH_RINGBUF_ADDR 的第一個 byte，若為 0xFF 則 Ring 為空、從頭開始；
+ * 否則二分搜尋最後一個有資料的 Sector，再逐 slot 找首個空槽。純讀取，不擦除任何東西，
+ * 讓呼叫端可以在決定「是否要 bulk 預擦」之前，先安全讀到既有的最後一筆封包。 */
+static void ring_scan_write_head(void)
 {
-    printf("[FLASH_RING] Init start...\r\n");
-
-    /* --- 掃描寫入頭 ---
-     * 策略：讀取 FLASH_RINGBUF_ADDR 的第一個 byte，
-     *       若為 0xFF 則 Ring 為空，從頭開始；
-     *       否則二分搜尋最後一個有資料的 Sector，再逐 slot 找首個空槽。 */
     uint8_t first_byte;
     W25QXX_ReadData(FLASH_RINGBUF_ADDR, &first_byte, 1);
 
@@ -568,8 +565,13 @@ void FlashRing_InitEx(void (*progress_cb)(uint32_t current, uint32_t total))
         }
         printf("[FLASH_RING] Resumed from 0x%06lX\r\n", s_ring_write_addr);
     }
+}
 
-    /* --- 預擦 FLASH_RING_PREERASE_TARGET 個 Sector --- */
+/* Bulk 預擦 FLASH_RING_PREERASE_TARGET 個 Sector，從目前寫入頭所在的 Sector 開始。
+ * ★會擦掉寫入頭所在 Sector 內、寫入頭之前的既有資料——呼叫前必須確定不需要再讀那筆
+ * 資料（即已排除空中熱重啟的可能）。 */
+static void ring_bulk_preerase(void (*progress_cb)(uint32_t current, uint32_t total))
+{
     uint32_t erase_addr = s_ring_write_addr & ~((uint32_t)(W25QXX_SECTOR_SIZE - 1));
     for (int i = 0; i < FLASH_RING_PREERASE_TARGET; i++) {
         W25QXX_EraseSector(erase_addr);
@@ -587,7 +589,13 @@ void FlashRing_InitEx(void (*progress_cb)(uint32_t current, uint32_t total))
     s_ring_erased_end   = erase_addr;
     s_ring_packet_count = 0;
     s_ring_seq          = 0;
+}
 
+void FlashRing_InitEx(void (*progress_cb)(uint32_t current, uint32_t total))
+{
+    printf("[FLASH_RING] Init start...\r\n");
+    ring_scan_write_head();
+    ring_bulk_preerase(progress_cb);
     printf("[FLASH_RING] Ready. Write: 0x%06lX, Erased to: 0x%06lX\r\n",
            s_ring_write_addr, s_ring_erased_end);
 }
@@ -595,6 +603,118 @@ void FlashRing_InitEx(void (*progress_cb)(uint32_t current, uint32_t total))
 void FlashRing_Init(void)
 {
     FlashRing_InitEx(NULL);
+}
+
+/* ★P0：僅掃描寫入頭、不擦除。給開機序列在判斷「是否為空中熱重啟」之前呼叫——
+ * 若在讀到上一筆封包前就跑 bulk 預擦，會把寫入頭所在 Sector（含熱重啟判斷要讀的
+ * 最後一筆資料）擦掉，等於「先擦證據、後驗屍」。呼叫後應以 FlashRing_GetLastPacket()
+ * 讀最後一筆封包、跑完熱重啟判斷，才視結果呼叫 FlashRing_RunPreErase()（地面開機）
+ * 或 FlashRing_SkipPreErase()（空中熱重啟）。 */
+void FlashRing_ScanWriteHeadOnly(void)
+{
+    printf("[FLASH_RING] Scan write head (no erase)...\r\n");
+    ring_scan_write_head();
+    printf("[FLASH_RING] Write head: 0x%06lX\r\n", s_ring_write_addr);
+}
+
+/* ★P0：確定不是空中熱重啟（地面開機／熱啟動驗證未過回 PAD）後才呼叫，執行原本的
+ * 960-sector bulk 預擦。行為與舊版 FlashRing_InitEx() 的預擦段一致。 */
+void FlashRing_RunPreErase(void (*progress_cb)(uint32_t current, uint32_t total))
+{
+    ring_bulk_preerase(progress_cb);
+    printf("[FLASH_RING] Ready. Write: 0x%06lX, Erased to: 0x%06lX\r\n",
+           s_ring_write_addr, s_ring_erased_end);
+}
+
+/* ★2026-07-31：唯讀認領已擦區。開機序列的「唯一」池來源（冷開機與空中熱重啟共用）：
+ * 開機不再自動擦除，池由使用者觸發的 `flash erase`／`flash pool` 指令建立，重開機後
+ * 那片已擦區還好端端在 flash 上，只是 RAM 裡的 erased_end 沒了——本函式把它找回來。
+ *
+ * 作法：先把寫入頭所在 sector 的剩餘空間計入池（必為 0xFF，理由見 ring_sector_end()），
+ * 再逐 sector 讀首 2 bytes 確認 0xFF 才往前收（封包必以 0xAA 0x55 起頭、同 sector 內由
+ * 低往高寫，故首格為空 ⇒ 整格未使用；與 ring_scan_write_head() 的二分搜尋同一套假設）。
+ * 一遇非 0xFF 立即停手，池上限為 FLASH_RING_PREERASE_TARGET。全程零擦除，成本最壞
+ * FLASH_RING_PREERASE_TARGET 次 2-byte 讀（毫秒級）。
+ * 誤差方向是安全的：只會低估池（把「其實已擦」誤判為未擦），絕不會高估。 */
+uint32_t FlashRing_ProbePoolNoErase(void)
+{
+    uint32_t end = ring_sector_end(s_ring_write_addr);
+    const uint32_t pool_limit = (uint32_t)FLASH_RING_PREERASE_TARGET * W25QXX_SECTOR_SIZE;
+    uint32_t probed = 0;
+
+    while (ring_pool_bytes_calc(s_ring_write_addr, end) + W25QXX_SECTOR_SIZE <= pool_limit) {
+        uint8_t head[2];
+        if (W25QXX_ReadData(end, head, sizeof(head)) != W25QXX_OK) break;
+        if (head[0] != 0xFF || head[1] != 0xFF) break;   /* 遇到既有資料：停手，絕不擦除 */
+        end = ring_sector_end(end);
+        if ((++probed % 64U) == 0U) HAL_IWDG_Refresh(&hiwdg);
+    }
+    HAL_IWDG_Refresh(&hiwdg);
+
+    s_ring_erased_end = end;
+    return ring_pool_bytes() / W25QXX_SECTOR_SIZE;
+}
+
+/* ★2026-07-31：快速填池（`flash pool` 指令 / bench 反覆測試用）。只把池補到達標，
+ * 不動整環 —— 已被 ProbePool 認領的部分不重擦，只擦缺的那幾格。飛前正規流程仍應走
+ * `flash erase`（整環全擦），本函式是「環已乾淨、只是池不足」時的省時路徑。
+ * @return 補完後的池大小（sectors）。 */
+uint32_t FlashRing_TopUpPool(void (*progress_cb)(uint32_t current, uint32_t total))
+{
+    uint32_t have = FlashRing_ProbePoolNoErase();
+    const uint32_t want = FLASH_RING_PREERASE_TARGET;
+    if (have >= want) {
+        printf("[FLASH_RING] Pool already OK: %lu/%u sectors (no erase needed)\r\n",
+               (unsigned long)have, (unsigned)want);
+        return have;
+    }
+
+    const uint32_t need = want - have;
+    printf("[FLASH_RING] Top-up pool: %lu/%u sectors, erasing %lu more...\r\n",
+           (unsigned long)have, (unsigned)want, (unsigned long)need);
+    for (uint32_t i = 0; i < need; i++) {
+        if (W25QXX_EraseSector(ring_erase_target(s_ring_erased_end)) != W25QXX_OK) {
+            printf("[FLASH_RING] Top-up FAILED @ 0x%06lX\r\n", s_ring_erased_end);
+            break;
+        }
+        s_ring_erased_end = ring_erase_advance(s_ring_erased_end);
+        HAL_IWDG_Refresh(&hiwdg);
+        s_ring_erase_pct = (uint8_t)(((uint32_t)(i + 1) * 100U) / need);
+        if (progress_cb) progress_cb(i + 1, need);
+    }
+    have = ring_pool_bytes() / W25QXX_SECTOR_SIZE;
+    printf("[FLASH_RING] Top-up done: pool=%lu/%u sectors, write=0x%06lX erased_end=0x%06lX\r\n",
+           (unsigned long)have, (unsigned)want, s_ring_write_addr, s_ring_erased_end);
+    return have;
+}
+
+/* ★P0：確定是空中熱重啟時呼叫，整段跳過 bulk 預擦（避免擦掉剛讀到的最後一筆飛行
+ * 資料、也避免卡住主迴圈數十秒到數分鐘）。呼叫端應緊接著呼叫
+ * FlashRing_SetEraseAllowed(0) 立即關閉同步擦除，不要等主迴圈第一輪才關。
+ *
+ * ★2026-07-31：舊版直接令 erased_end = write_addr（池=0），造成兩個問題：
+ *   1) 池=0 + erase_allowed=0 ⇒ 熱重啟之後整段飛行 100% 丟包（見 FlashRing_WritePacket
+ *      的 W25QXX_ERR_NO_POOL 分支）——但這個 0 是假的：開機序列（整環全擦／960-sector
+ *      預擦）留下的已擦區還好端端在 flash 上，只是 RAM 裡的 erased_end 隨重啟沒了。
+ *   2) write_addr 是 128B 對齊、不是 sector 對齊，破壞 erased_end 的 sector 對齊
+ *      不變量：落地後 erase_allowed 一開，第一次滾動擦除的 target 就是寫入頭本身，
+ *      會擦掉寫入頭所在整個 sector（重啟前最後 ≤31 筆，含熱重啟賴以判斷的那一筆），
+ *      之後 erased_end 長期不對齊、池區間尾端會落進未擦 sector（NOR 覆寫靜默損毀）。
+ * 現版：不擦任何東西，改以「唯讀探測」把已擦區找回來——先把寫入頭所在 sector 的
+ * 剩餘空間計入池（必為 0xFF，理由見 ring_sector_end()），再逐 sector 讀首 2 bytes
+ * 確認 0xFF 才往前收（封包必以 0xAA 0x55 起頭、同 sector 內由低往高寫，故首格為空
+ * ⇒ 整格未使用；與 ring_scan_write_head() 的二分搜尋同一套假設）。一遇非 0xFF 立即
+ * 停手，池上限仍是 FLASH_RING_PREERASE_TARGET。成本最壞 960 次 2-byte 讀（毫秒級），
+ * 換回「熱重啟後仍能繼續記錄」，且全程零擦除。 */
+void FlashRing_SkipPreErase(void)
+{
+    uint32_t pool = FlashRing_ProbePoolNoErase();
+    s_ring_packet_count = 0;
+    s_ring_seq          = 0;
+    printf("[FLASH_RING] HOT-RESTART: no erase at all; verified pool=%lu/%u sectors, "
+           "write=0x%06lX erased_end=0x%06lX\r\n",
+           (unsigned long)pool, (unsigned)FLASH_RING_PREERASE_TARGET,
+           s_ring_write_addr, s_ring_erased_end);
 }
 
 /* 只擦除環形緩衝區（Block 1..255, 0x010000~0xFFFFFF），保留 Sector 0（校準/mag/LoRa）

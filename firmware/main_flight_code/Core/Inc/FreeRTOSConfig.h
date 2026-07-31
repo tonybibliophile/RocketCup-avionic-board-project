@@ -45,6 +45,8 @@
 
 /* USER CODE BEGIN Includes */
 /* Section where include file can be added */
+#include "board_config.h"   /* BOARD_ROLE / IS_GROUND：heap 大小依角色切（見下方 configTOTAL_HEAP_SIZE）。
+                             * board_config.h 是純巨集、無 include，對組譯器亦無副作用。 */
 /* USER CODE END Includes */
 
 /* Ensure definitions are only used by the compiler, and not by the assembler. */
@@ -68,7 +70,17 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
+/* heap_4 的 ucHeap[] 是 .bss 靜態陣列——沒用到的部分照樣佔滿 SRAM。
+ * 地面站(ROLE_GROUND)只建立 defaultTask(4KB stack)+兩個 mutex，實測需求 <8KB，
+ * 但飛控用的全域緩衝（g_ekf_buffers 7200B、s_imu_buf 4096B…）仍編進 binary，
+ * 128KB SRAM 被擠爆 → 連結報 `._user_heap_stack will not fit in region RAM`
+ * （newlib 的 _sbrk heap + stack 那段放不下）。故地面站改配 32KB（約 4x 餘裕），
+ * 主/備航電維持 96KB 不變。 */
+#if IS_GROUND
+#define configTOTAL_HEAP_SIZE                    ((size_t)32000)
+#else
 #define configTOTAL_HEAP_SIZE                    ((size_t)96000)
+#endif
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0
