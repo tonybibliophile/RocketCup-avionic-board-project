@@ -168,6 +168,27 @@ volatile uint8_t g_flash_erase_in_progress = 0; /* 1 = 正在執行 flash erase�
  * 的提醒來源：主迴圈 1Hz 橫幅（USB/LoRa 文字）＋下鏈 arm_flags 的 TELEM_ARM_NEED_ERASE
  * （地面站 GUI 顯示）。ARM 本身由 fsm.c 既有的 flash_pool_ready 閘擋下，非靠此旗標。 */
 volatile uint8_t g_flash_need_erase = 0;
+/* ★2026-07-31：1 = 要求飛控主迴圈（StartDefaultTask 的 for(;;)）停在迴圈頂端讓路，
+ * 供 flash erase/pool 期間使用。合作式停車，不用 osThreadSuspend——理由見迴圈頂端註解
+ * （持 SPI3 鎖時被強制掛起會與擦除端死鎖）。LoRa 遙測任務刻意不停，進度才送得出去。 */
+volatile uint8_t g_erase_pause_flight_loop = 0;
+
+/* 擦除前後成對呼叫。回傳值供呼叫端判斷是否真的停到（逾時仍繼續，只是失去讓路效果）。 */
+static void FlashErase_PauseFlightLoop(void)
+{
+    if (g_erase_pause_flight_loop) return;   /* 已經停了（巢狀呼叫防呆） */
+    g_erase_pause_flight_loop = 1U;
+    /* 主迴圈一輪 1ms 級，等 50ms 綽綽有餘；不做確認握手以免多一組狀態要維護。 */
+    osDelay(50);
+    printf("[FLASH_ERASE] 飛控主迴圈已暫停讓路（LoRa 遙測與指令台照常運作）\r\n");
+}
+
+static void FlashErase_ResumeFlightLoop(void)
+{
+    if (!g_erase_pause_flight_loop) return;
+    g_erase_pause_flight_loop = 0U;
+    printf("[FLASH_ERASE] 飛控主迴圈已恢復\r\n");
+}
 
 static void FlashFlight_SetLastId(uint32_t last_id, uint8_t active)
 {
@@ -2540,16 +2561,19 @@ static void FlashErase_FormatDualProgress(char *buf, size_t buflen,
     }
 }
 
-static void FlashPreErase_ProgressCallback(uint32_t current, uint32_t total)
+/* 擦除/預擦/填池共用的進度回呼（★2026-07-31 自 FlashPreErase_ProgressCallback 更名：
+ * 現在 FlashRing_EraseAll() 也吃同一支，整環全擦不再是「三分鐘沒有任何輸出」）。 */
+static void FlashErase_ProgressCallback(uint32_t current, uint32_t total)
 {
-    /* 1) 每 sector 廣播自身 erase_pct → 對端 DMA RX 可更新 peer_erase_pct。
-     *    主迴圈 Link_PublishTick 此時尚未跑，這是雙板進度互通的唯一路徑。 */
+    /* 1) 每格廣播自身 erase_pct → 對端 DMA RX 可更新 peer_erase_pct。
+     *    開機路徑下主迴圈 Link_PublishTick 尚未跑，這是雙板進度互通的唯一路徑；
+     *    指令路徑下主迴圈已被 FlashErase_PauseFlightLoop() 停下，同樣只剩這條。 */
     Link_PublishEraseProgress();
     HAL_IWDG_Refresh(&hiwdg);
 
     /* 2) USB-CDC / LoRa：每 10% 或對端進度有明顯變化時印雙板進度。
      *    主航電插 USB 時應同時看到 primary=..% 與 backup=..%。 */
-    uint32_t step = total / 10U;  /* 960 → 96 */
+    uint32_t step = total / 10U;  /* 預擦 1500 → 150；整環全擦 255 → 25 */
     if (step == 0U) step = 1U;
 
     static uint8_t s_last_printed_peer_pct = 0xFFU;
@@ -3716,18 +3740,30 @@ void Parse_Serial_Command(const char* cmd) {
                  * 寫入位置可能落在還沒擦淨的區塊。★此旗標由 uplink_cmd.c 的 ARM/text
                  * "arm" 兩處共查。 */
                 g_flash_erase_in_progress = 1U;
+                /* ★2026-07-31：整段擦除期間把飛控主迴圈停在迴圈頂端讓路（LoRa 遙測任務
+                 * 與本指令台不停）。合作式停車，不用 osThreadSuspend——見迴圈頂端註解。 */
+                FlashErase_PauseFlightLoop();
 
+                /* 板間鏈路存在時把進度也廣播給對端（FlashErase_ProgressCallback 定義在
+                 * FEATURE_LINK 區塊內）；地面站角色沒有鏈路，靠 EraseAll 自己的
+                 * [FLASH_ERASE] 文字行輸出到 USB-CDC 即可。 */
+#if FEATURE_LINK
+                void (*erase_cb)(uint32_t, uint32_t) = FlashErase_ProgressCallback;
+#else
+                void (*erase_cb)(uint32_t, uint32_t) = NULL;
+#endif
                 W25QXX_StatusTypeDef st = W25QXX_OK;
                 if (erase_all) {
                     printf("[FLASH] Erasing WHOLE chip (含校準/總結/紀錄)...\r\n");
                     st = W25QXX_EraseBlock64K(FLASH_SYSFLAGS_ADDR);  /* Block 0：SysFlags + Summary */
                     HAL_IWDG_Refresh(&hiwdg);
-                    if (st == W25QXX_OK) st = FlashRing_EraseAll();  /* Block 1..255：Ring Buffer */
+                    if (st == W25QXX_OK) st = FlashRing_EraseAll(erase_cb);
                 } else {
                     printf("[FLASH] Erasing Ring Buffer only (保留校準/總結)...\r\n");
-                    st = FlashRing_EraseAll();
+                    st = FlashRing_EraseAll(erase_cb);
                 }
 
+                FlashErase_ResumeFlightLoop();
                 g_flash_erase_in_progress = 0U;
 
                 /* 還原飛行用 ~2.05s IWDG 視窗 */
@@ -3765,11 +3801,22 @@ void Parse_Serial_Command(const char* cmd) {
             printf("[FLASH] 快速填池：目標 %u sectors（只補不足部分，不動整環）...\r\n",
                    (unsigned)FLASH_RING_PREERASE_TARGET);
             g_flash_erase_in_progress = 1U;
+            FlashErase_PauseFlightLoop();   /* 同 `flash erase`：擦除期間只留 LoRa */
+            /* 填池最壞 1500 × ~400ms sector erase，遠超飛行用 2.05s IWDG 視窗 →
+             * 比照 `flash erase` 先放寬到 10s，結束後還原。 */
+            {
+                IWDG_HandleTypeDef iwdg_wide = hiwdg;
+                iwdg_wide.Init.Prescaler = IWDG_PRESCALER_256;
+                iwdg_wide.Init.Reload    = 1250;   /* 32kHz/256=125Hz -> 10s */
+                HAL_IWDG_Init(&iwdg_wide);
+            }
 #if FEATURE_LINK
-            uint32_t pool_now = FlashRing_TopUpPool(FlashPreErase_ProgressCallback);
+            uint32_t pool_now = FlashRing_TopUpPool(FlashErase_ProgressCallback);
 #else
             uint32_t pool_now = FlashRing_TopUpPool(NULL);
 #endif
+            HAL_IWDG_Init(&hiwdg);          /* 還原飛行用 ~2.05s 視窗 */
+            FlashErase_ResumeFlightLoop();
             g_flash_erase_in_progress = 0U;
             HAL_IWDG_Refresh(&hiwdg);
             g_flash_logging_active = 1;
@@ -4014,12 +4061,16 @@ void StartDefaultTask(void *argument)
 #else
       printf("[BOOT] FEATURE_FLASH_BOOT_FULL_ERASE=1: Erasing ENTIRE Flash Ring (~3 min)...\r\n");
 #endif
-      FlashRing_EraseAll();   /* Block 1..255：只清環（保留 Sector 0 校準/mag/LoRa/總結） */
+#if FEATURE_LINK
+      FlashRing_EraseAll(FlashErase_ProgressCallback);  /* Block 1..255：只清環（保留 Sector 0） */
+#else
+      FlashRing_EraseAll(NULL);
+#endif
       HAL_IWDG_Init(&hiwdg);
       HAL_IWDG_Refresh(&hiwdg);
       FlashRing_ScanWriteHeadOnly();
 #if FEATURE_LINK
-      FlashRing_RunPreErase(FlashPreErase_ProgressCallback);
+      FlashRing_RunPreErase(FlashErase_ProgressCallback);
       Boot_WaitPeerEraseProgress();
 #else
       FlashRing_RunPreErase(NULL);
@@ -4296,6 +4347,19 @@ void StartDefaultTask(void *argument)
   DWT_Init(); // Ensure DWT is initialized
   for(;;)
   {
+    /* === ★2026-07-31：擦除期間把飛控主迴圈停在這裡（使用者要求：擦除時其他任務暫停，
+     * 只留 LoRa）===
+     * 刻意用「合作式停車」而非 osThreadSuspend()：本迴圈會持 SPI3 匯流排鎖（Flash ring
+     * 與 E80 共用 SPI3），若在持鎖瞬間被強制掛起，擦除端的 CS_LOW() 會永遠等不到鎖 →
+     * 直接死鎖到 IWDG 重啟。停在迴圈頂端則保證所有鎖都已釋放。
+     * 停車期間不餵狗沒問題：擦除迴圈自己每塊 HAL_IWDG_Refresh()，且指令端已把視窗放寬到
+     * 10s。LoRa 遙測任務（獨立 RTOS task）不受影響，擦除進度照樣送得出去；EKF 任務靠本
+     * 迴圈餵資料，本迴圈停了它自然在空佇列上阻塞，不必另外處理。
+     * 擦除指令已閘在 INIT/PAD/LANDED，不會在飛行中發生。 */
+    while (g_erase_pause_flight_loop) {
+        osDelay(20);
+    }
+
     uint32_t loop_start_cycles = DWT->CYCCNT;
     /* --- 餵狗 (Feed the independent watchdog) --- */
     HAL_IWDG_Refresh(&hiwdg);

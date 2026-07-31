@@ -670,21 +670,58 @@ uint32_t FlashRing_TopUpPool(void (*progress_cb)(uint32_t current, uint32_t tota
     }
 
     const uint32_t need = want - have;
+    const uint32_t sectors_per_block = W25QXX_BLOCK_SIZE_64K / W25QXX_SECTOR_SIZE;   /* 16 */
     printf("[FLASH_RING] Top-up pool: %lu/%u sectors, erasing %lu more...\r\n",
            (unsigned long)have, (unsigned)want, (unsigned long)need);
-    for (uint32_t i = 0; i < need; i++) {
-        if (W25QXX_EraseSector(ring_erase_target(s_ring_erased_end)) != W25QXX_OK) {
-            printf("[FLASH_RING] Top-up FAILED @ 0x%06lX\r\n", s_ring_erased_end);
-            break;
+
+    const uint32_t t0 = HAL_GetTick();
+    uint32_t done = 0, blocks_used = 0, sectors_used = 0;
+    while (done < need) {
+        const uint32_t target    = ring_erase_target(s_ring_erased_end);
+        const uint32_t remaining = need - done;
+        /* ★2026-07-31 速度：對齊且還缺 ≥16 格時改用 64KB block erase。
+         * 同樣 64KB，1 次 block erase（datasheet typ 150ms）遠快於 16 次 sector erase
+         * （16 × typ 45ms ≈ 720ms），整池 1500 格差距可達數十秒。尾巴不足一個 block、
+         * 或起點未對齊時才回退到 sector erase，故最終邊界仍精準落在 want。 */
+        uint32_t step;
+        if ((target % W25QXX_BLOCK_SIZE_64K) == 0U && remaining >= sectors_per_block) {
+            if (W25QXX_EraseBlock64K(target) != W25QXX_OK) {
+                printf("[FLASH_RING] Top-up FAILED (block) @ 0x%06lX\r\n", target);
+                break;
+            }
+            step = sectors_per_block;
+            blocks_used++;
+        } else {
+            if (W25QXX_EraseSector(target) != W25QXX_OK) {
+                printf("[FLASH_RING] Top-up FAILED (sector) @ 0x%06lX\r\n", target);
+                break;
+            }
+            step = 1U;
+            sectors_used++;
         }
-        s_ring_erased_end = ring_erase_advance(s_ring_erased_end);
+        for (uint32_t k = 0; k < step; k++) {
+            s_ring_erased_end = ring_erase_advance(s_ring_erased_end);
+        }
+        done += step;
         HAL_IWDG_Refresh(&hiwdg);
-        s_ring_erase_pct = (uint8_t)(((uint32_t)(i + 1) * 100U) / need);
-        if (progress_cb) progress_cb(i + 1, need);
+        s_ring_erase_pct = (uint8_t)((done * 100U) / need);
+        if (progress_cb) progress_cb(done, need);
+        if ((done % 160U) < step || done >= need) {
+            const uint32_t elapsed = HAL_GetTick() - t0;
+            printf("[FLASH_ERASE] top-up %lu/%lu sectors %u%% | 已用 %lus 預估剩餘 %lus\r\n",
+                   (unsigned long)done, (unsigned long)need, (unsigned)s_ring_erase_pct,
+                   (unsigned long)(elapsed / 1000U),
+                   (unsigned long)(done ? ((need - done) * elapsed / done) / 1000U : 0U));
+        }
     }
+
     have = ring_pool_bytes() / W25QXX_SECTOR_SIZE;
-    printf("[FLASH_RING] Top-up done: pool=%lu/%u sectors, write=0x%06lX erased_end=0x%06lX\r\n",
-           (unsigned long)have, (unsigned)want, s_ring_write_addr, s_ring_erased_end);
+    printf("[FLASH_RING] Top-up done: pool=%lu/%u sectors，耗時 %lus（%lu 塊 64KB + %lu 格 4KB），"
+           "write=0x%06lX erased_end=0x%06lX\r\n",
+           (unsigned long)have, (unsigned)want,
+           (unsigned long)((HAL_GetTick() - t0) / 1000U),
+           (unsigned long)blocks_used, (unsigned long)sectors_used,
+           s_ring_write_addr, s_ring_erased_end);
     return have;
 }
 
@@ -722,23 +759,57 @@ void FlashRing_SkipPreErase(void)
  * Sector Erase），每塊擦完餵一次狗。每次 SPI 交易經 CS_LOW/CS_HIGH 自行鎖/解鎖 SPI3，
  * 呼叫端不需另包外層鎖（見 main.c flash erase 指令處說明）；呼叫端應放寬 IWDG 視窗。
  * 擦完由呼叫端跑 FlashRing_Init() 重掃寫入頭。 */
-W25QXX_StatusTypeDef FlashRing_EraseAll(void)
+W25QXX_StatusTypeDef FlashRing_EraseAll(void (*progress_cb)(uint32_t current, uint32_t total))
 {
+    const uint32_t total_blocks =
+        (FLASH_RINGBUF_END + 1UL - FLASH_RINGBUF_ADDR) / W25QXX_BLOCK_SIZE_64K;   /* 255 */
     uint32_t addr = FLASH_RINGBUF_ADDR;   /* 0x010000，64KB 對齊 */
     uint32_t block_idx = 0;
+    const uint32_t t0 = HAL_GetTick();
+
+    s_ring_erase_pct = 0U;
+    if (progress_cb) progress_cb(0U, total_blocks);
+
     while (addr <= FLASH_RINGBUF_END) {
+        const uint32_t tb = HAL_GetTick();
         W25QXX_StatusTypeDef st = W25QXX_EraseBlock64K(addr);
         if (st != W25QXX_OK) {
-            printf("[FLASH_RING] EraseAll FAILED @ 0x%06lX, err=%d\r\n", addr, (int)st);
+            printf("[FLASH_RING] EraseAll FAILED @ 0x%06lX, err=%d（已完成 %lu/%lu 塊）\r\n",
+                   addr, (int)st, (unsigned long)block_idx, (unsigned long)total_blocks);
             return st;
         }
         HAL_IWDG_Refresh(&hiwdg);
-        if ((++block_idx & 0x1F) == 0) {
-            printf("[FLASH_RING] Erasing... %lu/255 blocks\r\n", (unsigned long)block_idx);
+        block_idx++;
+
+        /* ★2026-07-31：每一塊都更新進度。舊版整段 3 分鐘只在每 32 塊印一行純文字、
+         * 且完全不動 s_ring_erase_pct，導致板間鏈路/GUI 的 erase_pct 一路停在 0，
+         * 使用者看到的是「畫面凍住」。現在 pct 每塊更新，progress_cb 讓呼叫端把進度
+         * 廣播出去（LoRa/板間鏈路仍在跑，見 main.c 的任務暫停策略）。 */
+        s_ring_erase_pct = (uint8_t)((block_idx * 100U) / total_blocks);
+        if (progress_cb) progress_cb(block_idx, total_blocks);
+
+        /* 文字進度：每 16 塊一行，附「本塊耗時 / 平均 / 預估剩餘」——這三個數字才能
+         * 回答「為什麼慢」：64KB block erase 的實際耗時取決於晶片磨損程度，
+         * datasheet typ 150ms / max 2000ms，只有量出來才知道落在哪。 */
+        if ((block_idx % 16U) == 0U || block_idx == total_blocks) {
+            const uint32_t elapsed = HAL_GetTick() - t0;
+            const uint32_t avg_ms  = elapsed / block_idx;
+            printf("[FLASH_ERASE] %lu/%lu blocks %u%% | 本塊 %lums 平均 %lums 已用 %lus 預估剩餘 %lus\r\n",
+                   (unsigned long)block_idx, (unsigned long)total_blocks,
+                   (unsigned)s_ring_erase_pct,
+                   (unsigned long)(HAL_GetTick() - tb), (unsigned long)avg_ms,
+                   (unsigned long)(elapsed / 1000U),
+                   (unsigned long)(((total_blocks - block_idx) * avg_ms) / 1000U));
         }
         addr += W25QXX_BLOCK_SIZE_64K;
     }
-    printf("[FLASH_RING] Ring buffer erased (%lu blocks).\r\n", (unsigned long)block_idx);
+
+    const uint32_t elapsed = HAL_GetTick() - t0;
+    s_ring_erase_pct = 100U;
+    if (progress_cb) progress_cb(total_blocks, total_blocks);
+    printf("[FLASH_ERASE] DONE：%lu 塊 / %lus（平均 %lums/塊，64KB/塊）\r\n",
+           (unsigned long)block_idx, (unsigned long)(elapsed / 1000U),
+           (unsigned long)(elapsed / (block_idx ? block_idx : 1U)));
     return W25QXX_OK;
 }
 

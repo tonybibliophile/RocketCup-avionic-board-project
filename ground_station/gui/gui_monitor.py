@@ -2282,6 +2282,22 @@ class RocketDashboardApp:
                 tot_sec = m_er.group(5)
                 self._update_erase_progress(pri_pct, bak_pct, cur_sec, tot_sec)
 
+        # C1b. ★2026-07-31：單板擦除進度 [FLASH_ERASE] 96/255 blocks 37% | 本塊 152ms 平均 148ms
+        #      已用 14s 預估剩餘 23s（整環全擦）／[FLASH_ERASE] top-up 480/1500 sectors 32% ...
+        #      舊版整環全擦 3 分鐘完全不更新 erase_pct，GUI 看起來像當機；這條讓「單板直連」
+        #      也有進度與 ETA（雙板情境仍由 C1/[LINK] 的 primary=/backup= 覆蓋）。
+        elif "[FLASH_ERASE]" in line:
+            m_fe = re.search(r"(\d+)\s*/\s*(\d+)\s+(?:blocks|sectors)\s+(\d+)%", line)
+            if m_fe:
+                cur, tot, pct = int(m_fe.group(1)), int(m_fe.group(2)), int(m_fe.group(3))
+                m_eta = re.search(r"預估剩餘\s*(\d+)s", line)
+                eta = f" ETA {m_eta.group(1)}s" if m_eta else ""
+                self.lbl_erase.config(
+                    text=f"💾 ERASE {pct}% [{cur}/{tot}]{eta}",
+                    fg="#00e676" if pct >= 100 else "#ffcc00")
+            elif "DONE" in line:
+                self.lbl_erase.config(text="💾 ✅ 擦除完成", fg="#00e676")
+
         # C2. 主/備板間鏈路溝通狀態 [LINK] self:.. peer:.. link:OK/STALE/NONE state:.. flags:.. age:..ms
         #     （新版尾段：sync=OK/NO lost=.. desync=.. self_arb=.. peer_arb=.. peer_flash=.. primary_erase=..% backup_erase=..%
         #      ph_cm=.. pv_cms=.. pbaro_cm=.. paz_cg=.. pvfh_cm=.. pvfv_cms=.. pbmi_cg=.. padxl_cg=..

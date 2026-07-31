@@ -593,7 +593,9 @@ static void dispatch_cmd(char *line)
                 iwdg_wide.Init.Reload    = 1250;   /* 32kHz/256=125Hz -> 1250/125 = 10s，比照 main.c flash erase */
                 HAL_IWDG_Init(&iwdg_wide);
             }
-            W25QXX_StatusTypeDef st = FlashRing_EraseAll();
+            /* 地面站沒有板間鏈路要廣播，進度靠 FlashRing_EraseAll() 自己的
+             * [FLASH_ERASE] 文字行（每 16 塊，含本塊耗時/平均/預估剩餘）→ USB-CDC。 */
+            W25QXX_StatusTypeDef st = FlashRing_EraseAll(NULL);
             HAL_IWDG_Init(&hiwdg);       /* 還原正常視窗 */
             HAL_IWDG_Refresh(&hiwdg);
             GroundStation_FlashResetAfterErase();

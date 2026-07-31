@@ -414,7 +414,10 @@ W25QXX_StatusTypeDef FlashRing_GetSecondLastPacket(FlashRingPacket_t *pkt);
  *         擦除後請呼叫 FlashRing_Init() 重新掃描寫入頭與預擦。
  * @retval W25QXX_OK 或錯誤碼
  */
-W25QXX_StatusTypeDef FlashRing_EraseAll(void);
+/* ★2026-07-31：加上 progress_cb（可傳 NULL）。舊版整段擦除只每 32 塊印一行、且完全不更新
+ * s_ring_erase_pct，板間鏈路/GUI 的進度一路停在 0，看起來像當機。現在每塊更新 pct 並回呼，
+ * 文字進度另附「本塊耗時/平均/預估剩餘」供診斷擦除速度。 */
+W25QXX_StatusTypeDef FlashRing_EraseAll(void (*progress_cb)(uint32_t current, uint32_t total));
 
 /** @brief 取得目前寫入地址 */
 uint32_t FlashRing_GetWriteAddr(void);
