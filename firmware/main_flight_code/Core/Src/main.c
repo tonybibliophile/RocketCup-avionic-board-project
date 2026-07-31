@@ -3672,10 +3672,17 @@ void Parse_Serial_Command(const char* cmd) {
         }
 
     } else if (strcmp(tok[0], "flash") == 0 && n >= 2) {
+        /* ★2026-07-31：PAD_ARMED 自允許清單移除。擦除/匯出全程阻塞主迴圈（整環全擦 ~3min、
+         * 填池最壞 1500×400ms、export 數秒），期間 FSM_Update 不跑 ⇒ 起飛偵測與開傘邏輯
+         * 完全停擺；而 PAD_ARMED 的定義正是「隨時可能起飛」。g_flash_erase_in_progress 只擋
+         * 「新的 ARM 生效」，不會解除既有武裝，所以先前那條路是真的會在武裝狀態下卡死主迴圈。
+         * 要擦除請先 DISARM 回 STATE_PAD。 */
         FlightState_t current_st = (FlightState_t)current_fsm_state;
-        if (current_st != STATE_INIT && current_st != STATE_PAD && 
-            current_st != STATE_PAD_ARMED && current_st != STATE_LANDED) {
-            printf("[FLASH] REJECTED: Flash erase/export only allowed in PAD or LANDED states! (fsm=%u)\r\n", (unsigned)current_st);
+        if (current_st != STATE_INIT && current_st != STATE_PAD &&
+            current_st != STATE_LANDED) {
+            printf("[FLASH] REJECTED: 僅限 INIT/PAD/LANDED 才可操作 Flash（state=%u）；"
+                   "PAD_ARMED 已武裝、隨時可能起飛，擦除會阻塞主迴圈數分鐘 → 請先 DISARM。\r\n",
+                   (unsigned)current_st);
             g_parse_status = ACK_REJECTED;
             return;
         }
