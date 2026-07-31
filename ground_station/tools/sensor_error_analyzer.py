@@ -58,31 +58,50 @@ except ImportError:
     serial_link = None
 
 # --- 遙測封包結構參數 (與 telemetry.h 同步) ---
-# ★ 2026-07-26：telemetry.h 新增 vf_pos_z_cm/vf_vel_z_cms 與擴充 peer_* 欄位，
-# 封包從 93 → 116 bytes。以下必須跟 TelemetryPacket_t 的欄位順序逐一對齊，
-# 順序錯了 CRC 永遠對不上、二進制模式會整段解不出來（曾經整個壞掉過一次）。
-PACKET_SIZE = 116
+# ★ 2026-07-30 兩輪瘦身：先移除 cpu_ekf_x10 + 對端 EKF/丟包率/高G（對端一律只看 VF）
+# 並新增 profile_flags（117→103B）；再砍 baro_press_pa、mag 三軸、高G 三軸縮成模長，
+# 換上飛行滾動極值 max_alt_m/max_vel_ms/max_acc_cg（103→95B），
+# 再加實際開傘高度 drogue_alt_m/main_alt_m（95→99B）。以下必須跟
+# TelemetryPacket_t 的欄位順序逐一對齊，順序錯了 CRC 永遠對不上、二進制模式會整段
+# 解不出來（曾經整個壞掉過一次）。
+#
+# ⚠ 本工具是「感測器誤差」分析器，mag 三軸 / 高G 三軸 / 原始氣壓 Pa 正是它的主分析
+#   對象——這些欄位現在已經不走 LoRa 下鏈了。但那三組資料本來就該用 USB 直連航電
+#   分析（要全速率，2Hz 的 LoRa 取樣本來也做不了雜訊統計），而 USB 文字路徑
+#   （[HG]/[MAG]/[BARO] 行 → self.state）完全不受影響，仍是完整的。
+#   只有「拿 LoRa 二進位流餵本工具」時那幾張圖會是平的 0，見 _BIN_ABSENT_FIELDS。
+PACKET_SIZE = 99
 SYNC0, SYNC1 = 0xA5, 0x5A
-_STRUCT_FMT = "<4BI2i4hiI12h2ih2B3HB2B2i2B3iBHh2i2BH"
+_STRUCT_FMT = "<4BI2i4hi7h2ih2B2H3B2iHhH2h2BiB2i3BH"
 _FIELDS = [
     "sync0", "sync1", "seq", "fsm_state", "tick_ms",
     "ekf_pos_z_cm", "ekf_vel_z_cms",
     "ekf_q0", "ekf_q1", "ekf_q2", "ekf_q3",
-    "baro_alt_cm", "baro_press_pa",
+    "baro_alt_cm",
     "imu_ax_mg", "imu_ay_mg", "imu_az_mg",
     "gyro_x_dps", "gyro_y_dps", "gyro_z_dps",
-    "hg_ax_cg", "hg_ay_cg", "hg_az_cg",
-    "mag_x_mg", "mag_y_mg", "mag_z_mg",
+    "hg_mag_cg",
     "gps_lat_1e6", "gps_lon_1e6", "gps_alt_m", "gps_sats", "gps_fix",
-    "bat_mv", "cpu_main_x10", "cpu_ekf_x10",
+    "bat_mv", "cpu_main_x10",
     "flags", "health_bits", "sensor_bits",
     "vf_pos_z_cm", "vf_vel_z_cms",
-    "peer_fsm_state", "peer_flags", "peer_h_cm", "peer_v_cms", "peer_baro_cm",
-    "peer_link", "peer_loss_pmil", "peer_az_cg", "peer_vf_h_cm", "peer_vf_v_cms",
-    "arm_flags",
-    "peer_bench_arb",
+    "max_alt_m", "max_vel_ms", "max_acc_cg",
+    "drogue_alt_m", "main_alt_m",
+    "peer_fsm_state", "peer_flags", "peer_baro_cm", "peer_link",
+    "peer_vf_h_cm", "peer_vf_v_cms",
+    "arm_flags", "peer_bench_arb", "profile_flags",
     "crc16",
 ]
+assert struct.calcsize(_STRUCT_FMT) == PACKET_SIZE, struct.calcsize(_STRUCT_FMT)
+
+# 下鏈已不再攜帶、但本工具下游繪圖仍會索引的欄位：二進位解出來後補 0，避免 KeyError。
+# （USB 文字路徑會用真值覆蓋這些 key，故只影響純 LoRa 二進位輸入。）
+_BIN_ABSENT_FIELDS = {
+    "baro_press_pa": 0,
+    "hg_ax_cg": 0, "hg_ay_cg": 0, "hg_az_cg": 0,
+    "mag_x_mg": 0, "mag_y_mg": 0, "mag_z_mg": 0,
+    "cpu_ekf_x10": 0,
+}
 
 def crc16_ccitt_false(data: bytes) -> int:
     crc = 0xFFFF
@@ -94,7 +113,9 @@ def crc16_ccitt_false(data: bytes) -> int:
 
 def decode_packet(raw: bytes) -> dict:
     vals = struct.unpack(_STRUCT_FMT, raw)
-    return dict(zip(_FIELDS, vals))
+    d = dict(_BIN_ABSENT_FIELDS)   # 先鋪 0，再讓實際欄位覆蓋（見 _BIN_ABSENT_FIELDS 說明）
+    d.update(zip(_FIELDS, vals))
+    return d
 
 
 # ===========================================================================
@@ -162,9 +183,9 @@ class StreamParser:
             "gps_sats": 8, "gps_fix": 1, "gps_lat_1e6": 24789000, "gps_lon_1e6": 120987000, "gps_alt_m": 25,
             "health_bits": 0, "sensor_bits": 0, "fsm_state": 1, "flags": 0,
             "vf_pos_z_cm": 0, "vf_vel_z_cms": 0,
-            "peer_fsm_state": 0, "peer_flags": 0, "peer_h_cm": 0, "peer_v_cms": 0, "peer_baro_cm": 0,
-            "peer_link": 0, "peer_loss_pmil": 0, "peer_az_cg": 0, "peer_vf_h_cm": 0, "peer_vf_v_cms": 0,
-            "arm_flags": 0, "peer_bench_arb": 0,
+            "peer_fsm_state": 0, "peer_flags": 0, "peer_baro_cm": 0, "peer_link": 0,
+            "peer_vf_h_cm": 0, "peer_vf_v_cms": 0,
+            "arm_flags": 0, "peer_bench_arb": 0, "profile_flags": 0,
             "seq": 0, "tick_ms": 0, "crc16": 0
         }
         self.seq = 0
@@ -566,7 +587,9 @@ class SensorAnalyzerEngine:
 
         # 8. CPU 資源
         cpu_main = [p["cpu_main_x10"] / 10.0 for p in packets]
-        cpu_ekf = [p["cpu_ekf_x10"] / 10.0 for p in packets]
+        # EKF CPU 只在 USB 直連的 [CPU] 診斷行才有（下行封包 2026-07-30 起不再攜帶），
+        # 走 LoRa 二進制路徑的封包沒有這個 key → 預設 0。
+        cpu_ekf = [p.get("cpu_ekf_x10", 0) / 10.0 for p in packets]
         stat_cpu_main = StatMetrics(cpu_main)
         stat_cpu_ekf = StatMetrics(cpu_ekf)
 
@@ -1092,7 +1115,7 @@ class LivePlotter:
         self.line_bat.set_data(t_sub, [p["bat_mv"] for p in p_sub])
 
         self.line_cpum.set_data(t_sub, [p["cpu_main_x10"] / 10.0 for p in p_sub])
-        self.line_cpue.set_data(t_sub, [p["cpu_ekf_x10"] / 10.0 for p in p_sub])
+        self.line_cpue.set_data(t_sub, [p.get("cpu_ekf_x10", 0) / 10.0 for p in p_sub])
 
         for ax in self.axs:
             ax.relim()
@@ -1531,9 +1554,9 @@ def generate_selftest_packets(count=150) -> list:
             "flags": 0, "health_bits": 0, "sensor_bits": 0,
             # VF 跟 EKF 給幾乎一致的值，模擬雙估計器健康一致的情況
             "vf_pos_z_cm": alt + int(random.gauss(0, 2.0)), "vf_vel_z_cms": int(random.gauss(0, 2.0)),
-            "peer_fsm_state": 0, "peer_flags": 0, "peer_h_cm": 0, "peer_v_cms": 0, "peer_baro_cm": 0,
-            "peer_link": 0, "peer_loss_pmil": 0, "peer_az_cg": 0, "peer_vf_h_cm": 0, "peer_vf_v_cms": 0,
-            "arm_flags": 0, "peer_bench_arb": 0,
+            "peer_fsm_state": 0, "peer_flags": 0, "peer_baro_cm": 0, "peer_link": 0,
+            "peer_vf_h_cm": 0, "peer_vf_v_cms": 0,
+            "arm_flags": 0, "peer_bench_arb": 0, "profile_flags": 0,
             "crc16": 0, "_bin": True,
         }
         packets.append(pkt)
@@ -1557,6 +1580,13 @@ def main():
     engine = SensorAnalyzerEngine()
     stop_event = threading.Event()
 
+    if not args.selftest and not args.file and not args.port:
+        try:
+            from file_selector import select_input_file
+            args.file = select_input_file(title="請選擇感測器/遙測數據紀錄檔", extensions=[".bin", ".csv", ".log"])
+        except Exception as e:
+            print(f"[WARNING] 無法啟動互動式檔案選擇器: {e}")
+
     if args.selftest:
         print("[SELFTEST] 執行發射前檢查與誤差分析邏輯測試...")
         packets = generate_selftest_packets(150)
@@ -1568,13 +1598,26 @@ def main():
             print(f"[ERROR] 檔案不存在: {args.file}")
             sys.exit(1)
 
+        file_size = os.path.getsize(args.file)
+        bytes_read = 0
+        last_pct = -1
         parser = StreamParser(engine.add_packet, on_diag=engine.update_diag)
         with open(args.file, "rb") as f:
             while True:
-                chunk = f.read(4096)
+                chunk = f.read(65536)
                 if not chunk:
                     break
+                bytes_read += len(chunk)
+                if file_size > 0:
+                    pct = int((bytes_read / file_size) * 100)
+                    if pct != last_pct and (pct % 10 == 0 or pct == 100):
+                        last_pct = pct
+                        sys.stdout.write(f"\r[PROGRESS] ⏳ 讀取遙測紀錄進度: {pct:3d}% ({bytes_read / (1024*1024):.1f} / {file_size / (1024*1024):.1f} MB)")
+                        sys.stdout.flush()
                 parser.feed(chunk)
+        if file_size > 0:
+            sys.stdout.write("\r[PROGRESS] ✅ 遙測紀錄讀取解碼完成 (100%)\n")
+            sys.stdout.flush()
     else:
         # CDC / Serial 連線
         if serial_link is None:

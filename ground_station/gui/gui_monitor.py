@@ -65,6 +65,7 @@ import serial
 import serial.tools.list_ports
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure   # 圖表獨立視窗用：不登記進 pyplot 全域 Gcf manager，開關視窗不漏 Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -73,6 +74,13 @@ import random
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from tkinter.scrolledtext import ScrolledText
+
+# 本檔刻意不吃 gui_theme 的配色／版面（見該檔 docstring），只借共用「規則」：
+# 發射台氣壓零點的重零／凍結判定規則，三支 GUI 必須一致；電梯測試 profile 醒目警示
+# 同理——是否顯示/怎麼措辭三支 GUI 必須一致，複製兩份遲早會走鐘，不重新發明。
+# 放在依賴自動安裝之後 —— gui_theme 會 import numpy/tkinter。
+from gui_theme import (PadRefTracker, make_elevator_banner, update_elevator_banner,
+                        spam_elevator_console_warning, ELEVATOR_WARN_TAG_CFG)
 
 # Add parent directory to sys.path to load serial_link
 import sys
@@ -224,6 +232,53 @@ def quaternion_to_euler(q):
     return np.degrees(roll), np.degrees(pitch), deg_yaw
 
 
+def _generate_static_ground_geometry():
+    """發射台地平面/同心圈/方位射線/水平全息環——這些點位跟姿態四元數無關，每幀都不變。
+    update_3d_plot() 之前每幀（5Hz）重算 np.linspace/meshgrid/cos/sin，抽成模組層級常數
+    只算一次，畫圖時直接吃現成陣列（逐字同步 gui_attitude3d.py 的同一份優化）。"""
+    z_ground = -1.2
+    r_vals = np.linspace(0, 2.0, 15)
+    theta_vals = np.linspace(0, 2 * np.pi, 48)
+    R_grid, T_grid = np.meshgrid(r_vals, theta_vals)
+    xg = R_grid * np.cos(T_grid)
+    yg = R_grid * np.sin(T_grid)
+    zg = np.full_like(xg, z_ground)
+
+    cx = 2.0 * np.cos(theta_vals)
+    cy = 2.0 * np.sin(theta_vals)
+    cz = np.full_like(cx, z_ground)
+
+    rings = []
+    for r_c in (0.7, 1.4):
+        cx_c = r_c * np.cos(theta_vals)
+        cy_c = r_c * np.sin(theta_vals)
+        cz_c = np.full_like(cx_c, z_ground)
+        rings.append((cx_c, cy_c, cz_c))
+
+    compass_lines = []
+    for angle in (0, 45, 90, 135, 180, 225, 270, 315):
+        rad = np.radians(angle)
+        compass_lines.append(([0, 2.0 * np.cos(rad)], [0, 2.0 * np.sin(rad)], [z_ground, z_ground]))
+
+    th_h = np.linspace(0, 2 * np.pi, 60)
+    hx = 0.65 * np.cos(th_h)
+    hy = 0.65 * np.sin(th_h)
+    hz = np.zeros_like(th_h)
+    horizon_surf = (np.array([np.zeros_like(th_h), hx]),
+                     np.array([np.zeros_like(th_h), hy]),
+                     np.array([np.zeros_like(th_h), hz]))
+
+    return {
+        "z_ground": z_ground, "xg": xg, "yg": yg, "zg": zg,
+        "cx": cx, "cy": cy, "cz": cz, "rings": rings,
+        "compass_lines": compass_lines,
+        "hx": hx, "hy": hy, "hz": hz, "horizon_surf": horizon_surf,
+    }
+
+
+_STATIC_GROUND = _generate_static_ground_geometry()
+
+
 # ==================== 3b. 跨平台自訂高對比按鈕 ====================
 class StyledButton(tk.Label):
     """跨平台 (特別優化 macOS Aqua) 高對比自訂按鈕，解決 macOS 下 tk.Button 底色白化與文字隱形問題"""
@@ -327,7 +382,7 @@ class RocketDashboardApp:
         self.chart_t0 = time.monotonic()
         _N = 6000
         self.ts_alt_ekf  = deque(maxlen=_N)   # EKF 高度 m
-        self.ts_alt_baro = deque(maxlen=_N)   # 氣壓高度 m（原始）
+        self.ts_alt_baro = deque(maxlen=_N)   # 氣壓高度 m，已扣 pad_ref → 相對起點（見 self.pad_ref）
         self.ts_alt_gps  = deque(maxlen=_N)   # GPS 海拔 m（原始）
         self.ts_vz_ekf   = deque(maxlen=_N)   # EKF 垂直速度 m/s
         self.ts_spd_gps  = deque(maxlen=_N)   # GPS 地速 m/s（原始）
@@ -335,12 +390,16 @@ class RocketDashboardApp:
         self.ts_acc_adxl = deque(maxlen=_N)   # ADXL375 |a| g（原始）
         self.ts_vf_alt   = deque(maxlen=_N)   # 本板 VF 高度 m
         self.ts_vf_vz    = deque(maxlen=_N)   # 本板 VF 垂直速度 m/s
+        self.ts_ground_alt = deque(maxlen=_N) # 本板 相對地面高度原始值 m（pad_ref 未濾波，每 30s 於 PAD 重零）
+        self.pad_ref = PadRefTracker()        # 發射台氣壓零點；ts_alt_baro 逐點扣它
         self.ts_backup_alt  = deque(maxlen=_N) # 副航電 EKF 高度 m
         self.ts_backup_vz   = deque(maxlen=_N) # 副航電 EKF 垂直速度 m/s
         self.ts_backup_baro = deque(maxlen=_N) # 副航電 氣壓高度 m
         self.ts_backup_acc  = deque(maxlen=_N) # 副航電 高G 垂直加速度 g
         self.ts_backup_vf_alt = deque(maxlen=_N) # 副航電 VF 高度 m
         self.ts_backup_vf_vz  = deque(maxlen=_N) # 副航電 VF 垂直速度 m/s
+        self.ts_backup_acc_bmi  = deque(maxlen=_N) # 副航電 BMI088 加速度模長 g（原始）
+        self.ts_backup_acc_adxl = deque(maxlen=_N) # 副航電 ADXL375 加速度模長 g（原始）
         self.backup_state   = None             # 副航電實時狀態
         self.backup_fsm_events = []             # 副航電 FSM 狀態轉換（時間戳, 狀態名），供 live chart 同時標示主副航電
         self.chart_dirty = False
@@ -368,11 +427,6 @@ class RocketDashboardApp:
         self.log_file = None
         self.save_log_var = tk.BooleanVar(value=True)
 
-        # ★發射鎖：地面站天線若裝有 LNA（低雜訊放大器，僅供接收增益用），發射時的
-        # TX 功率會直接回灌燒毀 LNA。故預設鎖定，每次開啟 GUI 都必須由使用者手動
-        # 勾選「已確認未安裝 LNA」才能真正發送任何指令（見 send_command 內的鎖檢查）。
-        self.lna_lock_var = tk.BooleanVar(value=False)
-        
         # 初始化 3D 幾何本地數據
         self.local_geom = generate_rocket_geometry()
         self.last_q = [1.0, 0.0, 0.0, 0.0]
@@ -396,6 +450,15 @@ class RocketDashboardApp:
         # 設置 UI 樣式與結構
         self.setup_styles()
 
+        # 電梯測試 profile 醒目橫幅：預設隱藏，收到 [PAD_CFG]/瘋狂警告行才顯示（見對應 elif 分支）。
+        self.elevator_banner = make_elevator_banner(self.root)
+        # 三種資料來源（直連航電 [PAD_CFG]/[ELEVATOR_TEST_WARNING]、經地面站板 LoRa 中繼的
+        # [GS_PKT] prof:）共用這兩個時間戳，用「最近看到」的新鮮度窗口判斷是否仍要顯示，
+        # 避免任一來源各自直接切換橫幅互相蓋掉彼此狀態（同一個 process 同時只會接一種來源，
+        # 但用時間戳統一收斂邏輯最單純）。0.0 = 從未看過 / 已被權威來源明確清除。
+        self._elevator_self_ts = 0.0
+        self._elevator_peer_ts = 0.0
+
         # ---- 頂部狀態列：兩排設計，避免右側標籤被截斷 ----
         top_container = tk.Frame(self.root, bg="#151515")
         top_container.pack(fill=tk.X, side=tk.TOP, padx=10, pady=(5, 0))
@@ -416,7 +479,7 @@ class RocketDashboardApp:
 
         tk.Frame(top_bar, bg="#333333", width=1, height=18).pack(side=tk.LEFT, padx=4, fill=tk.Y)
 
-        # 板間鏈路與舵機互斥握手狀態 (固定寬度 45，防文字裁切)
+        # 板間鏈路與主傘 PD14 共開狀態 (固定寬度 45，防文字裁切)
         self.lbl_link = tk.Label(top_bar, text="🔗 LINK: --", bg="#151515", fg="#555555",
                                  font=("Helvetica", 10, "bold"), width=45, anchor="w")
         self.lbl_link.pack(side=tk.LEFT, padx=4, pady=2)
@@ -456,17 +519,6 @@ class RocketDashboardApp:
         bot_bar = tk.Frame(top_container, bg="#151515")
         bot_bar.pack(fill=tk.X, side=tk.TOP, pady=(2, 4))
 
-        # ★發射鎖控制區（獨立醒目框，預設鎖定：未勾選前 send_command 一律擋下）
-        lna_lock_box = tk.Frame(bot_bar, bg="#4a1a00", highlightbackground="#ff8c00", highlightthickness=2, padx=4, pady=2)
-        lna_lock_box.pack(side=tk.LEFT, padx=(4, 6), pady=1)
-
-        self.chk_lna_lock = tk.Checkbutton(
-            lna_lock_box, text="🔓 已確認未安裝 LNA（勾選才能發送指令）",
-            variable=self.lna_lock_var, bg="#4a1a00", fg="#ffcc66", selectcolor="#4a1a00",
-            activebackground="#4a1a00", activeforeground="#ffcc66",
-            font=("Helvetica", 9, "bold"))
-        self.chk_lna_lock.pack(side=tk.LEFT, padx=2)
-
         # ARM / DISARM 安全解鎖與狀態指示控制區
         arm_box = tk.Frame(bot_bar, bg="#1a1a1a", highlightbackground="#333333", highlightthickness=1, padx=4, pady=2)
         arm_box.pack(side=tk.LEFT, padx=(4, 6), pady=1)
@@ -485,7 +537,7 @@ class RocketDashboardApp:
                                        font=("Helvetica", 9, "bold"), width=8, padx=4, pady=3)
         self.btn_disarm.pack(side=tk.LEFT, padx=2)
 
-        # BENCH 桌面點火/舵機測試獨立高亮控制區
+        # BENCH 桌面開傘測試獨立高亮控制區
         bench_box = tk.Frame(bot_bar, bg="#2d1b4e", highlightbackground="#8b5cf6", highlightthickness=2, padx=4, pady=2)
         bench_box.pack(side=tk.LEFT, padx=(4, 6), pady=1)
 
@@ -586,6 +638,8 @@ class RocketDashboardApp:
             ("GPS Update", "gps", "0.00 Hz", "#e03bfb"),
             ("Flash PKTs", "flash_pkt", "0 Pkts", "#ffffff"),
             ("ALT 高度", "alt", "-- m", "#00e676"),
+            ("相對起點 (baro)", "ground_alt", "-- m", "#ff9800"),
+            ("零點 pad_ref", "pad_ref", "-- m", "#888888"),
             ("Vz 垂直速度", "vz", "-- m/s", "#00e676"),
             ("BATTERY 電池", "bat", "-- V", "#ffa500")
         ]
@@ -639,10 +693,22 @@ class RocketDashboardApp:
         console_tools.pack(fill=tk.X, side=tk.BOTTOM, padx=5, pady=5)
 
         StyledButton(console_tools, text="清除終端", command=self.clear_console, bg="#2d2d2d", hover_bg="#3d3d3d", padx=8, pady=4).pack(side=tk.LEFT, padx=3)
+        StyledButton(console_tools, text="📈 飛行圖表", command=self.open_charts_window, bg="#00435a", hover_bg="#005f7f", padx=10, pady=4).pack(side=tk.LEFT, padx=3)
         StyledButton(console_tools, text="📡 LoRa 參數設定", command=self.open_lora_panel, bg="#00435a", hover_bg="#005f7f", padx=10, pady=4).pack(side=tk.LEFT, padx=3)
         StyledButton(console_tools, text="🧭 軸向對齊測試", command=self.open_test_wizard, bg="#2d2d2d", hover_bg="#3d3d3d", padx=10, pady=4).pack(side=tk.LEFT, padx=3)
         StyledButton(console_tools, text="🧲 磁強計校正與鎖定", command=self.open_mag_calibration, bg="#2d2d2d", hover_bg="#3d3d3d", padx=10, pady=4).pack(side=tk.LEFT, padx=3)
         StyledButton(console_tools, text="💾 Flash 紀錄管理", command=self.open_flash_panel, bg="#005577", hover_bg="#007799", padx=10, pady=4).pack(side=tk.LEFT, padx=3)
+
+        # 大字即時讀數（原本在 build_charts_tab 裡；圖表移到獨立視窗後這三個留在主視窗——
+        # 飛行中最重要的即時數字不能被藏進另一個可能沒開的視窗）。由 _update_big_readouts()
+        # 每次 charts_redraw_loop tick 更新，不受圖表視窗是否開啟影響。
+        self.lbl_big_alt = tk.Label(console_tools, text="ALT --.- m", bg="#1e1e1e", fg="#00e676", font=("Monaco", 11, "bold"))
+        self.lbl_big_alt.pack(side=tk.LEFT, padx=(14, 6))
+        self.lbl_big_vz = tk.Label(console_tools, text="Vz --.- m/s", bg="#1e1e1e", fg="#00e5ff", font=("Monaco", 11, "bold"))
+        self.lbl_big_vz.pack(side=tk.LEFT, padx=(0, 6))
+        self.lbl_big_acc = tk.Label(console_tools, text="|a| --.- g", bg="#1e1e1e", fg="#ffcc00", font=("Monaco", 11, "bold"))
+        self.lbl_big_acc.pack(side=tk.LEFT)
+
         self.lbl_drops = tk.Label(console_tools, text="EKF Queue Drops: 0", bg="#1e1e1e", fg="#aaaaaa", font=("Monaco", 9))
         self.lbl_drops.pack(side=tk.RIGHT, padx=10)
 
@@ -678,15 +744,9 @@ class RocketDashboardApp:
         self.console.tag_config("lora", foreground="#e07bfb")
         self.console.tag_config("link", foreground="#00e676")
         self.console.tag_config("ack", foreground="#00e5ff", background="#00303a")
+        self.console.tag_config("elevator_warn", **ELEVATOR_WARN_TAG_CFG)
 
-        left_pane.add(left_frame, height=400, minsize=180)
-
-        # --- 左下: 飛行圖表（高度 / 速度 / 加速度，原始+EKF） ---
-        charts_frame = tk.Frame(left_pane, bg="#1e1e1e")
-        tk.Label(charts_frame, text=" > FLIGHT CHARTS (RAW + EKF)", bg="#1e1e1e", fg="#00d2ff",
-                 font=("Monaco", 10, "bold")).pack(anchor="w", padx=10, pady=(5, 0))
-        self.build_charts_tab(charts_frame)
-        left_pane.add(charts_frame, minsize=240)
+        left_pane.add(left_frame, minsize=180)   # 圖表移到獨立視窗後，log 欄撐滿整個左側直欄
 
         # --- 右上: 3D 姿態 ---
         att_frame = tk.Frame(right_pane, bg="#1e1e1e")
@@ -768,6 +828,7 @@ class RocketDashboardApp:
 
     def clear_console(self):
         self.console.delete("1.0", tk.END)
+        self._console_line_count = 0
         if hasattr(self, 'event_console'):
             self.event_console.delete("1.0", tk.END)
 
@@ -781,9 +842,12 @@ class RocketDashboardApp:
             self.canvas.draw()
 
     def clear_rate_cards(self):
-        defaults = {"flash_pkt": "0 Pkts", "alt": "-- m", "vz": "-- m/s", "bat": "-- V"}
+        defaults = {"flash_pkt": "0 Pkts", "alt": "-- m", "vz": "-- m/s", "bat": "-- V",
+                    "ground_alt": "-- m", "pad_ref": "-- m"}
         for key in self.cards:
             self.cards[key].config(text=defaults.get(key, "0.00 Hz"))
+        # 讓 _refresh_pad_ref_card 的「文字沒變就不動」快取失效，否則零點卡片會一直停在 "-- m"
+        self._pad_ref_text = None
         self.lbl_drops.config(text="EKF Queue Drops: 0")
 
     # ==================== 飛行圖表 / GPS 地圖（與 3D、log 四象限同屏） ====================
@@ -793,7 +857,7 @@ class RocketDashboardApp:
     def clear_chart_data(self):
         for dq in (self.ts_alt_ekf, self.ts_alt_baro, self.ts_alt_gps,
                    self.ts_vz_ekf, self.ts_spd_gps, self.ts_acc_bmi, self.ts_acc_adxl,
-                   self.ts_vf_alt, self.ts_vf_vz,
+                   self.ts_vf_alt, self.ts_vf_vz, self.ts_ground_alt,
                    self.ts_backup_alt, self.ts_backup_vz, self.ts_backup_baro,
                    self.ts_backup_acc, self.ts_backup_vf_alt, self.ts_backup_vf_vz):
             dq.clear()
@@ -823,20 +887,48 @@ class RocketDashboardApp:
             self.map_path = None
             self.map_marker = None
 
+    # ---- 飛行圖表：獨立視窗（方便拖到第二顆螢幕）----
+    # 大字即時讀數（ALT/Vz/|a|）留在主視窗 console_tools（飛行中最重要的即時數字不能被
+    # 藏進一個可能沒開的視窗），只有歷史時序圖表本身（含暫停/清除/儲存/時間窗控制）搬
+    # 進這個 Toplevel。沿用既有 open_lora_panel/open_flash_panel 等 5 個 Toplevel 共用的
+    # singleton idiom（hasattr+winfo_exists+lift，不 grab_set，讓主視窗終端/地圖/姿態
+    # 保持即時更新）。
+    def open_charts_window(self):
+        if getattr(self, "charts_win", None) is not None and self.charts_win.winfo_exists():
+            self.charts_win.lift()
+            return
+        self.charts_win = tk.Toplevel(self.root)
+        self.charts_win.title("📈 FLIGHT CHARTS (RAW + EKF)")
+        self.charts_win.geometry("1400x760")
+        self.charts_win.configure(bg="#1e1e1e")
+        # 不用 transient()：見 open_lora_panel 註解，子視窗要能各自獨立縮小/關閉。
+        self.charts_win.protocol("WM_DELETE_WINDOW", self._on_charts_window_close)
+        self.build_charts_tab(self.charts_win)
+        self.chart_dirty = True   # 立刻用既有歷史補畫一幀
+
+    def _on_charts_window_close(self):
+        """關閉時務必清空 figure/canvas/line 參照，否則 charts_redraw_loop 之後每次 tick
+        都會對著已銷毀的 widget 呼叫 draw_idle() 拋 TclError，且重開視窗也救不回來。"""
+        try:
+            self.charts_win.destroy()
+        finally:
+            self.charts_win = None
+            for attr in ("chart_fig", "chart_canvas", "ax_alt", "ax_vel", "ax_acc",
+                        "ax_alt_backup", "ax_vel_backup", "ax_acc_backup",
+                        "ln_alt_ekf", "ln_alt_baro", "ln_alt_vf", "ln_ground_alt", "ln_alt_backup",
+                        "ln_alt_backup_baro", "ln_alt_backup_vf", "ln_alt_gps",
+                        "ln_vz_ekf", "ln_vz_vf", "ln_vz_backup", "ln_vz_backup_vf", "ln_spd_gps",
+                        "ln_acc_bmi", "ln_acc_adxl", "ln_acc_ekf", "ln_acc_backup",
+                        "ln_acc_backup_bmi", "ln_acc_backup_adxl", "ln_acc_backup_ekf",
+                        "btn_chart_pause", "chart_win_combo"):
+                setattr(self, attr, None)
+
     # ---- 飛行圖表分頁 ----
     def build_charts_tab(self, tab):
-        # 單列：大字即時讀數（左）+ 時間窗/暫停/清除 控制（右），節省四象限垂直空間
+        # 時間窗/暫停/清除/儲存 控制列（大字即時讀數已移到主視窗 console_tools，見
+        # open_charts_window() 呼叫處旁的說明——這裡只剩圖表本身相關的控制）
         bar = tk.Frame(tab, bg="#1e1e1e")
         bar.pack(fill=tk.X, padx=8, pady=(4, 2))
-        self.lbl_big_alt = tk.Label(bar, text="ALT --.- m", bg="#1e1e1e", fg="#00e676",
-                                    font=("Monaco", 13, "bold"))
-        self.lbl_big_alt.pack(side=tk.LEFT, padx=(4, 12))
-        self.lbl_big_vz = tk.Label(bar, text="Vz --.- m/s", bg="#1e1e1e", fg="#00e5ff",
-                                   font=("Monaco", 13, "bold"))
-        self.lbl_big_vz.pack(side=tk.LEFT, padx=(0, 12))
-        self.lbl_big_acc = tk.Label(bar, text="|a| --.- g", bg="#1e1e1e", fg="#ffcc00",
-                                    font=("Monaco", 13, "bold"))
-        self.lbl_big_acc.pack(side=tk.LEFT)
 
         ttk.Button(bar, text="儲存圖表", width=8, command=self.save_chart_snapshot).pack(side=tk.RIGHT, padx=(4, 2))
         ttk.Button(bar, text="清除", width=5, command=self.clear_chart_data).pack(side=tk.RIGHT, padx=2)
@@ -849,42 +941,70 @@ class RocketDashboardApp:
         tk.Label(bar, text="時間窗:", bg="#1e1e1e", fg="#aaaaaa",
                  font=("Helvetica", 9)).pack(side=tk.RIGHT, padx=(8, 3))
 
-        # 三聯圖：高度 / 速度 / 加速度（共用時間軸；標籤用 ASCII 避免 matplotlib 缺中文字型）
-        self.chart_fig = plt.figure(facecolor="#101010")
-        gs = self.chart_fig.add_gridspec(3, 1, hspace=0.32, left=0.11, right=0.97, top=0.97, bottom=0.08)
-        self.ax_alt = self.chart_fig.add_subplot(gs[0])
-        self.ax_vel = self.chart_fig.add_subplot(gs[1], sharex=self.ax_alt)
-        self.ax_acc = self.chart_fig.add_subplot(gs[2], sharex=self.ax_alt)
+        # 雙欄三聯圖：左欄=主航電、右欄=副航電，各自 高度/速度/加速度（共用時間軸；
+        # 標籤用 ASCII 避免 matplotlib 缺中文字型）。原本主副疊在同一張圖上，副航電
+        # 的線常被主航電蓋掉幾乎看不到，改成左右分開兩欄各自獨立可讀。
+        # 用 Figure(...) 不用 plt.figure()：後者會登記進 pyplot 全域 Gcf manager 永久持有
+        # 參照，這個視窗現在會被重複開關，plt.figure() 會漏 Figure。
+        self.chart_fig = Figure(facecolor="#101010")
+        gs = self.chart_fig.add_gridspec(3, 2, hspace=0.32, wspace=0.20,
+                                          left=0.07, right=0.98, top=0.94, bottom=0.08)
+        self.ax_alt = self.chart_fig.add_subplot(gs[0, 0])
+        self.ax_vel = self.chart_fig.add_subplot(gs[1, 0], sharex=self.ax_alt)
+        self.ax_acc = self.chart_fig.add_subplot(gs[2, 0], sharex=self.ax_alt)
+        self.ax_alt_backup = self.chart_fig.add_subplot(gs[0, 1], sharex=self.ax_alt)
+        self.ax_vel_backup = self.chart_fig.add_subplot(gs[1, 1], sharex=self.ax_alt)
+        self.ax_acc_backup = self.chart_fig.add_subplot(gs[2, 1], sharex=self.ax_alt)
 
-        for ax, ylab in ((self.ax_alt, "Alt (m)"), (self.ax_vel, "Vel (m/s)"), (self.ax_acc, "Acc (g)")):
+        all_axes = (self.ax_alt, self.ax_vel, self.ax_acc,
+                    self.ax_alt_backup, self.ax_vel_backup, self.ax_acc_backup)
+        ylabels = {self.ax_alt: "Alt (m)", self.ax_vel: "Vel (m/s)", self.ax_acc: "Acc (g)",
+                   self.ax_alt_backup: "Alt (m)", self.ax_vel_backup: "Vel (m/s)", self.ax_acc_backup: "Acc (g)"}
+        for ax in all_axes:
             ax.set_facecolor("#151515")
             ax.tick_params(colors="#888888", labelsize=8)
             for sp in ax.spines.values():
                 sp.set_color("#333333")
             ax.grid(color="#2a2a2a", linewidth=0.5, alpha=0.6)
-            ax.set_ylabel(ylab, color="#aaaaaa", fontsize=9)
+            ax.set_ylabel(ylabels[ax], color="#aaaaaa", fontsize=9)
         self.ax_acc.set_xlabel("t (s)", color="#aaaaaa", fontsize=9)
+        self.ax_acc_backup.set_xlabel("t (s)", color="#aaaaaa", fontsize=9)
+        self.ax_alt.set_title("主航電 Primary", color="#00e5ff", fontsize=9, pad=4)
+        self.ax_alt_backup.set_title("副航電 Backup", color="#00e676", fontsize=9, pad=4)
 
+        # 主航電高度四條線全部同零點（發射台 pad_ref）：EKF/VF 本來就是相對值，
+        # Baro 這條在 append 時已扣掉 pad_ref（原本畫絕對海拔，跟其他線差一個常數偏移）。
         self.ln_alt_ekf,  = self.ax_alt.plot([], [], color="#00e5ff", lw=1.6, label="EKF")
-        self.ln_alt_baro, = self.ax_alt.plot([], [], color="#ff9800", lw=0.9, label="Baro raw")
+        self.ln_alt_baro, = self.ax_alt.plot([], [], color="#ff9800", lw=0.9, label="Baro 相對 10Hz")
         self.ln_alt_vf,   = self.ax_alt.plot([], [], color="#ffca28", lw=1.1, label="VF")
-        self.ln_alt_backup, = self.ax_alt.plot([], [], color="#00e676", lw=1.2, ls="--", label="Backup EKF")
-        self.ln_alt_backup_baro, = self.ax_alt.plot([], [], color="#ff9800", lw=0.9, ls=":", alpha=0.7, label="Backup Baro")
-        self.ln_alt_backup_vf, = self.ax_alt.plot([], [], color="#ffca28", lw=1.1, ls=":", alpha=0.85, label="Backup VF")
+        self.ln_ground_alt, = self.ax_alt.plot([], [], color="#ffffff", lw=1.0, ls="-.", alpha=0.85, label="航電 braw 1Hz")
         self.ln_alt_gps,  = self.ax_alt.plot([], [], color="#e03bfb", lw=0, marker=".", ms=3, label="_nolegend_", visible=False)
+
+        self.ln_alt_backup, = self.ax_alt_backup.plot([], [], color="#00e676", lw=1.6, label="EKF")
+        # 副板 baro（下鏈 peer_baro_cm）也是絕對海拔，但副板自己的 pad_ref 不在封包裡，
+        # 只能借主板零點扣 —— 兩板同一個發射台，差距是兩次快照的氣壓雜訊（實測 ±30cm）。
+        # legend 寫明「用主板零點」，別當成副板自己的判斷值。
+        self.ln_alt_backup_baro, = self.ax_alt_backup.plot([], [], color="#ff9800", lw=0.9,
+                                                            label="Baro 相對(用主板零點)")
+        self.ln_alt_backup_vf, = self.ax_alt_backup.plot([], [], color="#ffca28", lw=1.1, label="VF")
 
         self.ln_vz_ekf,   = self.ax_vel.plot([], [], color="#00e5ff", lw=1.6, label="EKF Vz")
         self.ln_vz_vf,    = self.ax_vel.plot([], [], color="#ffca28", lw=1.1, label="VF Vz")
-        self.ln_vz_backup,  = self.ax_vel.plot([], [], color="#00e676", lw=1.2, ls="--", label="Backup Vz")
-        self.ln_vz_backup_vf, = self.ax_vel.plot([], [], color="#ffca28", lw=1.1, ls=":", alpha=0.85, label="Backup VF Vz")
         self.ln_spd_gps,  = self.ax_vel.plot([], [], color="#ffcc00", lw=0, marker=".", ms=3, label="_nolegend_", visible=False)
+
+        self.ln_vz_backup,  = self.ax_vel_backup.plot([], [], color="#00e676", lw=1.6, label="EKF Vz")
+        self.ln_vz_backup_vf, = self.ax_vel_backup.plot([], [], color="#ffca28", lw=1.1, label="VF Vz")
 
         self.ln_acc_bmi,  = self.ax_acc.plot([], [], color="#28d745", lw=0.9, label="BMI088 raw")
         self.ln_acc_adxl, = self.ax_acc.plot([], [], color="#ff3b30", lw=0.9, alpha=0.8, label="ADXL375 raw")
         self.ln_acc_ekf,  = self.ax_acc.plot([], [], color="#00e5ff", lw=1.4, ls="--", label="EKF dVz/dt")
-        self.ln_acc_backup, = self.ax_acc.plot([], [], color="#00e676", lw=0.9, ls="--", alpha=0.85, label="Backup Accel")
 
-        for ax in (self.ax_alt, self.ax_vel, self.ax_acc):
+        self.ln_acc_backup, = self.ax_acc_backup.plot([], [], color="#00e676", lw=0.9, alpha=0.6, label="Accel (Z)")
+        self.ln_acc_backup_bmi,  = self.ax_acc_backup.plot([], [], color="#28d745", lw=0.9, label="BMI088 raw")
+        self.ln_acc_backup_adxl, = self.ax_acc_backup.plot([], [], color="#ff3b30", lw=0.9, alpha=0.8, label="ADXL375 raw")
+        self.ln_acc_backup_ekf,  = self.ax_acc_backup.plot([], [], color="#00e676", lw=1.4, ls="--", label="EKF dVz/dt")
+
+        for ax in all_axes:
             leg = ax.legend(loc="upper left", fontsize=7, facecolor="#1c1c1c",
                             edgecolor="#333333", labelcolor="#cccccc", ncol=3)
             leg.get_frame().set_alpha(0.7)
@@ -928,7 +1048,9 @@ class RocketDashboardApp:
             "--------------------------------------------------",
             "【1. 高度與速度指標 (Altitude & Velocity)】",
             f"  • EKF 估算最高高度  (Apogee)   : {max_alt_ekf:.2f} m",
-            f"  • 氣壓計原始最高高度           : {max_alt_baro:.2f} m",
+            f"  • 氣壓計最高高度 (相對起點)     : {max_alt_baro:.2f} m",
+            f"  • 發射台氣壓零點 pad_ref       : "
+            f"{f'{self.pad_ref.pad_ref_m:.2f} m (絕對海拔尺度)' if self.pad_ref.valid else '未收到 [FSM] pad_ref locked'}",
             f"  • GPS 海拔最高高度            : {max_alt_gps:.2f} m",
             f"  • 最大上升速度 (Max Ascent Vz) : {max_vz_up:+.2f} m/s",
             f"  • 最大下降速度 (Max Descent Vz): {max_vz_down:+.2f} m/s",
@@ -1037,6 +1159,7 @@ class RocketDashboardApp:
         pairs = [
             (self.ln_alt_ekf, self.ts_alt_ekf), (self.ln_alt_baro, self.ts_alt_baro),
             (self.ln_alt_vf, self.ts_vf_alt),
+            (self.ln_ground_alt, self.ts_ground_alt),
             (self.ln_alt_backup, self.ts_backup_alt),
             (self.ln_alt_backup_baro, self.ts_backup_baro),
             (self.ln_alt_backup_vf, self.ts_backup_vf_alt),
@@ -1046,6 +1169,8 @@ class RocketDashboardApp:
             (self.ln_spd_gps, self.ts_spd_gps),
             (self.ln_acc_bmi, self.ts_acc_bmi), (self.ln_acc_adxl, self.ts_acc_adxl),
             (self.ln_acc_backup, self.ts_backup_acc),
+            (self.ln_acc_backup_bmi, self.ts_backup_acc_bmi),
+            (self.ln_acc_backup_adxl, self.ts_backup_acc_adxl),
         ]
         for ln, dq in pairs:
             if not ln.get_visible():
@@ -1053,14 +1178,22 @@ class RocketDashboardApp:
             ts, vs = self._series_window(dq, tmin)
             ln.set_data(ts, vs)
 
-        # EKF 加速度 = EKF Vz 數值微分（中央差分，/9.81 轉 g）
+        # EKF 加速度 = EKF Vz 數值微分（中央差分，/9.81 轉 g）——主/副航電分開算
         ts, vs = self._series_window(self.ts_vz_ekf, tmin)
         if len(ts) >= 3:
             self.ln_acc_ekf.set_data(ts, np.gradient(vs, ts) / 9.81)
         else:
             self.ln_acc_ekf.set_data([], [])
 
-        for ax in (self.ax_alt, self.ax_vel, self.ax_acc):
+        ts, vs = self._series_window(self.ts_backup_vz, tmin)
+        if len(ts) >= 3:
+            self.ln_acc_backup_ekf.set_data(ts, np.gradient(vs, ts) / 9.81)
+        else:
+            self.ln_acc_backup_ekf.set_data([], [])
+
+        all_axes = (self.ax_alt, self.ax_vel, self.ax_acc,
+                    self.ax_alt_backup, self.ax_vel_backup, self.ax_acc_backup)
+        for ax in all_axes:
             ax.set_xlim(tmin, max(tmax, tmin + 1.0))
             ax.relim(visible_only=True)
             ax.autoscale_view(scalex=False, scaley=True)
@@ -1073,8 +1206,8 @@ class RocketDashboardApp:
                 except Exception:
                     pass
         self._fsm_spans = []
-        if self.fsm_events:
-            events = self.fsm_events  # [(t, state), ...]
+
+        def _draw_fsm_events(events, axes, alt_ax, label_prefix=""):
             for i, (t_start_ev, state) in enumerate(events):
                 t_end_ev = events[i + 1][0] if i + 1 < len(events) else tmax
                 if t_end_ev <= tmin or t_start_ev >= tmax:
@@ -1083,47 +1216,39 @@ class RocketDashboardApp:
                 bg_col, txt_col, label = phase
                 x0 = max(t_start_ev, tmin)
                 x1 = min(t_end_ev, tmax)
-                for ax in (self.ax_alt, self.ax_vel, self.ax_acc):
+                for ax in axes:
                     span = ax.axvspan(x0, x1, color=bg_col, alpha=0.25, zorder=0, linewidth=0)
                     self._fsm_spans.append(span)
                 # 在高度子圖頂部畫標籤線 + 文字
-                vline = self.ax_alt.axvline(t_start_ev, color=txt_col, lw=0.8, ls="--", alpha=0.6, zorder=1)
+                vline = alt_ax.axvline(t_start_ev, color=txt_col, lw=0.8, ls="--", alpha=0.6, zorder=1)
                 self._fsm_spans.append(vline)
-                ylims = self.ax_alt.get_ylim()
+                ylims = alt_ax.get_ylim()
                 y_top = ylims[1] - (ylims[1] - ylims[0]) * 0.05
-                txt = self.ax_alt.text(
-                    t_start_ev + (x1 - x0) * 0.03, y_top, label,
+                txt = alt_ax.text(
+                    t_start_ev + (x1 - x0) * 0.03, y_top, f"{label_prefix}{label}",
                     color=txt_col, fontsize=6.5, va="top", ha="left",
                     alpha=0.85, zorder=2,
                     bbox=dict(boxstyle="round,pad=0.15", fc=bg_col, ec=txt_col, lw=0.5, alpha=0.7)
                 )
                 self._fsm_spans.append(txt)
 
-        # 副航電 FSM 狀態轉換（與主航電同屏比對：置底 + 點狀線 + "B:" 前綴，避免與主航電頂部標籤重疊）
+        # 主航電 FSM 狀態轉換 → 只畫在左欄（主航電）三張子圖
+        if self.fsm_events:
+            _draw_fsm_events(self.fsm_events, (self.ax_alt, self.ax_vel, self.ax_acc), self.ax_alt)
+
+        # 副航電 FSM 狀態轉換 → 只畫在右欄（副航電）三張子圖，各自獨立不再與主航電互相遮擋
         if self.backup_fsm_events:
-            b_events = self.backup_fsm_events
-            for i, (t_start_ev, state) in enumerate(b_events):
-                t_end_ev = b_events[i + 1][0] if i + 1 < len(b_events) else tmax
-                if t_end_ev <= tmin or t_start_ev >= tmax:
-                    continue   # 視窗外略過
-                _, _, label = self._FSM_PHASE.get(state, ("#1a1a2e", "#00e676", state.replace("STATE_", "")))
-                x0 = max(t_start_ev, tmin)
-                for ax in (self.ax_alt, self.ax_vel):
-                    vline = ax.axvline(t_start_ev, color="#00e676", lw=0.8, ls=":", alpha=0.7, zorder=1)
-                    self._fsm_spans.append(vline)
-                ylims = self.ax_alt.get_ylim()
-                y_bot = ylims[0] + (ylims[1] - ylims[0]) * 0.05
-                txt = self.ax_alt.text(
-                    x0, y_bot, f"B:{label}",
-                    color="#00e676", fontsize=6.5, va="bottom", ha="left",
-                    alpha=0.9, zorder=2,
-                    bbox=dict(boxstyle="round,pad=0.15", fc="#0a1f14", ec="#00e676", lw=0.5, alpha=0.8)
-                )
-                self._fsm_spans.append(txt)
+            _draw_fsm_events(self.backup_fsm_events,
+                              (self.ax_alt_backup, self.ax_vel_backup, self.ax_acc_backup),
+                              self.ax_alt_backup)
 
         self.chart_canvas.draw_idle()
 
-        # 大字即時讀數
+    def _update_big_readouts(self):
+        """大字即時讀數（ALT/Vz/|a|，主視窗 console_tools）——獨立於圖表視窗開關之外，
+        每次 charts_redraw_loop tick 都呼叫，不受圖表視窗是否開啟影響（原本內嵌在
+        redraw_charts() 尾端，圖表移到獨立視窗後若不拆開，視窗一關這三個數字就會凍結——
+        那是飛行中最重要的即時讀數，不能被藏進一個可能沒開的視窗）。"""
         if self.ts_alt_ekf:
             self.lbl_big_alt.config(text=f"ALT {self.ts_alt_ekf[-1][1]:.1f} m")
         elif self.ts_alt_baro:
@@ -1146,13 +1271,26 @@ class RocketDashboardApp:
         except tk.TclError:
             pass
 
+    def _refresh_pad_ref_card(self):
+        """零點卡片：值 + 「幾秒前重零」/「已凍結」。文字沒變就不動 widget。"""
+        text, color = self.pad_ref.label_text()
+        if getattr(self, "_pad_ref_text", None) != text:
+            self._pad_ref_text = text
+            card = self.cards.get("pad_ref")
+            if card is not None and card.winfo_exists():
+                card.config(text=text, foreground=color)
+
     def charts_redraw_loop(self):
         try:
             if not self.root.winfo_exists():
                 return
-            if (not self.chart_paused) and self.chart_dirty:
-                self.redraw_charts()
-                self.chart_dirty = False
+            self._refresh_pad_ref_card()  # 「幾秒前重零」要自己走鐘，不能只在收到 pad_ref 行時更新
+            self._update_big_readouts()   # 主視窗永遠更新，不受圖表視窗開關影響
+            if not self.chart_paused:
+                charts_win = getattr(self, "charts_win", None)
+                if self.chart_dirty and charts_win is not None and charts_win.winfo_exists():
+                    self.redraw_charts()
+                self.chart_dirty = False   # 無條件清（視窗未開時也一併清掉，避免旗標白白堆積）
             self.root.after(300, self.charts_redraw_loop)
         except tk.TclError:
             pass
@@ -1545,6 +1683,56 @@ class RocketDashboardApp:
             except: pass
             self.log_file = None
 
+    # ------------------ 電梯測試 profile 醒目警示（三種資料來源共用一組時間戳，見 __init__ 註解） ------------------
+    def _handle_pad_cfg_profile_line(self, line):
+        """[PAD_CFG] Flight Profile: ELEVATOR_TEST(...) / REAL_FLIGHT(...)，每 10s 一行，
+        僅回報「本板」——是唯一會明確講「已經切回正式版」的權威來源，REAL_FLIGHT 時直接
+        歸零時間戳（立即清除），不必等新鮮度窗口逾時。"""
+        self._elevator_self_ts = time.time() if "ELEVATOR_TEST" in line else 0.0
+        self._refresh_elevator_banner()
+
+    def _handle_elevator_warning_line(self, line):
+        """!!! [ELEVATOR_TEST_WARNING] THIS BOARD / PEER BOARD STILL ON ELEVATOR-TEST PROFILE !!!
+        每 1s 一行、只在仍為電梯測試 profile 時才會印出（見 main.c），瘋狂洗版故意不節流。"""
+        now = time.time()
+        who = []
+        if "THIS BOARD" in line:
+            self._elevator_self_ts = now
+            who.append("本板")
+        if "PEER BOARD" in line:
+            self._elevator_peer_ts = now
+            who.append("對端(副板)")
+        self._refresh_elevator_banner()
+        spam_elevator_console_warning(self.console, "+".join(who))
+
+    def _handle_gs_pkt_profile(self, prof_hex):
+        """[GS_PKT] ... prof:0x%02X（經地面站板 LoRa 中繼時的路徑，見 ground_station.c）。
+        bit0=主航電、bit1=副航電，語意與 telemetry.h TELEM_PROFILE_* 一致。"""
+        prof = int(prof_hex, 16)
+        now = time.time()
+        who = []
+        if prof & 0x01:
+            self._elevator_self_ts = now
+            who.append("本板(主航電)")
+        if prof & 0x02:
+            self._elevator_peer_ts = now
+            who.append("對端(副航電)")
+        self._refresh_elevator_banner()
+        if who:
+            spam_elevator_console_warning(self.console, "+".join(who))
+
+    def _refresh_elevator_banner(self):
+        """兩個時間戳都採 3 秒新鮮度窗口（斷線/恢復正式版超過窗口即視為已清除），
+        由 poll_queue 每輪都呼叫一次，故不需要另外設定逾時計時器。"""
+        now = time.time()
+        self_active = (now - self._elevator_self_ts) < 3.0
+        peer_active = (now - self._elevator_peer_ts) < 3.0
+        active = self_active or peer_active
+        who = []
+        if self_active: who.append("本板")
+        if peer_active: who.append("對端(副板)")
+        update_elevator_banner(self.root, self.elevator_banner, active, "+".join(who))
+
     # ------------------ 主執行緒：定時處理佇列 ------------------
     def poll_queue(self):
         # 批次處理佇列中的資料，避免界面阻塞
@@ -1576,6 +1764,11 @@ class RocketDashboardApp:
                 tag = "rate"
             elif "[PAD_CFG]" in line:
                 tag = "err" if "WARNING" in line else "ok"
+                if "Flight Profile:" in line:
+                    self._handle_pad_cfg_profile_line(line)
+            elif "[ELEVATOR_TEST_WARNING]" in line:
+                tag = "elevator_warn"
+                self._handle_elevator_warning_line(line)
             elif "[MAG]" in line:
                 tag = "mag"
             elif "[GPS]" in line or "[GS_GPS]" in line:
@@ -1589,10 +1782,14 @@ class RocketDashboardApp:
                 tag = "err"
                 
             self.console.insert(tk.END, f"[{ts}] {line}\n", tag)
-            
-            # 定期截斷終端，防記憶體飆升 (上限 2000 行)
-            if float(self.console.index('end-1c')) > 2000.0:
+
+            # 定期截斷終端，防記憶體飆升 (上限 2000 行)。用 Python 計數器取代逐行呼叫
+            # console.index('end-1c')：後者每次都要跟 Tcl 往返一次，高頻遙測時累積下來
+            # 是主執行緒卡頓的來源之一，現在只有真的超過門檻要裁切時才觸發一次 Tcl 呼叫。
+            self._console_line_count = getattr(self, "_console_line_count", 0) + 1
+            if self._console_line_count > 2000:
                 self.console.delete("1.0", "200.0")
+                self._console_line_count -= 199
 
             # 指令/回應分流 + 解析（單行出錯不得中斷輪詢，否則 poll_queue 停止重排→GUI 凍結）
             try:
@@ -1665,6 +1862,10 @@ class RocketDashboardApp:
             except tk.TclError:
                 pass
 
+        # 對端電梯測試 profile 新鮮度窗口到期要自動收合橫幅（見 _refresh_elevator_banner），
+        # 沒有新的警告行進來時也得靠這裡定時檢查，不能只在收到行時才刷新。
+        self._refresh_elevator_banner()
+
         # 繼續定時輪詢
         try:
             if self.root.winfo_exists():
@@ -1687,7 +1888,14 @@ class RocketDashboardApp:
             if "status:OK" in line:
                 return "resp"
             return "err"
-        if "[CMD]" in line or "[UPLINK]" in line:
+        if "[UPLINK]" in line:
+            # burst 結束行帶實際發射次數（gs_lora_test.c uplink_burst）：ok=0 代表本機
+            # E22 全程忙線、命令根本沒上空中——那是失敗，不能跟一般送出訊息同色，
+            # 否則又會像舊版「一律印送出完畢」那樣看不出來。
+            if "ok=0 " in line or "⚠" in line:
+                return "err"
+            return "cmd"
+        if "[CMD]" in line:
             return "cmd"
         if "ERROR" in line or "FAIL" in line or "❌" in line:
             return "err"
@@ -1942,7 +2150,11 @@ class RocketDashboardApp:
                 t = self.now_t()
                 self.ts_acc_bmi.append((t, float(np.sqrt(v[0]**2 + v[1]**2 + v[2]**2)) / 1000.0))
                 self.ts_acc_adxl.append((t, float(np.sqrt(v[3]**2 + v[4]**2 + v[5]**2)) / 1000.0))
-                self.ts_alt_baro.append((t, v[8] / 100.0))
+                # v[8] 是絕對海拔；逐點扣掉當下生效的 pad_ref，跟韌體 in.baro_alt_rel 的
+                # 算法一致，也讓這條線跟 EKF/VF 共用發射台零點（原本差一個海拔常數偏移）。
+                baro_rel = self.pad_ref.rel(v[8] / 100.0)
+                if baro_rel is not None:
+                    self.ts_alt_baro.append((t, baro_rel))
                 self.chart_dirty = True
                 return
 
@@ -1968,7 +2180,26 @@ class RocketDashboardApp:
                 self.ts_vz_ekf.append((t, vz))
                 self.cards["vz"].config(text=f"{vz:+.1f} m/s")
                 self.chart_dirty = True
-                    
+
+        # A2. USB 直連飛行板的本板 VF 原始輸出（1Hz）：
+        #     [VF] h_cm=.. v_cms=.. | EKF h_cm=.. v_cms=.. | braw_cm=..
+        #     （EKF 那半段跟 [TELE] pos/vel 重複，這裡只取 VF 半段 + braw_cm 相對地面高度原始值）
+        elif "[VF]" in line and "h_cm=" in line:
+            m = re.search(r"h_cm=(-?\d+)\s+v_cms=(-?\d+)", line)
+            if m:
+                t = self.now_t()
+                self.ts_vf_alt.append((t, int(m.group(1)) / 100.0))
+                self.ts_vf_vz.append((t, int(m.group(2)) / 100.0))
+                self.chart_dirty = True
+            m_braw = re.search(r"braw_cm=(-?\d+)", line)
+            if m_braw:
+                # 航電自己算的 baro_alt_rel：「航電認為自己相對起點多高」的原始值，
+                # 優先於 ts_alt_baro 的 10Hz 推導版顯示於卡片。
+                braw = int(m_braw.group(1)) / 100.0
+                self.ts_ground_alt.append((self.now_t(), braw))
+                self.cards["ground_alt"].config(text=f"{braw:+.1f} m")
+                self.chart_dirty = True
+
         # B. 解析頻率封包 [RATE] BMI088_A:xxHz, ...
         elif "[RATE]" in line:
             # 提取採樣率數字
@@ -2011,19 +2242,28 @@ class RocketDashboardApp:
                 self._update_erase_progress(pri_pct, bak_pct, cur_sec, tot_sec)
 
         # C2. 主/備板間鏈路溝通狀態 [LINK] self:.. peer:.. link:OK/STALE/NONE state:.. flags:.. age:..ms
-        #     （新版尾段：sync=OK/NO lost=.. desync=.. self_arb=.. peer_arb=.. peer_flash=.. primary_erase=..% backup_erase=..%）
+        #     （新版尾段：sync=OK/NO lost=.. desync=.. self_arb=.. peer_arb=.. peer_flash=.. primary_erase=..% backup_erase=..%
+        #      ph_cm=.. pv_cms=.. pbaro_cm=.. paz_cg=.. pvfh_cm=.. pvfv_cms=.. pbmi_cg=.. padxl_cg=..
+        #      ← 對端最近回報的 EKF 高度/速度、baro 相對高度、加速度(單軸)、VF 高度/速度、
+        #      BMI088/ADXL375 加速度模長，讓 USB 直連單板時不必透過地面站 LoRa 轉發也能畫出
+        #      完整副航電曲線，見 main.c [LINK] printf 旁註解）
         elif "[LINK]" in line:
             m = re.search(
                 r"self=(\w+)\s+peer=(\w+)\s+link=(\w+)\s+state=(\w+)\s+flags=0x([0-9A-Fa-f]+)\s+age=(\d+)ms"
                 r"(?:\s+sync=(\w+)\s+lost=(\d+)\s+desync=(\d+))?"
                 r"(?:\s+self_arb=(\w+)\s+peer_arb=(\w+))?"
                 r"(?:\s+peer_flash=(\w+))?"
-                r"(?:\s+primary_erase=(\d+)%\s+backup_erase=(\d+)%)?",
+                r"(?:\s+primary_erase=(\d+)%\s+backup_erase=(\d+)%)?"
+                r"(?:\s+ph_cm=(-?\d+)\s+pv_cms=(-?\d+))?"
+                r"(?:\s+pbaro_cm=(-?\d+)\s+paz_cg=(-?\d+)\s+pvfh_cm=(-?\d+)\s+pvfv_cms=(-?\d+))?"
+                r"(?:\s+pbmi_cg=(-?\d+)\s+padxl_cg=(-?\d+))?",
                 line)
             if m:
                 (self_role, peer_role, link_ok, peer_state, flags_hex, age_ms,
                  sync, lost, desync, self_arb, peer_arb,
-                 peer_flash, primary_erase, backup_erase) = m.groups()
+                 peer_flash, primary_erase, backup_erase,
+                 ph_cm, pv_cms, pbaro_cm, paz_cg, pvfh_cm, pvfv_cms,
+                 pbmi_cg, padxl_cg) = m.groups()
                 self.update_link_status(self_role, peer_role, link_ok, peer_state,
                                         int(flags_hex, 16), int(age_ms),
                                         sync=sync, lost=lost, desync=desync,
@@ -2031,9 +2271,33 @@ class RocketDashboardApp:
                 # 更新擦除進度（從 [LINK] 1Hz 診斷取得持續更新）
                 if primary_erase is not None and backup_erase is not None:
                     self._update_erase_progress(int(primary_erase), int(backup_erase))
+                # USB 直連主航電時，對端（backup）EKF/baro/VF/加速度靠這條 1Hz 鏈路帶進來
+                # （底層板間鏈路本身是 20Hz，這裡只是把已經在收的資料印出來），不需要地面站
+                # LoRa 轉發。只在 peer 確實回報 BACKUP 角色時才收，避免 USB 若改接副航電時
+                # 把對端(此時是 PRIMARY)資料誤標成 backup 序列。
+                if ph_cm is not None and pv_cms is not None and peer_role == "BACKUP":
+                    t = self.now_t()
+                    self.ts_backup_alt.append((t, int(ph_cm) / 100.0))
+                    self.ts_backup_vz.append((t, int(pv_cms) / 100.0))
+                    if pbaro_cm is not None:
+                        # 副板 baro 是絕對海拔，借主板 pad_ref 扣（見 ln_alt_backup_baro 註解）
+                        pbaro_rel = self.pad_ref.rel(int(pbaro_cm) / 100.0)
+                        if pbaro_rel is not None:
+                            self.ts_backup_baro.append((t, pbaro_rel))
+                        self.ts_backup_acc.append((t, int(paz_cg) / 100.0))
+                        self.ts_backup_vf_alt.append((t, int(pvfh_cm) / 100.0))
+                        self.ts_backup_vf_vz.append((t, int(pvfv_cms) / 100.0))
+                    if pbmi_cg is not None:
+                        self.ts_backup_acc_bmi.append((t, int(pbmi_cg) / 100.0))
+                        self.ts_backup_acc_adxl.append((t, int(padxl_cg) / 100.0))
+                    self.chart_dirty = True
 
         # D. 解析 FSM 狀態轉移以動態更新 HUD
         elif "[FSM]" in line:
+            # 發射台氣壓零點重零（PAD 期每 30s，ARM 後停）——相對起點高度的分母
+            if self.pad_ref.feed(line):
+                self._refresh_pad_ref_card()
+                return
             # 格式 A（1Hz heartbeat）：[FSM] state=PAD role=PRIMARY
             m_heartbeat = re.search(r"state=([A-Z_]+)", line)
             # 格式 B（事件）：[FSM] [ARMED] ... Entering STATE_PAD_ARMED.
@@ -2149,17 +2413,25 @@ class RocketDashboardApp:
                 self.lbl_gs_pkts.config(text=f"📦 接收包數: {self.gs_pkt_cnt_total} (433:{self.gs_pkt_cnt_433} | 920:{self.gs_pkt_cnt_920})")
 
             # 主/副協同（Phase A/D）：主板經下鏈中繼的副板摘要 → 雙板監看徽章 + live chart 比對
-            mp = re.search(r"peer:(\d+) pflags:0x([0-9A-Fa-f]+) ph:(-?\d+)cm pv:(-?\d+)cms "
-                           r"plink:0x([0-9A-Fa-f]+) ploss:(\d+) "
-                           r"pbaro:(-?\d+)cm paz:(-?\d+) pvfh:(-?\d+)cm pvfv:(-?\d+)cms"
+            # ★2026-07-30：下鏈的對端摘要只剩 VF + baro + 鏈路健康位（EKF 高度/速度、
+            # 丟包率、高G 已從封包移除，見 telemetry.h 同日註解）。USB 直連主航電時
+            # 上面 [LINK] 那條路徑仍有完整的對端 EKF/高G，不受影響。
+            mp = re.search(r"peer:(\d+) pflags:0x([0-9A-Fa-f]+) "
+                           r"plink:0x([0-9A-Fa-f]+) "
+                           r"pbaro:(-?\d+)cm pvfh:(-?\d+)cm pvfv:(-?\d+)cms"
                            r"(?:\s+pbarb:(\d+))?", line)
             if mp:
                 self.update_peer_relay(int(mp.group(1)), int(mp.group(2), 16),
-                                       int(mp.group(3)) / 100.0, int(mp.group(4)) / 100.0,
-                                       int(mp.group(5), 16), int(mp.group(6)),
-                                       int(mp.group(7)) / 100.0, int(mp.group(8)) / 100.0,
-                                       int(mp.group(9)) / 100.0, int(mp.group(10)) / 100.0,
-                                       pbarb=int(mp.group(11)) if mp.group(11) is not None else 0)
+                                       int(mp.group(3), 16),
+                                       int(mp.group(4)) / 100.0,
+                                       int(mp.group(5)) / 100.0, int(mp.group(6)) / 100.0,
+                                       pbarb=int(mp.group(7)) if mp.group(7) is not None else 0)
+
+            # 電梯測試 profile 醒目提示（經地面站板 LoRa 中繼時走這條路徑；直連航電板走
+            # [PAD_CFG]/[ELEVATOR_TEST_WARNING]，見 _handle_pad_cfg_profile_line 一帶）。
+            m_prof = re.search(r"prof:0x([0-9A-Fa-f]+)", line)
+            if m_prof:
+                self._handle_gs_pkt_profile(m_prof.group(1))
 
             m = re.search(r"alt:(-?\d+)cm", line)
             if m:
@@ -2173,7 +2445,10 @@ class RocketDashboardApp:
                 self.cards["vz"].config(text=f"{vz:+.1f} m/s")
             m = re.search(r"baro:(-?\d+)cm", line)
             if m:
-                self.ts_alt_baro.append((t, int(m.group(1)) / 100.0))
+                # 同 10Hz CSV：下鏈的 baro 是絕對海拔，扣 pad_ref 才跟 EKF/VF 同零點
+                baro_rel = self.pad_ref.rel(int(m.group(1)) / 100.0)
+                if baro_rel is not None:
+                    self.ts_alt_baro.append((t, baro_rel))
             m = re.search(r"vfh:(-?\d+)cm vfv:(-?\d+)cms", line)
             if m:
                 self.ts_vf_alt.append((t, int(m.group(1)) / 100.0))
@@ -2277,36 +2552,25 @@ class RocketDashboardApp:
         self.ax.set_facecolor("#101010") # 深邃太空黑背景
         self.ax.view_init(elev=elev, azim=azim)
 
-        z_ground = -1.2
+        # 地平面/同心圈/方位射線/水平環都跟姿態無關，每幀不變，改吃模組層級快取
+        # _STATIC_GROUND，不再每幀重算 linspace/meshgrid/cos/sin（5Hz 下省下最大宗的
+        # 重複 numpy 運算，減少卡頓）。
+        sg = _STATIC_GROUND
+        z_ground = sg["z_ground"]
 
-        # 1. 繪製圓形發射台平面 (Launchpad Disk)
-        r_vals = np.linspace(0, 2.0, 15)
-        theta_vals = np.linspace(0, 2*np.pi, 48)
-        R_grid, T_grid = np.meshgrid(r_vals, theta_vals)
-        xg = R_grid * np.cos(T_grid)
-        yg = R_grid * np.sin(T_grid)
-        zg = np.full_like(xg, z_ground)
-
-        # 繪製暗碳灰色、帶有細緻格線的發射底座面
-        self.ax.plot_surface(xg, yg, zg, color="#161616", alpha=0.6, edgecolor='#2c2c2c', linewidth=0.4, shade=False)
+        # 1. 繪製圓形發射台平面 (Launchpad Disk)：暗碳灰色、帶有細緻格線的發射底座面
+        self.ax.plot_surface(sg["xg"], sg["yg"], sg["zg"], color="#161616", alpha=0.6, edgecolor='#2c2c2c', linewidth=0.4, shade=False)
 
         # 繪製發射台霓虹邊緣外圈 (螢光青綠)
-        cx = 2.0 * np.cos(theta_vals)
-        cy = 2.0 * np.sin(theta_vals)
-        cz = np.full_like(cx, z_ground)
-        self.ax.plot(cx, cy, cz, color="#00ffcc", linestyle="-", linewidth=1.5, alpha=0.7)
+        self.ax.plot(sg["cx"], sg["cy"], sg["cz"], color="#00ffcc", linestyle="-", linewidth=1.5, alpha=0.7)
 
         # 繪製內部同心雷達圈
-        for r_c in [0.7, 1.4]:
-            cx_c = r_c * np.cos(theta_vals)
-            cy_c = r_c * np.sin(np.linspace(0, 2*np.pi, 48))
-            cz_c = np.full_like(cx_c, z_ground)
+        for cx_c, cy_c, cz_c in sg["rings"]:
             self.ax.plot(cx_c, cy_c, cz_c, color="#3e3e3e", linestyle="--", linewidth=0.8, alpha=0.5)
 
         # 繪製方位十字參考射線 (N E S W)
-        for angle in [0, 45, 90, 135, 180, 225, 270, 315]:
-            rad = np.radians(angle)
-            self.ax.plot([0, 2.0 * np.cos(rad)], [0, 2.0 * np.sin(rad)], [z_ground, z_ground], color="#333333", linestyle=":", linewidth=0.6)
+        for lx, ly, lz in sg["compass_lines"]:
+            self.ax.plot(lx, ly, lz, color="#333333", linestyle=":", linewidth=0.6)
 
         # 方位標籤
         self.ax.text(2.2, 0, z_ground, "E (90°)", color="#00ffcc", fontsize=8, fontweight="bold", ha="left", va="center")
@@ -2315,14 +2579,9 @@ class RocketDashboardApp:
         self.ax.text(0, -2.2, z_ground, "S (180°)", color="#00ffcc", fontsize=8, fontweight="bold", ha="center", va="top")
 
         # 2. 繪製水平面參考系 (Z = 0.0 橫切面半透明全息環)
-        th_h = np.linspace(0, 2*np.pi, 60)
-        hx = 0.65 * np.cos(th_h)
-        hy = 0.65 * np.sin(th_h)
-        hz = np.zeros_like(th_h)
-        self.ax.plot_surface(np.array([np.zeros_like(th_h), hx]),
-                             np.array([np.zeros_like(th_h), hy]),
-                             np.array([np.zeros_like(th_h), hz]),
-                             color="#00e5ff", alpha=0.12, shade=False)
+        hx, hy, hz = sg["hx"], sg["hy"], sg["hz"]
+        hsx, hsy, hsz = sg["horizon_surf"]
+        self.ax.plot_surface(hsx, hsy, hsz, color="#00e5ff", alpha=0.12, shade=False)
         self.ax.plot(hx, hy, hz, color="#00e5ff", linestyle="-", linewidth=0.8, alpha=0.4)
         self.ax.plot([-0.65, 0.65], [0, 0], [0, 0], color="#00e5ff", linestyle=":", linewidth=0.5, alpha=0.4)
         self.ax.plot([0, 0], [-0.65, 0.65], [0, 0], color="#00e5ff", linestyle=":", linewidth=0.5, alpha=0.4)
@@ -2445,16 +2704,6 @@ class RocketDashboardApp:
     CMD_CHAR_GAP = 0.1   # 秒/字
 
     def send_command(self, cmd_str):
-        # ★發射鎖：天線若裝有 LNA（僅供接收增益），發射 TX 功率會回灌燒毀 LNA，
-        # 故所有指令一律先過此鎖；使用者必須手動勾選「已確認未安裝 LNA」才放行。
-        if not self.lna_lock_var.get():
-            messagebox.showwarning(
-                "⚠️ 發射鎖：未確認 LNA 狀態",
-                "此地面站僅可在【未安裝 LNA】的情況下發送 LoRa 指令！\n\n"
-                "天線若裝有 LNA（低雜訊放大器，僅供接收增益用），直接發射會讓 "
-                "TX 功率回灌，燒毀 LNA。\n\n"
-                "請確認天線端未安裝 LNA 後，勾選上方「🔓 已確認未安裝 LNA」再發送。")
-            return False
         if not self.running or not hasattr(self, 'ser') or not self.ser:
             messagebox.showwarning("警告", "串口未連接！請先連線。")
             return False
@@ -2527,13 +2776,22 @@ class RocketDashboardApp:
 
     # ==================== BENCH 桌面測試實時監控彈出視窗 ====================
     def open_bench_monitor_window(self):
-        """開啟 BENCH 桌面測試實時監控彈出視窗（顯示 PD13 點火、PD14 舵機及 1s Guard 互斥握手）。"""
+        """開啟 BENCH 桌面測試實時監控彈出視窗。
+
+        ★時序已改版（與飛行邏輯 1:1 對應）：
+          步驟1 引傘 PD13：主板 t=0 起 8s；副板延後 4s（頂點提前量）後 3s —— 兩窗**重疊**。
+          步驟3 主傘 PD14：★不啟 PWM，兩板**同時**純 GPIO 拉高 1.5s（互斥握手/舵機掃描已取消）。
+        故本視窗不再顯示「1s Guard 意圖確認 / 讓位 / PWM 掃描 / 互斥防打架」那套語意，
+        也不再需要舊的 _bench_step1_done 階段閘：新的 arb 值（BENCH_START / BENCH_PRI_FIRE /
+        BENCH_SEC_FIRE / BENCH_MAIN_HIGH / DONE）本身就分得出階段，不會像舊版 INTENT 那樣
+        在「序列剛開始」與「步驟3 舵機交接」共用同一個列舉值而誤判。
+        """
         if hasattr(self, 'bench_win') and self.bench_win and self.bench_win.winfo_exists():
             self.bench_win.lift()
             return
 
         self.bench_win = tk.Toplevel(self.root)
-        self.bench_win.title("🖥️ BENCH TEST REALTIME MONITOR — 桌面點火/舵機雙板協同測試")
+        self.bench_win.title("🖥️ BENCH TEST REALTIME MONITOR — 桌面開傘雙板協同測試")
         self.bench_win.geometry("860x650")
         self.bench_win.configure(bg="#121212")
 
@@ -2542,14 +2800,14 @@ class RocketDashboardApp:
         hdr_frame.pack(fill=tk.X)
         tk.Label(hdr_frame, text="🖥️ BENCH TEST REALTIME MONITOR", bg="#27104e", fg="#a855f7",
                  font=("Helvetica", 14, "bold")).pack(anchor="w")
-        tk.Label(hdr_frame, text="即時監控：PD13 Drogue Motor/Pyro (8s) | 1s Guard 意圖確認 | PD14 Main Servo (0°~180°) | 防打架互斥機制",
+        tk.Label(hdr_frame, text="即時監控：引傘 PD13（主 8s / 副 延後 4s 後 3s，窗重疊）｜ 主傘 PD14（雙板同時拉高 1.5s，無 PWM、無握手）",
                  bg="#27104e", fg="#d8b4fe", font=("Helvetica", 9)).pack(anchor="w", pady=(2, 0))
 
         main_frame = tk.Frame(self.bench_win, bg="#121212", padx=18, pady=14)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         # 區塊 1：主副航電與互斥防打架狀態徽章 (3列寬幅獨立卡片，徹底防止文字擠壓)
-        badge_frame = tk.LabelFrame(main_frame, text=" 🛡️ 主副航電與舵機互斥防打架 (Servo Interlock) 狀態 ",
+        badge_frame = tk.LabelFrame(main_frame, text=" 🛡️ 主副航電開傘輸出狀態 (PD13 引傘 / PD14 主傘共開) ",
                                    bg="#18181b", fg="#a855f7", font=("Helvetica", 11, "bold"), padx=12, pady=10)
         badge_frame.pack(fill=tk.X, pady=(0, 12))
 
@@ -2567,7 +2825,7 @@ class RocketDashboardApp:
 
         b_row3 = tk.Frame(badge_frame, bg="#18181b")
         b_row3.pack(fill=tk.X, pady=3)
-        self.lbl_bench_arb_status = tk.Label(b_row3, text="🪂 DIODE-OR INTERLOCK: 🟢 SAFE (兩板皆靜置，無 PWM 衝突)", bg="#064e3b", fg="#34d399",
+        self.lbl_bench_arb_status = tk.Label(b_row3, text="🪂 主傘共開 (PD14 CO-FIRE): 🟢 IDLE (兩板皆靜置)", bg="#064e3b", fg="#34d399",
                                              font=("Helvetica", 10, "bold"), anchor="w", padx=10, pady=6)
         self.lbl_bench_arb_status.pack(fill=tk.X)
 
@@ -2640,6 +2898,48 @@ class RocketDashboardApp:
         if notify:
             messagebox.showinfo("儲存 LOG", f"已儲存至：\n{fpath}")
 
+    # BENCH 期間 [LINK] 行的 arb 欄位 → 兩張板子徽章。
+    # main_arb 值語意見韌體 servo_arb.h（★互斥握手已取消，2=LEGACY_DRIVING 僅存在於舊紀錄）。
+    _BENCH_ARB_BADGE = {
+        # arb 名稱: (主板顯示, 副板顯示, bg, fg)
+        "BENCH_START":     ("🖥️ BENCH 序列開始 (待命)",       "🖥️ BENCH 序列開始 (待命)",       "#1e293b", "#38bdf8"),
+        "BENCH_PRI_FIRE":  ("🔥 PD13 HIGH (引傘通電 8s)",       "🟢 PD13 LOW (等模擬頂點)",        "#7f1d1d", "#ff6b6b"),
+        "BENCH_SEC_FIRE":  ("🔥 PD13 HIGH (8s 窗內，已通知副板)", "🔥 PD13 HIGH (引傘通電 3s)",     "#7f1d1d", "#ff6b6b"),
+        "BENCH_MAIN_HIGH": ("⚡ PD14 HIGH 1.5s (共開，無 PWM)",  "⚡ PD14 HIGH 1.5s (共開，無 PWM)", "#581c87", "#c084fc"),
+        "MAIN_HIGH":       ("⚡ PD14 HIGH 1.5s (飛行共開)",      "⚡ PD14 HIGH 1.5s (飛行共開)",     "#581c87", "#c084fc"),
+        "DONE":            ("🟢 DONE (PD14 已回低)",            "🟢 DONE (PD14 已回低)",           "#064e3b", "#34d399"),
+    }
+
+    def _bench_apply_link_arb(self, line):
+        """解析 [LINK] 行的 self=/self_arb=/peer_arb=，把兩板 arb 狀態各自貼到對應徽章。
+
+        舊版是「整行含 BENCH_PRI_FIRE 就當主板在燒」——self/peer 誰是誰全靠猜；這裡直接
+        依 self= 角色分派，主/副接哪一條 USB 線都不會貼錯板。"""
+        m_self = re.search(r"self=(\w+)", line)
+        m_sarb = re.search(r"self_arb=(\w+)", line)
+        m_parb = re.search(r"peer_arb=(\w+)", line)
+        if not m_self:
+            return
+        self_is_primary = (m_self.group(1) == "PRIMARY")
+        pairs = []
+        if m_sarb:
+            pairs.append((self_is_primary, m_sarb.group(1)))
+        if m_parb:
+            pairs.append((not self_is_primary, m_parb.group(1)))
+        for is_primary, arb in pairs:
+            badge = self._BENCH_ARB_BADGE.get(arb)
+            if not badge:
+                continue   # NONE / LEGACY_DRIVING / 未知：不覆蓋既有顯示
+            pri_txt, sec_txt, bg, fg = badge
+            if is_primary:
+                self.lbl_bench_primary_status.config(text=f"🚀 PRIMARY BOARD : {pri_txt}", bg=bg, fg=fg)
+            else:
+                self.lbl_bench_backup_status.config(text=f"🛟 BACKUP BOARD  : {sec_txt}", bg=bg, fg=fg)
+            if arb in ("BENCH_MAIN_HIGH", "MAIN_HIGH"):
+                self.lbl_bench_arb_status.config(
+                    text="🪂 主傘共開 (PD14 CO-FIRE): 🟣 CO-FIRE 中 (兩板同時拉高＝設計目的)",
+                    bg="#581c87", fg="#c084fc")
+
     def update_bench_monitor(self, line):
         """當收到 [BENCH]、[PYRO-SELFTEST] 或 [LINK] servo_arb 行時更新實時監控小視窗。"""
         if not hasattr(self, 'bench_win') or not self.bench_win or not self.bench_win.winfo_exists():
@@ -2655,119 +2955,97 @@ class RocketDashboardApp:
         tag = "sys"
         clean_line = line.strip()
 
-        # 日誌分類高亮與步驟進度更新
-        if "開傘電火自測" in line or "序列：" in line or "時間錯開：" in line or "LED:" in line or "⚠" in line or "倒數" in line:
+        # ── 日誌分類高亮與步驟進度更新 ──
+        # 時序（與飛行 1:1）：
+        #   步驟1 引傘 PD13：主板 t=0 起 8s；副板延後 4s 後 3s（兩窗重疊，diode-OR 準位訊號無妨）
+        #   步驟3 主傘 PD14：兩板「同時」純 GPIO 拉高 1.5s（★無 PWM、無互斥握手、無讓位 guard）
+        if ("開傘電火自測" in line or "序列：" in line or "對應飛行：" in line
+                or "LED:" in line or "⚠ PD13" in line or "倒數" in line or "同脈同步" in line):
             tag = "sys"
         elif "[1a]" in line:
             tag = "fire"
-            self.lbl_bench_step.config(text="當前步驟: 1a/3 — 🔥 主板單獨 PD13 通電測試中 (2s)")
+            self.lbl_bench_step.config(text="當前步驟: 1a/3 — 🔥 主板引傘 PD13 通電中 (8s，對應飛行提前 4s 開)")
             self.bench_progressbar['value'] = 20
-            self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🔥 FIRE HIGH (PD13 2s 通電中)", bg="#7f1d1d", fg="#ff6b6b")
-            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🟢 FIRE LOW (待命讓位)", bg="#064e3b", fg="#34d399")
-            self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🟢 PRIMARY FIRE ONLY (主板獨立引爆通路)", bg="#064e3b", fg="#34d399")
+            self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🔥 PD13 HIGH (引傘通電 8s)", bg="#7f1d1d", fg="#ff6b6b")
+            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🟢 PD13 LOW (等模擬頂點，延後 4s)", bg="#064e3b", fg="#34d399")
+            self.lbl_bench_arb_status.config(text="🪂 主傘共開 (PD14 CO-FIRE): 🟢 IDLE (步驟1 進行中，PD14 未動作)", bg="#064e3b", fg="#34d399")
         elif "[1b]" in line:
+            tag = "guard"
+            self.lbl_bench_step.config(text="當前步驟: 1b/3 — ⏳ 副板等待模擬頂點（延後 4s＝飛行提前量）")
+            self.bench_progressbar['value'] = 30
+            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : ⏳ 等待模擬頂點 (PD13 仍 LOW)", bg="#78350f", fg="#fde047")
+        elif "[1c]" in line and "已達模擬頂點" in line:
             tag = "fire"
-            self.lbl_bench_step.config(text="當前步驟: 1b/3 — 🔥 副板單獨 PD13 通電測試中 (2s)")
-            self.bench_progressbar['value'] = 35
-            self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🟢 FIRE LOW (待命讓位)", bg="#064e3b", fg="#34d399")
-            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🔥 FIRE HIGH (PD13 2s 通電中)", bg="#7f1d1d", fg="#ff6b6b")
-            self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🟢 BACKUP FIRE ONLY (副板獨立引爆通路)", bg="#064e3b", fg="#34d399")
+            self.lbl_bench_step.config(text="當前步驟: 1c/3 — 📢 主板已達模擬頂點，通知副板開引傘（主板 PD13 仍 HIGH）")
+            self.bench_progressbar['value'] = 40
+            self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🔥 PD13 HIGH (8s 窗內，已通知副板)", bg="#7f1d1d", fg="#ff6b6b")
+        elif "[1c]" in line and "回 LOW" in line:
+            tag = "fire"
+            self.lbl_bench_step.config(text="當前步驟: 1c/3 — 🟢 副板引傘 3s 到，PD13 回 LOW（主板可能仍在導通）")
+            self.bench_progressbar['value'] = 50
+            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🟢 PD13 LOW (3s 窗結束)", bg="#064e3b", fg="#34d399")
         elif "[1c]" in line:
             tag = "fire"
-            self.lbl_bench_step.config(text="當前步驟: 1c/3 — 🔥 雙板同時 PD13 通電測試中 (4s)")
-            self.bench_progressbar['value'] = 50
-            self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🔥 FIRE HIGH (PD13 4s 通電中)", bg="#7f1d1d", fg="#ff6b6b")
-            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🔥 FIRE HIGH (PD13 4s 通電中)", bg="#7f1d1d", fg="#ff6b6b")
-            self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🔥 BOTH DUAL FIRE HIGH (Diode-OR 雙路引爆全驗證)", bg="#b91c1c", fg="#fef08a")
-        elif "[1]" in line and ("通電測試結束" in line or "LOW" in line):
+            self.lbl_bench_step.config(text="當前步驟: 1c/3 — 🔥 副板引傘 PD13 通電中 (3s，對應飛行真頂點才開)")
+            self.bench_progressbar['value'] = 45
+            self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🔥 PD13 HIGH (8s 窗內，與副板重疊)", bg="#7f1d1d", fg="#ff6b6b")
+            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🔥 PD13 HIGH (引傘通電 3s)", bg="#7f1d1d", fg="#ff6b6b")
+            self.lbl_bench_arb_status.config(text="🪂 主傘共開 (PD14 CO-FIRE): 🟢 IDLE (引傘兩窗重疊屬正常設計)", bg="#064e3b", fg="#34d399")
+        elif "[1]" in line and "通電測試結束" in line:
             tag = "fire"
-            self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🟢 FIRE LOW (通電結束)", bg="#064e3b", fg="#34d399")
-            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🟢 FIRE LOW (通電結束)", bg="#064e3b", fg="#34d399")
-            self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🟢 SAFE (通電關閉)", bg="#064e3b", fg="#34d399")
+            self.lbl_bench_step.config(text="當前步驟: 1/3 完成 — 🟢 兩板引傘 PD13 皆已回 LOW")
             self.bench_progressbar['value'] = 55
-        elif "[2]" in line or ("等待" in line and "ms" in line) or "步驟 2" in line:
+            self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🟢 PD13 LOW (通電結束)", bg="#064e3b", fg="#34d399")
+            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🟢 PD13 LOW (通電結束)", bg="#064e3b", fg="#34d399")
+        elif "[2]" in line:
             tag = "sys"
-            self.lbl_bench_step.config(text="當前步驟: 2/3 — ⏳ 通電結束，冷卻等待中 (5s)")
+            self.lbl_bench_step.config(text="當前步驟: 2/3 — ⏳ 引傘結束，冷卻等待中 (5s)")
             self.bench_progressbar['value'] = 65
-            self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🟢 FIRE LOW (冷卻中)", bg="#064e3b", fg="#34d399")
-            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🟢 FIRE LOW (冷卻中)", bg="#064e3b", fg="#34d399")
-            self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🟢 SAFE (冷卻中)", bg="#064e3b", fg="#34d399")
-        elif "1s Guard 意圖確認" in line or "廣播 INTENT" in line:
-            tag = "guard"
-            is_pri = "主板" in line or ("副板" not in line)
-            role_str = "主板" if is_pri else "副板"
-            self.lbl_bench_step.config(text=f"當前步驟: 3a — 🔍 {role_str}發送 1s Guard 意圖確認 (廣播 INTENT)")
-            self.bench_progressbar['value'] = 75
-            if is_pri:
-                self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🔍 1s GUARD INTENT CHECK (廣播 INTENT 1秒確認無衝突)", bg="#78350f", fg="#fde047")
-                self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : ⏳ WAITING INTENT (讓位中)", bg="#1e293b", fg="#fbbf24")
-                self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🟡 PRIMARY CHECKING 1S GUARD (預備取得獨佔權限)", bg="#78350f", fg="#fde047")
-            else:
-                self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🔍 1s GUARD INTENT CHECK (廣播 INTENT 1秒確認無衝突)", bg="#78350f", fg="#fde047")
-        elif "1s Guard 完成" in line or "取得獨佔權限" in line:
-            tag = "guard"
-            is_pri = "主板" in line or ("副板" not in line)
-            role_str = "主板" if is_pri else "副板"
-            self.lbl_bench_step.config(text=f"當前步驟: 3b — 🟢 {role_str} 1s Guard 通過，取得獨佔權限 (DRIVING)")
-            self.bench_progressbar['value'] = 82
-        elif "副板：等待主板" in line:
+            self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🟢 冷卻中 (PD13/PD14 皆 LOW)", bg="#064e3b", fg="#34d399")
+            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🟢 冷卻中 (PD13/PD14 皆 LOW)", bg="#064e3b", fg="#34d399")
+        elif "呼叫副板一起開主傘" in line or "等待主板呼叫" in line or "未見主板呼叫" in line:
             tag = "arb"
-            self.lbl_bench_step.config(text="當前步驟: 3a — 🛟 副板讓位，等待主板舵機完成 (見 DONE)")
-            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : ⏳ WAITING PRIMARY DONE (廣播 INTENT 讓位)", bg="#78350f", fg="#fde047")
-            self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🟢 PRIMARY SWEEPING (副板已成功讓位)", bg="#064e3b", fg="#34d399")
-        elif "副板：見主板 DONE" in line or "接手掃" in line or "呼叫副板" in line:
-            tag = "arb"
-            self.lbl_bench_step.config(text="當前步驟: 3b — 🛟 主板 DONE，副板接收呼叫接手舵機掃描")
-            self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🟢 DONE (PWM 鬆弛釋放)", bg="#064e3b", fg="#34d399")
-            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🔍 收到主板 DONE 呼叫 (接手驅動)", bg="#78350f", fg="#fde047")
-            self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🟡 HANDSHAKE TO BACKUP (主板完成，交接給副板)", bg="#78350f", fg="#fde047")
-        elif ("[3]" in line and ("舵機" in line or "0°" in line)) or "舵機 PWM 啟動" in line:
+            self.lbl_bench_step.config(text="當前步驟: 3/3 — 📢 主傘共開呼叫（無握手隔離，兩板同時拉高）")
+            self.bench_progressbar['value'] = 78
+            self.lbl_bench_arb_status.config(text="🪂 主傘共開 (PD14 CO-FIRE): 🟡 呼叫中 (主板廣播 BENCH_MAIN_HIGH)", bg="#78350f", fg="#fde047")
+        elif "[3]" in line and "PD14 拉高" in line:
             tag = "servo"
             is_sec = "副板" in line
-            self.lbl_bench_step.config(text=f"當前步驟: 3/3 — 🪂 {'副板' if is_sec else '主板'} PD14 舵機 PWM 0°→180°→0° 轉動掃描中")
-            self.bench_progressbar['value'] = 90
+            self.lbl_bench_step.config(text="當前步驟: 3/3 — ⚡ 主傘 PD14 純 GPIO 拉高 1.5s（雙板同時，★不啟 PWM）")
+            self.bench_progressbar['value'] = 88
+            label = ("⚡ PD14 HIGH 1.5s (純 GPIO，無 PWM)")
             if is_sec:
-                self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🟢 DONE (PWM 釋放)", bg="#064e3b", fg="#34d399")
-                self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🪂 SERVO PWM SWEEP 0°→180°→0° (驅動中)", bg="#581c87", fg="#c084fc")
-                self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🟢 BACKUP DRIVING ONLY (互斥防打架 100% 驗證)", bg="#064e3b", fg="#34d399")
+                self.lbl_bench_backup_status.config(text=f"🛟 BACKUP BOARD  : {label}", bg="#581c87", fg="#c084fc")
             else:
-                self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🪂 SERVO PWM SWEEP 0°→180°→0° (驅動中)", bg="#581c87", fg="#c084fc")
-                self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : ⏳ WAITING PRIMARY DONE (讓位中)", bg="#1e293b", fg="#fbbf24")
-                self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🟢 PRIMARY DRIVING ONLY (互斥防打架 100% 驗證)", bg="#064e3b", fg="#34d399")
+                self.lbl_bench_primary_status.config(text=f"🚀 PRIMARY BOARD : {label}", bg="#581c87", fg="#c084fc")
+            self.lbl_bench_arb_status.config(text="🪂 主傘共開 (PD14 CO-FIRE): 🟣 CO-FIRE 中 (兩板同時拉高＝設計目的)", bg="#581c87", fg="#c084fc")
+        elif "拉高" in line and "完成" in line:
+            tag = "servo"
+            is_sec = "副板" in line
+            self.lbl_bench_step.config(text=f"當前步驟: 3/3 — 🟢 {'副板' if is_sec else '主板'} 主傘拉高完成，PD14 回 LOW")
+            self.bench_progressbar['value'] = 94
+            if is_sec:
+                self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🟢 PD14 LOW (拉高完成)", bg="#064e3b", fg="#34d399")
+            else:
+                self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🟢 PD14 LOW (拉高完成)", bg="#064e3b", fg="#34d399")
+        elif "已確認副板同步完成主傘拉高" in line:
+            tag = "ok"
+            self.lbl_bench_step.config(text="當前步驟: 3/3 — ✅ 已確認雙板同時共開主傘成功")
+            self.bench_progressbar['value'] = 98
+            self.lbl_bench_arb_status.config(text="🪂 主傘共開 (PD14 CO-FIRE): ✅ 雙板共開已確認 (兩板皆回報 DONE)", bg="#064e3b", fg="#34d399")
+        elif "未收到副板 DONE" in line:
+            tag = "guard"
+            self.lbl_bench_arb_status.config(text="🪂 主傘共開 (PD14 CO-FIRE): ⚠ 未收到副板 DONE (單板 bench 或鏈路異常)", bg="#78350f", fg="#fde047")
         elif "序列完成" in line or "BENCH OK" in line:
             tag = "ok"
             self.lbl_bench_step.config(text="當前步驟: ✅ 桌面測試完成 (BENCH COMPLETE)")
             self.bench_progressbar['value'] = 100
             self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🟢 STANDBY (復位完成)", bg="#1e293b", fg="#38bdf8")
             self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🟢 STANDBY (復位完成)", bg="#1e293b", fg="#fbbf24")
-            self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🟢 SAFE (兩板皆已釋放 PWM，回歸正常 FSM)", bg="#064e3b", fg="#34d399")
+            self.lbl_bench_arb_status.config(text="🪂 主傘共開 (PD14 CO-FIRE): 🟢 IDLE (兩板皆已回低，回歸正常 FSM)", bg="#064e3b", fg="#34d399")
         elif "[LINK]" in line and ("self_arb" in line or "peer_arb" in line):
             tag = "arb"
-            if "BENCH_PRI_FIRE" in line:
-                self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🔥 FIRE HIGH (PD13 2s 通電中)", bg="#7f1d1d", fg="#ff6b6b")
-                self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🟢 FIRE LOW (待命讓位)", bg="#064e3b", fg="#34d399")
-            elif "BENCH_SEC_FIRE" in line:
-                self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🟢 FIRE LOW (待命讓位)", bg="#064e3b", fg="#34d399")
-                self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🔥 FIRE HIGH (PD13 2s 通電中)", bg="#7f1d1d", fg="#ff6b6b")
-            elif "peer_arb=INTENT" in line or "副板廣播 INTENT" in line:
-                self.lbl_bench_step.config(text="當前步驟: 3b/3 — 🔍 副板發送 1s Guard 意圖確認 (廣播 INTENT)")
-                self.bench_progressbar['value'] = 80
-                self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🔍 1s GUARD INTENT CHECK (廣播 INTENT)", bg="#78350f", fg="#fde047")
-                self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🟡 BACKUP CHECKING 1S GUARD (預備取得獨佔權限)", bg="#78350f", fg="#fde047")
-            elif "peer_arb=DRIVING" in line or "副板接手舵機驅動" in line or "副板 1s Guard 通過" in line:
-                self.lbl_bench_step.config(text="當前步驟: 3b/3 — 🪂 副板接收呼叫接手，PD14 舵機 PWM 0°→180°→0° 轉動掃描中")
-                self.bench_progressbar['value'] = 92
-                self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🟢 DONE (PWM 鬆弛釋放)", bg="#064e3b", fg="#34d399")
-                self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🪂 SERVO PWM SWEEP 0°→180°→0° (接手驅動中)", bg="#581c87", fg="#c084fc")
-                self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🟢 BACKUP DRIVING ONLY (板間帶動成功)", bg="#064e3b", fg="#34d399")
-            elif "peer_arb=DONE" in line or "確認副板舵機掃描完成" in line:
-                self.lbl_bench_step.config(text="當前步驟: 3b/3 — 🟢 副板舵機掃描完成，雙板皆已釋放 PWM")
-                self.bench_progressbar['value'] = 98
-                self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🟢 DONE (PWM 鬆弛釋放)", bg="#064e3b", fg="#34d399")
-                self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🟢 DONE (PWM 鬆弛釋放)", bg="#064e3b", fg="#34d399")
-                self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🟢 SAFE (雙板皆已完成舵機測試)", bg="#064e3b", fg="#34d399")
-            elif "DRIVING" in line:
-                self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🟢 1 BOARD DRIVING (廣播 DRIVING，互斥正常)", bg="#064e3b", fg="#34d399")
+            self._bench_apply_link_arb(line)
 
         self.bench_console.insert(tk.END, f"[{ts}] {clean_line}\n", tag)
         self.bench_console.see(tk.END)
@@ -2852,15 +3130,17 @@ class RocketDashboardApp:
             self._event_log(f"[{ts}] ❌ [ACK] 尋回指令被拒：{line.strip()}", "err")
 
     def _on_bench_test(self):
-        """觸發手動桌面點火/舵機測試 (BENCH)。是否接受由航電板判斷（須先 ARM）；GUI 不做
+        """觸發手動桌面開傘測試 (BENCH)。是否接受由航電板判斷（須先 ARM）；GUI 不做
         本地攔截，一律送出，接受/拒絕以航電回傳的 [ACK] 為準（見 update_bench_monitor）。"""
         ans = messagebox.askyesno(
             "手動桌面測試確認 (BENCH)",
-            "確定要發送『桌面點火/舵機測試 (BENCH)』指令嗎？\n\n"
-            "⚠️ 注意：\n"
-            "1. 航電將依序執行 PD13 點火通電 (8 秒)、1s Guard 意圖確認與 PD14 舵機轉動測試。\n"
-            "2. 全程耗時約 25 秒，測試完成後自動復位 PD14 並回歸正常 FSM。\n"
-            "3. 航電必須處於解鎖狀態 (STATE_PAD_ARMED)。\n\n"
+            "確定要發送『桌面開傘測試 (BENCH)』指令嗎？\n\n"
+            "⚠️ 注意（時序與飛行邏輯 1:1 對應）：\n"
+            "1. 引傘 PD13：主板 t=0 起通電 8s；副板延後 4s（模擬頂點提前量）後通電 3s，\n"
+            "   兩板通電窗會重疊（PD13 為 diode-OR 準位訊號，同時拉高無妨）。\n"
+            "2. 主傘 PD14：★不啟動 PWM，兩板『同時』純 GPIO 拉高 1.5s（已取消互斥握手）。\n"
+            "3. 全程耗時約 20 秒，測試完成後自動復位 PD14 並回歸正常 FSM。\n"
+            "4. 航電必須處於解鎖狀態 (STATE_PAD_ARMED)。\n\n"
             "是否立即執行？"
         )
         if ans:
@@ -3014,25 +3294,31 @@ class RocketDashboardApp:
         "PRIMARY": "PRIMARY",
         "NONE": "PEER",
     }
+    # 韌體 ServoArb_MsgName() 回傳值 → 頂部鏈路列的短標籤。
+    # ★主傘已改為「兩板同時把 PD14 拉高 1.5s」，無互斥握手；LEGACY_DRIVING 僅出現在舊紀錄。
     _ARB_SHORT = {
         "NONE": "IDLE",
-        "INTENT": "WANT",
-        "DRIVING": "SWEEP",
+        "BENCH_START": "BENCH",
+        "BENCH_PRI_FIRE": "P-FIRE",
+        "BENCH_SEC_FIRE": "S-FIRE",
+        "BENCH_MAIN_HIGH": "CO-HI",
+        "MAIN_HIGH": "HIGH",
         "DONE": "DONE",
+        "LEGACY_DRIVING": "OLD-PWM",
     }
 
     def update_link_status(self, self_role, peer_role, link_ok, peer_state, flags, age_ms,
                            sync=None, lost=None, desync=None, self_arb=None, peer_arb=None):
-        """更新頂部鏈路與主傘舵機互斥握手狀態 (1Hz)。"""
+        """更新頂部鏈路與主傘 PD14 共開狀態 (1Hz)。"""
         self.link_last_age_ms = age_ms
 
         p_order = self._PEER_STATE_ORDER.get(peer_state)
         if p_order is not None:
             self._mark_deploy("peer", p_order)
         # 對端手動開傘（其自身 UplinkCmd_TakeDeploy）同樣不會移動對端 FSM 狀態，
-        # 上面的 p_order 判斷會漏掉；但手動/自動都是動同一組硬體(PD13/TIM4)，
+        # 上面的 p_order 判斷會漏掉；但手動/自動都是動同一組硬體(PD13/PD14)，
         # peer->flags 的即時位元讀得到，這裡補上（同樣經 _mark_deploy latch，
-        # 不受副傘 8 秒後 flags 歸零影響）。TELEM_FLAG_DROGUE_FIRED=0x01,
+        # 不受副傘導通窗結束後 flags 歸零影響）。TELEM_FLAG_DROGUE_FIRED=0x01,
         # TELEM_FLAG_MAIN_DEPLOYED=0x02（telemetry.h）。
         if flags & 0x01:
             self._mark_deploy_flag("peer", "drogue")
@@ -3052,7 +3338,7 @@ class RocketDashboardApp:
             if color == "#00e676":
                 color = "#ffcc00"
 
-        # D2 主傘舵機錯開互斥握手狀態（確認主副兩板不同時啟用舵機）
+        # 主傘 PD14 共開狀態（★互斥握手已取消：兩板同時 HIGH 才是正常，不再是異常）
         sa = self._ARB_SHORT.get(self_arb or "", "")
         pa = self._ARB_SHORT.get(peer_arb or "", "")
         if sa or pa:
@@ -3064,7 +3350,12 @@ class RocketDashboardApp:
 
         if hasattr(self, 'lbl_peer') and self.lbl_peer.winfo_exists():
             if link_ok == "OK":
-                peer_text, peer_color = f"🛸 PEER: {peer_state} ({age_ms}ms)", "#00e676"
+                # 對端已解鎖 (PAD_ARMED) 比照本板 update_fsm_state_ui 的紅字警示——
+                # 對端已武裝代表其點火/舵機機構也已待發，不該只有本板 ARMED 才紅字。
+                if peer_state == "PAD_ARMED":
+                    peer_text, peer_color = f"⚡ PEER: {peer_state} ({age_ms}ms)", "#ff3b30"
+                else:
+                    peer_text, peer_color = f"🛸 PEER: {peer_state} ({age_ms}ms)", "#00e676"
             elif link_ok == "STALE":
                 peer_text, peer_color = f"🛸 PEER: LOST ({age_ms}ms)", "#ffcc00"
             else:
@@ -3090,55 +3381,72 @@ class RocketDashboardApp:
                        "APOGEE", "DESCENT", "MAIN", "LANDED"]
 
     def _apply_peer_bench_arb(self, pbarb):
-        """依主板下鏈中繼的副板 bench/servo 握手狀態(SERVO_ARB_MSG_*: 1=INTENT 2=DRIVING 3=DONE)
-        更新 BENCH 監控面板。走二進位遙測(LoRa 433/920 → 地面站 → USB [GS_PKT])，
-        與 update_bench_monitor() 的文字行解析互補，GUI 不需直接接航電板 USB 也能看到副板進度。"""
+        """依主板下鏈中繼的副板 main_arb 值（韌體 servo_arb.h 的 SERVO_ARB_MSG_*：
+        1=BENCH_START 3=DONE 4=BENCH_PRI_FIRE 5=BENCH_SEC_FIRE 6=BENCH_MAIN_HIGH
+        7=MAIN_HIGH）更新 BENCH 監控面板的副板徽章。
+        走二進位遙測(LoRa 433/920 → 地面站 → USB [GS_PKT])，與 update_bench_monitor() 的
+        文字行解析互補，GUI 不需直接接航電板 USB 也能看到副板進度。
+        ★2 = LEGACY_DRIVING（舊 PWM 掃描）僅存在於改版前的紀錄，這裡刻意不再處理。"""
         if not hasattr(self, 'bench_win') or not self.bench_win or not self.bench_win.winfo_exists():
             return
         if not hasattr(self, 'lbl_bench_backup_status'):
             return
-        if pbarb == 2:      # DRIVING：副板正在驅動舵機
-            self.lbl_bench_step.config(text="當前步驟: 3b/3 — 🪂 副板接收呼叫接手，PD14 舵機 PWM 0°→180°→0° 轉動掃描中")
-            self.bench_progressbar['value'] = 92
-            self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🟢 DONE (PWM 鬆弛釋放)", bg="#064e3b", fg="#34d399")
-            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🪂 SERVO PWM SWEEP 0°→180°→0° (接手驅動中)", bg="#581c87", fg="#c084fc")
-            self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🟢 BACKUP DRIVING ONLY (板間帶動成功)", bg="#064e3b", fg="#34d399")
-        elif pbarb == 3:    # DONE：副板舵機掃描完成
-            self.lbl_bench_step.config(text="當前步驟: 3b/3 — 🟢 副板舵機掃描完成，雙板皆已釋放 PWM")
-            self.bench_progressbar['value'] = 98
-            self.lbl_bench_primary_status.config(text="🚀 PRIMARY BOARD : 🟢 DONE (PWM 鬆弛釋放)", bg="#064e3b", fg="#34d399")
-            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🟢 DONE (PWM 鬆弛釋放)", bg="#064e3b", fg="#34d399")
-            self.lbl_bench_arb_status.config(text="🪂 DIODE-OR INTERLOCK: 🟢 SAFE (雙板皆已完成舵機測試)", bg="#064e3b", fg="#34d399")
-        elif pbarb == 1:    # INTENT：副板等待/宣告意圖
-            self.lbl_bench_step.config(text="當前步驟: 3b — 🔍 副板發送 1s Guard 意圖確認 (廣播 INTENT)")
-            self.bench_progressbar['value'] = 80
-            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🔍 1s GUARD INTENT CHECK (廣播 INTENT)", bg="#78350f", fg="#fde047")
+        if pbarb in (6, 7):   # BENCH_MAIN_HIGH / MAIN_HIGH：副板 PD14 拉高 1.5s（與主板共開）
+            self.lbl_bench_step.config(text="當前步驟: 3/3 — ⚡ 副板 PD14 拉高 1.5s（與主板同時共開，無 PWM）")
+            self.bench_progressbar['value'] = 88
+            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : ⚡ PD14 HIGH 1.5s (共開，無 PWM)", bg="#581c87", fg="#c084fc")
+            self.lbl_bench_arb_status.config(text="🪂 主傘共開 (PD14 CO-FIRE): 🟣 CO-FIRE 中 (兩板同時拉高＝設計目的)", bg="#581c87", fg="#c084fc")
+        elif pbarb == 5:    # BENCH_SEC_FIRE：副板引傘 PD13 通電 3s（主板 8s 窗內，兩窗重疊）
+            self.lbl_bench_step.config(text="當前步驟: 1c/3 — 🔥 副板引傘 PD13 通電中 (3s，真頂點才開)")
+            self.bench_progressbar['value'] = 45
+            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🔥 PD13 HIGH (引傘通電 3s)", bg="#7f1d1d", fg="#ff6b6b")
+        elif pbarb == 4:    # BENCH_PRI_FIRE：主板引傘中，副板應仍 LOW（等模擬頂點）
+            self.lbl_bench_step.config(text="當前步驟: 1a/3 — 🔥 主板引傘 PD13 通電中 (8s)")
+            self.bench_progressbar['value'] = 20
+            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🟢 PD13 LOW (等模擬頂點，延後 4s)", bg="#064e3b", fg="#34d399")
+        elif pbarb == 3:    # DONE：副板 PD14 拉高窗結束、已回低
+            self.lbl_bench_step.config(text="當前步驟: 3/3 — 🟢 副板主傘拉高完成，PD14 已回低")
+            self.bench_progressbar['value'] = 96
+            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🟢 DONE (PD14 已回低)", bg="#064e3b", fg="#34d399")
+        elif pbarb == 1:    # BENCH_START：副板已收到序列開始宣告，待命
+            self.lbl_bench_step.config(text="當前步驟: 0/3 — 🖥️ 副板已進入 BENCH 序列，待命中")
+            self.bench_progressbar['value'] = 8
+            self.lbl_bench_backup_status.config(text="🛟 BACKUP BOARD  : 🖥️ BENCH 序列開始 (待命)", bg="#1e293b", fg="#fbbf24")
 
-    def update_peer_relay(self, pfsm, pflags, ph_m, pv_ms, plink, ploss_pmil,
-                          pbaro_m=0.0, paz_g=0.0, pvfh_m=0.0, pvfv_ms=0.0, pbarb=0):
-        """主板經下鏈中繼的副板摘要（Phase A/D：地面雙板監看 + 全量比對）。同步餵入
-        live chart 的副航電高度/速度/加速度/VF 序列與 FSM 狀態轉換記號，讓主副航電
-        狀態與估計器差異能同屏比對。pbarb：副板 BENCH/舵機握手狀態（見 _apply_peer_bench_arb）。"""
+    def update_peer_relay(self, pfsm, pflags, plink,
+                          pbaro_m=0.0, pvfh_m=0.0, pvfv_ms=0.0, pbarb=0):
+        """主板經下鏈中繼的副板摘要（Phase A/D：地面雙板監看）。同步餵入 live chart 的
+        副航電 VF/baro 序列與 FSM 狀態轉換記號，讓主副航電狀態與估計器差異能同屏比對。
+        ★2026-07-30 起下鏈只帶 VF + baro + 鏈路健康位；USB 直連時走 [LINK] 那條路徑
+        仍有對端 EKF/高G 全量。pbarb：副板 BENCH/主傘共開狀態（見 _apply_peer_bench_arb）。"""
         self._apply_peer_bench_arb(pbarb)
+        # 副板開傘 latch：韌體自 2026-07-31 起把 peer_flags 的 bit0/bit1 改成「開過」鎖存值
+        # （Telemetry_Build 由 LinkPeer 的 drogue_latched/main_latched OR 進來），開過之後
+        # 每一包都帶著。舊版這裡完全沒讀 pflags —— 走 LoRa 下鏈時副板開傘在本 GUI 是看不到的
+        # （只有 USB 直連吃 [LINK] 那條 update_link_status 路徑才 latch），這裡補上。
+        # TELEM_FLAG_DROGUE_FIRED=0x01, TELEM_FLAG_MAIN_DEPLOYED=0x02（telemetry.h）。
+        if pflags & 0x01:
+            self._mark_deploy_flag("peer", "drogue")
+        if pflags & 0x02:
+            self._mark_deploy_flag("peer", "main")
         name = self._PEER_FSM_NAMES[pfsm] if pfsm < len(self._PEER_FSM_NAMES) else f"?{pfsm}"
         ever, fresh = bool(plink & 0x01), bool(plink & 0x02)
         lost, desync = bool(plink & 0x04), bool(plink & 0x08)
-        loss = ploss_pmil / 10.0
         if not ever:
             text, color = "🛸 PEER: NO LINK", "#ff3366"
         elif fresh:
             warn = ("⚠LOST " if lost else "") + ("⚠DESYNC " if desync else "")
-            text = f"🛸 PEER: {name} (h={ph_m:.0f}m, v={pv_ms:+.0f}m) {warn}".rstrip()
+            text = f"🛸 PEER: {name} (VF h={pvfh_m:.0f}m, v={pvfv_ms:+.0f}m/s) {warn}".rstrip()
             color = "#ffcc00" if (lost or desync) else "#00e676"
         else:
-            text, color = f"🛸 PEER: LOST ({loss:.1f}%)", "#ffcc00"
+            text, color = "🛸 PEER: LOST", "#ffcc00"
 
         if fresh:
             t = self.now_t()
-            self.ts_backup_alt.append((t, ph_m))
-            self.ts_backup_vz.append((t, pv_ms))
-            self.ts_backup_baro.append((t, pbaro_m))
-            self.ts_backup_acc.append((t, paz_g))
+            # 副板 baro 是絕對海拔，借主板 pad_ref 扣（見 ln_alt_backup_baro 註解）
+            pbaro_rel = self.pad_ref.rel(pbaro_m)
+            if pbaro_rel is not None:
+                self.ts_backup_baro.append((t, pbaro_rel))
             self.ts_backup_vf_alt.append((t, pvfh_m))
             self.ts_backup_vf_vz.append((t, pvfv_ms))
             self.backup_state = name
@@ -3433,7 +3741,8 @@ class RocketDashboardApp:
         self.lora_win.title("📡 LoRa 通訊參數設定（E22 433MHz / E80 920MHz）")
         self.lora_win.geometry("980x700")
         self.lora_win.configure(bg="#1c1c1c")
-        self.lora_win.transient(self.root)   # 不 grab_set：保留主視窗終端可同時觀察回報
+        # 不用 transient(self.root)：macOS 上 transient 視窗沒有獨立 Dock 圖示，縮小/關閉
+        # 主視窗或任一子視窗會把整組一起帶走，子視窗需要能各自獨立縮小/關閉。
 
         self.lora_widgets_common = []   # BACKUP 時停用
         self.lora_widgets_ground = []   # 僅 GROUND 啟用
@@ -3473,7 +3782,8 @@ class RocketDashboardApp:
 
     # ---- 小工具 ----
     def lora_send(self, cmd):
-        """LoRa 面板統一發送入口（沿用 send_command 的 [CMD] 終端回顯）"""
+        """LoRa 面板統一發送入口（沿用 send_command 的 [CMD] 終端回顯）：e22/e80 頻率/
+        功率/空速/SF/BW/CR/前導碼、stats、ver、e80 init/rxstart/airtime 等。"""
         return self.send_command(cmd)
 
     def lora_confirm_link_break(self, what):
@@ -3881,7 +4191,8 @@ class RocketDashboardApp:
         self.calib_win.title("🧲 地磁計硬鐵校正與航向鎖定")
         self.calib_win.geometry("900x520")
         self.calib_win.configure(bg="#1c1c1c")
-        self.calib_win.transient(self.root)
+        # 不用 transient()：見 open_lora_panel 註解，子視窗要能各自獨立縮小/關閉；
+        # grab_set() 仍保留，校正過程需要 modal 獨佔輸入焦點。
         self.calib_win.grab_set()
         # 關窗時保證恢復 1Hz（否則板子會卡在 10Hz 提速模式）
         self.calib_win.protocol("WM_DELETE_WINDOW", self._close_mag_calibration)
@@ -4369,14 +4680,18 @@ class RocketDashboardApp:
         if not self.running:
             messagebox.showwarning("提示", "請先開啟串口連接航電板，再進行一致性測試。")
             return
-        
+        if hasattr(self, 'wizard_win') and self.wizard_win and self.wizard_win.winfo_exists():
+            self.wizard_win.lift()
+            return
+
         # 建立彈出視窗
         self.wizard_win = tk.Toplevel(self.root)
         self.wizard_win.title("🧭 航電板感測器軸向一致性測試精靈")
         self.wizard_win.geometry("580x460")
         self.wizard_win.configure(bg="#1c1c1c")
-        self.wizard_win.transient(self.root) 
-        self.wizard_win.grab_set()           
+        # 不用 transient()：見 open_lora_panel 註解，子視窗要能各自獨立縮小/關閉；
+        # grab_set() 仍保留，測試精靈流程需要 modal 獨佔輸入焦點。
+        self.wizard_win.grab_set()
         
         self.current_step_idx = 0
         self.is_detecting = False

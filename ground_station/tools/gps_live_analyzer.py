@@ -326,82 +326,126 @@ class LiveGpsAnalyzer:
                 
         ser.close()
 
-    def process_queue(self):
-        """Process queued logs"""
+    def process_queue(self, max_items=2000):
+        """Process queued logs safely with multi-format parsing and batch processing"""
+        processed_count = 0
         while not self.data_queue.empty():
+            if self.is_file_mode and processed_count >= max_items:
+                break
             ts, line = self.data_queue.get()
+            processed_count += 1
             
-            if "[GPS]" in line or "[GS_PKT]" in line:
-                if "[GPS]" in line:
-                    fix_match = re.search(r"fix:(\d+)", line)
-                    sat_match = re.search(r"sat:(\d+)", line)
-                    coord_match = re.search(r"([\+\-]\d+\.\d+),([\+\-]\d+\.\d+)", line)
-                    alt_match = re.search(r"alt:(\-?\d+)m", line)
-                    ok_match = re.search(r"ok:(\d+)", line)
-                    ok_val = int(ok_match.group(1)) if ok_match else 0
-                else:
+            is_gps = "[GPS]" in line
+            is_gs_pkt = "[GS_PKT]" in line
+            is_gs_gps = "[GS_GPS]" in line
+            
+            if is_gps or is_gs_pkt or is_gs_gps:
+                fix_val = 0
+                sats_val = 0
+                lat, lon, alt = 0.0, 0.0, 0.0
+                has_valid_data = False
+                ok_val = 0
+
+                if is_gps:
+                    # [GPS] fix:1 q:3 sat:8 +22.991234,+120.211234 alt:45m spd:0cm/s stale:0 ok:1096 err:0
+                    fix_m = re.search(r"fix:(\d+)", line)
+                    sat_m = re.search(r"sat:(\d+)", line)
+                    coord_m = re.search(r"([+-]?\d+\.\d+),([+-]?\d+\.\d+)", line)
+                    alt_m = re.search(r"alt:([+-]?\d+(?:\.\d+)?)m?", line)
+                    ok_m = re.search(r"ok:(\d+)", line)
+
+                    if fix_m and sat_m:
+                        fix_val = int(fix_m.group(1))
+                        sats_val = int(sat_m.group(1))
+                        has_valid_data = True
+                    if ok_m:
+                        ok_val = int(ok_m.group(1))
+
+                    if coord_m:
+                        try:
+                            lat = float(coord_m.group(1))
+                            lon = float(coord_m.group(2))
+                        except ValueError:
+                            pass
+                    if alt_m:
+                        try:
+                            alt = float(alt_m.group(1))
+                        except ValueError:
+                            pass
+
+                elif is_gs_pkt:
                     # [GS_PKT] format: gps:8/1 pos:+22.991234,+120.211234 galt:45m
-                    m_gps = re.search(r"gps:(\d+)/(\d+)", line)
-                    sat_match = m_gps if m_gps else None
-                    fix_val = int(m_gps.group(2)) if m_gps else 0
-                    sats_val = int(m_gps.group(1)) if m_gps else 0
-                    fix_match = True
-                    coord_match = re.search(r"pos:([\+\-]\d+\.\d+),([\+\-]\d+\.\d+)", line)
-                    alt_match = re.search(r"galt:(\-?\d+)m", line)
-                    ok_val = 0
+                    gps_m = re.search(r"gps:(\d+)/(\d+)", line)
+                    coord_m = re.search(r"pos:([+-]?\d+\.\d+),([+-]?\d+\.\d+)", line)
+                    alt_m = re.search(r"(?:galt|alt):([+-]?\d+(?:\.\d+)?)m?", line)
 
-                if fix_match and sat_match:
-                    if "[GPS]" in line:
-                        fix_val = int(fix_match.group(1))
-                        sats_val = int(sat_match.group(1))
+                    if gps_m:
+                        sats_val = int(gps_m.group(1))
+                        fix_val = int(gps_m.group(2))
+                        has_valid_data = True
 
+                    if coord_m:
+                        try:
+                            lat = float(coord_m.group(1))
+                            lon = float(coord_m.group(2))
+                        except ValueError:
+                            pass
+                    if alt_m:
+                        try:
+                            alt = float(alt_m.group(1))
+                        except ValueError:
+                            pass
+
+                elif is_gs_gps:
+                    # [GS_GPS] FIX sats=8 Pos:+22.991234,+120.211234 Alt:45m
+                    # or [GS_GPS] SEARCHING sats=0 q=0 ok=12 err=0
+                    sats_m = re.search(r"sats?=(\d+)", line)
+                    coord_m = re.search(r"Pos:([+-]?\d+\.\d+),([+-]?\d+\.\d+)", line, re.IGNORECASE)
+                    alt_m = re.search(r"Alt:([+-]?\d+(?:\.\d+)?)m?", line, re.IGNORECASE)
+
+                    if sats_m:
+                        sats_val = int(sats_m.group(1))
+                    fix_val = 1 if ("FIX" in line or (re.search(r"q=([1-9])", line))) else 0
+                    has_valid_data = True
+
+                    if coord_m:
+                        try:
+                            lat = float(coord_m.group(1))
+                            lon = float(coord_m.group(2))
+                        except ValueError:
+                            pass
+                    if alt_m:
+                        try:
+                            alt = float(alt_m.group(1))
+                        except ValueError:
+                            pass
+
+                if has_valid_data:
                     with self.lock:
-                        # 1. Detect Reset (ok count decreases)
-                        if "[GPS]" in line and self.prev_ok is not None and ok_val < self.prev_ok - 100:
-                            print(f"\n🔄 [{ts}] Reset detected! Re-aligning timeline (retaining accumulated drift stats)...")
-                            self.times.clear()
-                            self.timestamps.clear()
-                            self.sats.clear()
-                            self.fixes.clear()
-                            self.lats.clear()
-                            self.lons.clear()
-                            self.alts.clear()
-                            
-                            self.start_sys_time = None
-                            self.first_fix_time_str = None
-                            self.ttff = None
-                        if "[GPS]" in line:
+                        # Log MCU reset without wiping historical arrays
+                        if is_gps and self.prev_ok is not None and ok_val > 0 and ok_val < self.prev_ok - 100:
+                            print(f"🔄 [{ts}] MCU reset detected (ok_val: {ok_val} < prev: {self.prev_ok}). Continuing timeline...")
+                        if is_gps and ok_val > 0:
                             self.prev_ok = ok_val
-                        
-                        # 2. Reset time offset
+
+                        # Reset time offset smoothly
                         t_sec = self.parse_time_str(ts)
                         if self.start_sys_time is None:
                             self.start_sys_time = t_sec
-                            
+
                         rel_time = t_sec - self.start_sys_time
                         if rel_time < 0:
                             rel_time += 24 * 3600
-                            
-                        # 3. Store raw data
+
+                        # Store raw data
                         self.times.append(rel_time)
                         self.timestamps.append(ts)
                         self.sats.append(sats_val)
                         self.fixes.append(fix_val)
-                        
-                        # 4. Parse coordinates & altitude
-                        lat, lon, alt = 0.0, 0.0, 0.0
-                        if coord_match and alt_match:
-                            try:
-                                lat = float(coord_match.group(1))
-                                lon = float(coord_match.group(2))
-                                alt = float(alt_match.group(1))
-                            except (ValueError, IndexError):
-                                pass
-
                         self.lats.append(lat)
                         self.lons.append(lon)
                         self.alts.append(alt)
-                        
+
                         # Save drift data only when GPS is fixed and coords are valid
                         if fix_val > 0 and abs(lat) > 0.01 and abs(lon) > 0.01:
                             if self.first_fix_time_str is None:
@@ -409,10 +453,9 @@ class LiveGpsAnalyzer:
                                 self.ttff = rel_time
                                 if not self.is_file_mode:
                                     print(f"\n🎉 [GPS 定位成功！] 抓到位置所需時間 (TTFF): {self.ttff:.2f} 秒 (鎖定時刻: {ts})\n")
-                                # Trigger map download centered at first fix location if no reference is set
                                 if not self.comp_loc:
                                     self.trigger_map_download(lat, lon)
-                                
+
                             self.drift_times.append(rel_time)
                             self.drift_lats.append(lat)
                             self.drift_lons.append(lon)

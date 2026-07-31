@@ -112,23 +112,19 @@ pwr_pattern = re.compile(r"\[PWR\] bat:(\d+)mV")
 gps_pattern = re.compile(r"\[GPS\] fix:(\d+) q:\d+ sat:(\d+)")
 health_pattern = re.compile(r"\[HEALTH\] sens=(0x[0-9a-fA-F]+|\d+)\s+ekf=(0x[0-9a-fA-F]+|\d+)")
 
-backup_pattern = re.compile(
-    r"\[BACKUP_TELEM\] fsm:(\d+) h_cm:(-?\d+) v_cms:(-?\d+) baro_cm:(-?\d+) az_cg:(-?\d+) q:([\d\.-]+),([\d\.-]+),([\d\.-]+),([\d\.-]+) flags:0x([0-9A-Fa-f]+)"
+# 本板 1Hz FSM 心跳：[FSM] state=PAD role=PRIMARY（state 已是短名稱，不必再剝 STATE_ 前綴）
+fsm_pattern = re.compile(r"\[FSM\]\s+state=(\w+)\s+role=(\w+)")
+
+# 板間鏈路 1Hz 診斷：對端（另一塊板）的 FSM 狀態 + 最近回報高度/速度（ph_cm/pv_cms）。
+# ph_cm/pv_cms 是舊韌體沒有的新欄位，設成 optional 對舊 log 向下相容。
+link_pattern = re.compile(
+    r"\[LINK\]\s+self=(\w+)\s+peer=\w+\s+link=\w+\s+state=(\w+)"
 )
+link_peer_alt_pattern = re.compile(r"ph_cm=(-?\d+)\s+pv_cms=(-?\d+)")
 
-# State mapping helper
-FSM_NAMES = [
-    "INIT", "PAD", "PAD_ARMED", "BOOST", "COAST",
-    "DEPLOY_DROGUE", "APOGEE", "DESCENT", "MAIN_DEPLOY", "LANDED"
-]
-
-def get_fsm_name(code_or_str):
-    if isinstance(code_or_str, int):
-        if 0 <= code_or_str < len(FSM_NAMES):
-            return FSM_NAMES[code_or_str]
-        return f"UNK({code_or_str})"
-    s = str(code_or_str).replace("STATE_", "")
-    return s
+def get_fsm_name(s):
+    """去除舊韌體/舊 log 可能殘留的 STATE_ 前綴，目前韌體本身已直接印短名稱。"""
+    return str(s).replace("STATE_", "")
 
 # Thread-safe queue for serial reading thread -> main plotting thread
 data_queue = queue.Queue()
@@ -268,13 +264,9 @@ def serial_reader_task(port):
                         sensor_health_bits, ekf_health_bits
                     ))
 
-                # C. Parse Backup Board telemetry [BACKUP_TELEM]
-                m_bak = backup_pattern.search(line)
-                if m_bak:
-                    bak_code = int(m_bak.group(1))
-                    bak_fsm_state = get_fsm_name(bak_code)
-                    latest_backup_alt = float(m_bak.group(2)) / 100.0
-                    latest_backup_vel_z = float(m_bak.group(3)) / 100.0
+                # C. 對端（另一塊板）的 FSM 狀態 + 高度/速度：見下方 J. [LINK] 解析
+                #    （舊韌體用獨立的 [BACKUP_TELEM] 行直接播報，該行已停印；
+                #    現在對端資料改走板間鏈路 1Hz 診斷行 [LINK] 的 ph_cm/pv_cms 欄位）。
 
                 # D. Parse raw sensor data (9 integers comma-separated line)
                 if len(parts) == 9 and all(p.lstrip('-').isdigit() for p in parts):
@@ -310,21 +302,33 @@ def serial_reader_task(port):
                     sensor_health_bits = int(m_health.group(1), 16) if 'x' in m_health.group(1) else int(m_health.group(1))
                     ekf_health_bits = int(m_health.group(2), 16) if 'x' in m_health.group(2) else int(m_health.group(2))
                 
-                # I. Parse Primary FSM state [FSM]
-                if "[FSM]" in line:
-                    m_state = re.search(r"(STATE_[A-Z_]+)", line)
-                    if m_state:
-                        pri_fsm_state = get_fsm_name(m_state.group(1))
-                    elif "LIFTOFF" in line:
-                        pri_fsm_state = "BOOST"
-                    elif "BURNOUT" in line:
-                        pri_fsm_state = "COAST"
-                    elif "DEPLOY_DROGUE" in line:
-                        pri_fsm_state = "DEPLOY_DROGUE"
-                    elif "APOGEE" in line:
-                        pri_fsm_state = "APOGEE"
-                    elif "LANDED" in line:
-                        pri_fsm_state = "LANDED"
+                # I. 本板（直連序列埠這塊板）1Hz FSM 心跳 [FSM] state=PAD role=PRIMARY
+                #    role 決定這個狀態要記進 pri_fsm_state 還是 bak_fsm_state——不能寫死
+                #    「連到的一定是主板」，萬一接的是副板，主/副標籤才不會顛倒。
+                m_fsm = fsm_pattern.search(line)
+                if m_fsm:
+                    local_state = get_fsm_name(m_fsm.group(1))
+                    local_role = m_fsm.group(2)
+                    if local_role == "BACKUP":
+                        bak_fsm_state = local_state
+                    else:
+                        pri_fsm_state = local_state
+
+                # J. 板間鏈路 1Hz 診斷 [LINK]：帶出「對端」（沒直連序列埠的那塊板）的
+                #    FSM 狀態，以及（新韌體）對端最近回報的 EKF 高度/速度 ph_cm/pv_cms。
+                #    self= 告訴我們直連的這塊板是主是副，藉此把「對端」正確歸到另一邊。
+                m_link = link_pattern.search(line)
+                if m_link:
+                    self_role = m_link.group(1)
+                    peer_state = get_fsm_name(m_link.group(2))
+                    if self_role == "BACKUP":
+                        pri_fsm_state = peer_state
+                    else:
+                        bak_fsm_state = peer_state
+                    m_ph = link_peer_alt_pattern.search(line)
+                    if m_ph:
+                        latest_backup_alt = int(m_ph.group(1)) / 100.0
+                        latest_backup_vel_z = int(m_ph.group(2)) / 100.0
             else:
                 time.sleep(0.002)
         except Exception as e:
@@ -453,16 +457,18 @@ def main():
     line_vf_alt,  = ax_alt.plot([], [], '#ff3b30', lw=2.2, label='VF Altitude ($h_{vf}$)')
     line_ekf_alt, = ax_alt.plot([], [], '#00d2ff', lw=1.8, label='EKF Altitude ($h_{ekf}$)')
     line_baro_alt,= ax_alt.plot([], [], '#28a745', lw=1.2, ls='--', label='Baro Altitude ($h_{baro}$)')
+    line_backup_alt, = ax_alt.plot([], [], '#a839f5', lw=1.6, ls=':', label='Backup Board Alt ($h_{bak}$)')
     ax_alt.set_ylabel("Altitude (m)", fontsize=10, fontweight='bold')
-    ax_alt.set_title("Altitude Estimation (VF vs EKF vs Baro)", color='white', fontsize=11, fontweight='bold')
+    ax_alt.set_title("Altitude Estimation (VF vs EKF vs Baro vs Backup)", color='white', fontsize=11, fontweight='bold')
     ax_alt.legend(loc="upper left", fontsize=8)
-    
-    # Subplot 2: Velocities (VF Vz vs EKF Vz)
+
+    # Subplot 2: Velocities (VF Vz vs EKF Vz vs Backup)
     line_vf_vel,  = ax_vel.plot([], [], '#ff3b30', lw=2.2, label='VF Vertical Velocity ($v_{z,vf}$)')
     line_ekf_vel, = ax_vel.plot([], [], 'cyan', lw=1.8, label='EKF Vertical Velocity ($v_{z,ekf}$)')
     line_vel_mag, = ax_vel.plot([], [], '#a88beb', lw=1.2, ls='--', label='EKF Speed ($|v|$)')
+    line_backup_vel, = ax_vel.plot([], [], '#a839f5', lw=1.6, ls=':', label='Backup Board Vz ($v_{z,bak}$)')
     ax_vel.set_ylabel("Velocity (m/s)", fontsize=10, fontweight='bold')
-    ax_vel.set_title("Vertical Velocity Estimation (VF vs EKF)", color='white', fontsize=11, fontweight='bold')
+    ax_vel.set_title("Vertical Velocity Estimation (VF vs EKF vs Backup)", color='white', fontsize=11, fontweight='bold')
     ax_vel.legend(loc="upper left", fontsize=8)
     
     # Subplot 3: Z-axis Acceleration (BMI088 vs ADXL375)
@@ -520,15 +526,18 @@ def main():
         line_vf_alt.set_data([], [])
         line_ekf_alt.set_data([], [])
         line_baro_alt.set_data([], [])
+        line_backup_alt.set_data([], [])
         line_vf_vel.set_data([], [])
         line_ekf_vel.set_data([], [])
         line_vel_mag.set_data([], [])
+        line_backup_vel.set_data([], [])
         line_acc_low.set_data([], [])
         line_acc_high.set_data([], [])
         line_gyro_x.set_data([], [])
         line_gyro_y.set_data([], [])
         line_gyro_z.set_data([], [])
-        return (line_vf_alt, line_ekf_alt, line_baro_alt, line_vf_vel, line_ekf_vel, line_vel_mag,
+        return (line_vf_alt, line_ekf_alt, line_baro_alt, line_backup_alt,
+                line_vf_vel, line_ekf_vel, line_vel_mag, line_backup_vel,
                 line_acc_low, line_acc_high, line_gyro_x, line_gyro_y, line_gyro_z, status_text)
 
     def animate(frame):
@@ -654,10 +663,12 @@ def main():
             line_vf_alt.set_data(t_list, list(vf_alt_history))
             line_ekf_alt.set_data(t_list, list(ekf_alt_history))
             line_baro_alt.set_data(t_list, list(baro_alt_history))
-            
+            line_backup_alt.set_data(t_list, list(backup_alt_history))
+
             line_vf_vel.set_data(t_list, list(vf_vel_z_history))
             line_ekf_vel.set_data(t_list, list(ekf_vel_z_history))
             line_vel_mag.set_data(t_list, list(ekf_vel_mag_history))
+            line_backup_vel.set_data(t_list, list(backup_vel_z_history))
             
             line_acc_low.set_data(t_list, list(raw_accel_low_history))
             line_acc_high.set_data(t_list, list(raw_accel_high_history))
@@ -671,12 +682,14 @@ def main():
             ax_acc.set_xlim(x_min, max(x_max, x_min + 5.0))
             ax_gyro.set_xlim(x_min, max(x_max, x_min + 5.0))
             
-            alts_arr = np.concatenate([list(vf_alt_history), list(ekf_alt_history), list(baro_alt_history)])
+            alts_arr = np.concatenate([list(vf_alt_history), list(ekf_alt_history), list(baro_alt_history),
+                                        list(backup_alt_history)])
             alt_min, alt_max = np.min(alts_arr), np.max(alts_arr)
             alt_pad = max(abs(alt_max - alt_min) * 0.15, 5.0)
             ax_alt.set_ylim(alt_min - alt_pad, alt_max + alt_pad + 5.0)
-            
-            vels_arr = np.concatenate([list(vf_vel_z_history), list(ekf_vel_z_history), list(ekf_vel_mag_history)])
+
+            vels_arr = np.concatenate([list(vf_vel_z_history), list(ekf_vel_z_history), list(ekf_vel_mag_history),
+                                        list(backup_vel_z_history)])
             vel_min, vel_max = np.min(vels_arr), np.max(vels_arr)
             vel_pad = max(abs(vel_max - vel_min) * 0.15, 2.0)
             ax_vel.set_ylim(vel_min - vel_pad, vel_max + vel_pad)
@@ -707,12 +720,13 @@ def main():
                 status_text.get_bbox_patch().set_edgecolor('#ff3b30')
             elif pri_lbl == "COAST":
                 status_text.get_bbox_patch().set_edgecolor('#ffcc00')
-            elif pri_lbl in ["DEPLOY_DROGUE", "APOGEE", "DESCENT", "MAIN_DEPLOY"]:
+            elif pri_lbl in ["DEP_DROGUE", "APOGEE", "DESCENT", "MAIN_DEPLOY"]:
                 status_text.get_bbox_patch().set_edgecolor('#28a745')
             elif pri_lbl == "LANDED":
                 status_text.get_bbox_patch().set_edgecolor('#ffffff')
 
-        return (line_vf_alt, line_ekf_alt, line_baro_alt, line_vf_vel, line_ekf_vel, line_vel_mag,
+        return (line_vf_alt, line_ekf_alt, line_baro_alt, line_backup_alt,
+                line_vf_vel, line_ekf_vel, line_vel_mag, line_backup_vel,
                 line_acc_low, line_acc_high, line_gyro_x, line_gyro_y, line_gyro_z, status_text)
 
     ani = animation.FuncAnimation(

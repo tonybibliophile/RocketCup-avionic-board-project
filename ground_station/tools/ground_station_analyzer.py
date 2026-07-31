@@ -94,14 +94,22 @@ LORA433_TX_EVERY = 1
 # 原因見 main.c 註解——時槽只有 100ms，而一包 433 的空中時間 ~390~580ms，跳過 1 個排程
 # 時槽時模組還在把前一包送上空中，空中根本沒有靜默，地面站的 ARM/DEPLOY 永遠打不進來
 # （實測：連送 10 次 ARM 全無 ACK）。窗必須用時間定義且長度 > 一包空中時間才成立。
-# 對本分析器的意義：433 的規律性 seq 間隙不再是「每 10 筆墊 1」，而是「每 3000ms 有一段
-# 800ms 完全沒發」——換算成時槽就是每 30 個 tick 連續 8 個 tick 不發射。
+# ★★2026-07-30 第二輪：只有「窗內不餵資料」還是不通（實測 LORA433_RX_ONLY=1 就通、
+# 設回 0 就不通，證明 RF 層無罪）。根因是名目窗長 != 真正的靜默長度——listen_slot 只在
+# 迴圈開頭判斷一次，一包在窗開始前一瞬間才起飛的封包會吃掉窗的前半段，800ms 的窗真正
+# 靜默只剩 ~300ms。韌體因此在窗「之前」加了一段發射守衛帶 UPLINK_TX_GUARD_MS，讓在途
+# 封包在窗開始前送完，並把 HOLD 從 800 縮到 400（總不發射時間 800→1000ms）。
+# 對本分析器的意義：433 的規律性 seq 間隙是「每 3000ms 有一段連續 1000ms 完全沒發」
+# ——換算成時槽就是每 30 個 tick 連續 10 個 tick 不發射。
 UPLINK_LISTEN_PERIOD_MS = 3000.0
-UPLINK_LISTEN_HOLD_MS = 800.0
-# 窗內佔全部時間的比例：433 可用發送時間因此只剩 (1 - 這個比例)。
-UPLINK_LISTEN_DUTY = UPLINK_LISTEN_HOLD_MS / UPLINK_LISTEN_PERIOD_MS   # = 0.267
+UPLINK_LISTEN_HOLD_MS = 400.0
+UPLINK_TX_GUARD_MS = 600.0
+# 不發射總時長（守衛帶 + 窗，兩段在時間軸上相連）佔全部時間的比例：
+# 433 可用發送時間只剩 (1 - 這個比例)。
+UPLINK_LISTEN_QUIET_MS = UPLINK_TX_GUARD_MS + UPLINK_LISTEN_HOLD_MS       # = 1000
+UPLINK_LISTEN_DUTY = UPLINK_LISTEN_QUIET_MS / UPLINK_LISTEN_PERIOD_MS     # = 0.333
 UPLINK_LISTEN_PERIOD_TICKS = round(UPLINK_LISTEN_PERIOD_MS / LORA_TELEM_PERIOD_MS)  # = 30
-UPLINK_LISTEN_HOLD_TICKS = round(UPLINK_LISTEN_HOLD_MS / LORA_TELEM_PERIOD_MS)      # = 8
+UPLINK_LISTEN_HOLD_TICKS = round(UPLINK_LISTEN_QUIET_MS / LORA_TELEM_PERIOD_MS)     # = 10
 
 # 433/E22 實際可達速率不再是「時槽除數」而是空中時間物理上限，但這個空中時間本身
 # ★還沒有實測、只有韌體裡兩份互相矛盾的估計值★：
@@ -116,7 +124,7 @@ UPLINK_LISTEN_HOLD_TICKS = round(UPLINK_LISTEN_HOLD_MS / LORA_TELEM_PERIOD_MS)  
 # 跟上一次成功發送時間戳相減），回填這裡取代猜測值。
 LORA433_AIRTIME_S = 0.580   # ← 估計值，見上方註解；非實測
 NOMINAL_RATE_HZ = {
-    LINK_433: (1.0 / LORA433_AIRTIME_S) * (1.0 - UPLINK_LISTEN_DUTY),  # ≈1.26 Hz(估計)
+    LINK_433: (1.0 / LORA433_AIRTIME_S) * (1.0 - UPLINK_LISTEN_DUTY),  # ≈1.15 Hz(估計)
     LINK_920: 1000.0 / LORA_TELEM_PERIOD_MS,                        # 10 Hz（受空中時間/BUSY 影響）
 }
 
@@ -471,9 +479,19 @@ def load_relay_flight_csv(csv_path: str) -> list:
                     "gps_fix": int(row["gps_fix"]),
                     "bat_mv": int(row["bat_mv"]),
                     "peer_fsm": int(row["peer_fsm"]),
-                    "peer_h_m": int(row["peer_h_cm"]) / 100.0,
-                    "peer_v_ms": int(row["peer_v_cms"]) / 100.0,
-                    "peer_loss_pmil": int(row["peer_loss_pmil"]),
+                    # ★2026-07-30：下鏈的對端摘要只剩 VF（EKF 高度/速度、丟包率已從封包移除）
+                    "peer_vf_h_m": int(row["peer_vf_h_cm"]) / 100.0,
+                    "peer_vf_v_ms": int(row["peer_vf_v_cms"]) / 100.0,
+                    # ★飛行滾動極值：火箭端全速率追蹤、每包重複攜帶（見 telemetry.h）。
+                    # 下鏈只有 ~2Hz，抓不到真正的頂點與峰值 G，這三個才是可信數字。
+                    # 用 .get 容忍舊 CSV——直接 row["max_alt_m"] 會在舊檔上 KeyError，
+                    # 而外層 except 是 continue，等於「整份舊紀錄一列都讀不進來」。
+                    "max_alt_m": int(row.get("max_alt_m") or 0),
+                    "max_vel_ms": int(row.get("max_vel_ms") or 0),
+                    "max_acc_g": int(row.get("max_acc_cg") or 0) / 100.0,
+                    # 開傘高度；-32768 = 未開傘哨兵（telemetry.h TELEM_DEPLOY_ALT_NA）
+                    "drogue_alt_m": int(row.get("drogue_alt_m") or -32768),
+                    "main_alt_m": int(row.get("main_alt_m") or -32768),
                     "gs_lat": int(row["gs_lat_1e6"]) / 1e6,
                     "gs_lon": int(row["gs_lon_1e6"]) / 1e6,
                     "gs_alt_m": int(row["gs_alt_m"]),
@@ -530,16 +548,31 @@ def generate_relay_flight_chart(csv_path: str, output_dir="."):
     ax1.plot(times, [e["ekf_alt_m"] for e in events], label="Primary EKF Alt", color="#00e676", linewidth=1.8)
     ax1.plot(times, [e["baro_alt_m"] for e in events], label="Primary Baro Alt", color="#ff9f43",
              linestyle="--", linewidth=1.1, alpha=0.8)
-    ax1.plot(times, [e["peer_h_m"] for e in events], label="Backup Alt (peer)", color="#38bdf8",
+    ax1.plot(times, [e["peer_vf_h_m"] for e in events], label="Backup VF Alt (peer)", color="#38bdf8",
              linestyle=":", linewidth=1.3)
+    # 火箭端全速率追蹤的最大高度（階梯線）：下鏈 ~2Hz 的取樣點永遠低估真正頂點，
+    # 這條線的最終高度才是可信的 apogee。與上面的取樣曲線同屏對照。
+    if any(e["max_alt_m"] for e in events):
+        ax1.plot(times, [e["max_alt_m"] for e in events], label="MAX Alt (rocket-tracked)",
+                 color="#e879f9", linewidth=1.4, drawstyle="steps-post", alpha=0.9)
+    # 實際開傘高度（火箭端在開傘那一刻就地鎖存，非事後從稀疏取樣反推）
+    for key, colour, lbl in (("drogue_alt_m", "#f43f5e", "Drogue deploy"),
+                             ("main_alt_m", "#22d3ee", "Main deploy")):
+        vals = [e[key] for e in events if e[key] != -32768]
+        if vals:
+            ax1.axhline(vals[-1], color=colour, linewidth=1.0, linestyle="-.",
+                        alpha=0.85, label=f"{lbl} @ {vals[-1]}m")
     ax1.set_title("Altitude (as relayed to ground)", color="#00e676")
     ax1.set_xlabel("Time (s)"); ax1.set_ylabel("Altitude (m)")
     ax1.grid(True, linestyle=":", alpha=0.25); ax1.legend(fontsize=8, facecolor="#161616", labelcolor="#ddd")
 
     ax2 = axs[0, 1]
     ax2.plot(times, [e["ekf_vel_ms"] for e in events], label="Primary Vz", color="#38ef7d", linewidth=1.6)
-    ax2.plot(times, [e["peer_v_ms"] for e in events], label="Backup Vz (peer)", color="#fbbf24",
+    ax2.plot(times, [e["peer_vf_v_ms"] for e in events], label="Backup VF Vz (peer)", color="#fbbf24",
              linestyle=":", linewidth=1.3)
+    if any(e["max_vel_ms"] for e in events):
+        ax2.plot(times, [e["max_vel_ms"] for e in events], label="MAX Vz (rocket-tracked)",
+                 color="#e879f9", linewidth=1.4, drawstyle="steps-post", alpha=0.9)
     ax2.axhline(0, color="#888", linewidth=0.7, linestyle=":")
     ax2.set_title("Vertical Velocity", color="#38ef7d")
     ax2.set_xlabel("Time (s)"); ax2.set_ylabel("Velocity (m/s)")
@@ -1272,8 +1305,8 @@ def generate_selftest_events(engine: GsAnalyzerEngine):
     seq，920 幾乎每個 tick 都發；433 每個 tick 都嘗試呼叫 LoRaE22_Send()(LORA433_TX_EVERY=1)，
     但 AUX busy（上一包空中時間還沒跑完，見 LORA433_AIRTIME_S 估計值）時會直接跳過不等待，
     所以兩次成功發射之間最少要隔 LORA433_MIN_TX_SPACING_TICKS 個 tick；此外每
-    UPLINK_LISTEN_PERIOD_TICKS(=30) 個 tick 會有連續 UPLINK_LISTEN_HOLD_TICKS(=8) 個
-    tick 完全不發、留給上行接收窗。這兩個規律間隙都是設計行為、不是遺失——433 的 gap
+    UPLINK_LISTEN_PERIOD_TICKS(=30) 個 tick 會有連續 UPLINK_LISTEN_HOLD_TICKS(=10) 個
+    tick 完全不發、留給上行接收窗（守衛帶 600ms + 窗 400ms，見常數宣告處）。這兩個規律間隙都是設計行為、不是遺失——433 的 gap
     門檻就是照這個實際排程換算出的名目速率放寬的，selftest 資料若不照這個排程生成，
     就測不出 gap 判定的門檻有沒有設歪。"""
     import random

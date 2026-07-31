@@ -157,9 +157,14 @@ def parse_flash_csv(csv_filepath):
 
     flights = {}
     total_lines = parsed = skipped = 0
+    file_size = os.path.getsize(csv_filepath)
+    bytes_read = 0
+    last_pct = -1
+
     with open(csv_filepath, 'r', encoding='utf-8', errors='ignore') as f:
-        for line in f:
-            line = line.strip()
+        for line_raw in f:
+            bytes_read += len(line_raw.encode('utf-8', errors='ignore'))
+            line = line_raw.strip()
             if not line or line.startswith('---') or line.startswith('[FLASH]'):
                 continue
             if line.startswith('addr,') or line.startswith('addr '):
@@ -168,6 +173,14 @@ def parse_flash_csv(csv_filepath):
             if len(parts) < 25:
                 continue
             total_lines += 1
+
+            if file_size > 0:
+                pct = int((bytes_read / file_size) * 100)
+                if pct != last_pct and (pct % 5 == 0 or pct == 100):
+                    last_pct = pct
+                    sys.stdout.write(f"\r[PROGRESS] ⏳ 解析 Flash CSV 進度: {pct:3d}% ({bytes_read / (1024*1024):.1f} / {file_size / (1024*1024):.1f} MB)")
+                    sys.stdout.flush()
+
             try:
                 flight_id = int(parts[1])
                 tick_ms   = int(parts[3])
@@ -227,6 +240,10 @@ def parse_flash_csv(csv_filepath):
             except (ValueError, IndexError):
                 skipped += 1
                 continue
+
+    if file_size > 0:
+        sys.stdout.write("\r[PROGRESS] ✅ Flash CSV 解析完成 (100%)\n")
+        sys.stdout.flush()
 
     # 每段飛行依 tick 排序（滾動 ring 可能亂序）
     for fid in flights:
@@ -893,6 +910,13 @@ def main():
                     help="輸出目錄（預設：若輸入檔位於 raw/ 底下則自動輸出到同層 processed/，否則為當前目錄）")
     ap.add_argument("--sysflags", help="sysflags_sector0.hex 路徑（選配；未指定時自動偵測同目錄）")
     args = ap.parse_args()
+
+    if not args.input_csv:
+        try:
+            from file_selector import select_input_file
+            args.input_csv = select_input_file(title="請選擇 Flash CSV 數據檔案", extensions=[".csv"])
+        except Exception as e:
+            print(f"[WARNING] 無法啟動互動式檔案選擇器: {e}")
 
     if not args.input_csv:
         ap.print_help()

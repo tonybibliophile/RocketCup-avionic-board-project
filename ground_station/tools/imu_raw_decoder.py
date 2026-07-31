@@ -81,15 +81,20 @@ def physical_accel_body(raw_xyz):
 
 
 def scan_records(buf: bytes):
-    """逐 128B 掃描：magic+CRC 過才算一筆，失敗則逐 byte 滑動重新同步（比照
-    telemetry_decoder.py 的 scan_stream 邏輯，但這裡是固定長度網格，優先嘗試
-    對齊網格位置，失敗才逐 byte 掃）。回傳 (records, ok_count, resync_count, crc_err_count)。
-    """
+    """逐 128B 掃描：magic+CRC 過才算一筆，失敗則逐 byte 滑動重新同步。"""
     records = []
     ok = resync = crc_err = 0
     i = 0
     n = len(buf)
+    last_pct = -1
     while i + RECORD_SIZE <= n:
+        if n > 0:
+            pct = int((i / n) * 100)
+            if pct != last_pct and (pct % 5 == 0 or pct == 100):
+                last_pct = pct
+                sys.stdout.write(f"\r[PROGRESS] ⏳ 掃描 IMU 二進位檔進度: {pct:3d}% ({i / (1024*1024):.1f} / {n / (1024*1024):.1f} MB)")
+                sys.stdout.flush()
+
         chunk = buf[i:i + RECORD_SIZE]
         if chunk[0] == MAGIC0 and chunk[1] == MAGIC1:
             crc_calc = crc16_ccitt_false(chunk[:RECORD_SIZE - 2])
@@ -102,15 +107,15 @@ def scan_records(buf: bytes):
             crc_err += 1
         resync += 1
         i += 1  # 網格未對齊或 CRC 錯：逐 byte 滑動找下一個 'RI'
+
+    if n > 0:
+        sys.stdout.write("\r[PROGRESS] ✅ 二進位檔掃描解碼完成 (100%)\n")
+        sys.stdout.flush()
     return records, ok, resync, crc_err
 
 
 def reconstruct_time_s(records):
-    """用 gyro_dt_q 逐顆累加重建絕對時間（秒），wrap-safe——不對 t_cyc 本身做
-    'unwrap'，因為每筆 delta 本身就是 firmware 端以 uint32 減法算出、對 2^32
-    回繞安全的正向經過 cycle 數（同 ekf.c EKF_Task 的 dt 計算邏輯）。
-    回傳與 records 等長的巢狀 list：每筆 record 對應 10 個陀螺樣本的累積時間點。
-    """
+    """用 gyro_dt_q 逐顆累加重建絕對時間（秒），wrap-safe。"""
     t_s = 0.0
     out = []
     first = True
@@ -118,8 +123,6 @@ def reconstruct_time_s(records):
         per_sample = []
         for dq in rec["gyro_dt_q"]:
             if first:
-                # 第一筆記錄的第一個樣本無上一顆可比較（見 imu_raw_log.h 欄位註解），
-                # 用名目 1000Hz 間隔頂替，不影響後續累積（僅這一點的絕對時間基準有 ~1ms 誤差）。
                 dt_s = 1.0 / 1000.0
                 first = False
             else:
@@ -133,7 +136,16 @@ def reconstruct_time_s(records):
 def to_csv_rows(records):
     times = reconstruct_time_s(records)
     rows = ["t_s,gx_dps,gy_dps,gz_dps,ax_g,ay_g,az_g,has_new_baro,baro_press_pa,fsm_state,seq"]
-    for rec, t_list in zip(records, times):
+    total = len(records)
+    last_pct = -1
+    for idx, (rec, t_list) in enumerate(zip(records, times)):
+        if total > 0:
+            pct = int((idx / total) * 100)
+            if pct != last_pct and (pct % 10 == 0 or pct == 100):
+                last_pct = pct
+                sys.stdout.write(f"\r[PROGRESS] ⏳ 轉換 CSV 數據進度: {pct:3d}% ({idx} / {total} 筆)")
+                sys.stdout.flush()
+
         for gi in range(10):
             t_s = t_list[gi]
             gx, gy, gz = physical_gyro_body(rec["gyro_raw"][gi])
@@ -142,6 +154,10 @@ def to_csv_rows(records):
             has_baro = 1 if (gi == 0 and rec["baro_press_pa"] != 0) else 0
             rows.append(f"{t_s:.6f},{gx:.4f},{gy:.4f},{gz:.4f},{ax:.5f},{ay:.5f},{az:.5f},"
                         f"{has_baro},{rec['baro_press_pa']},{rec['fsm_state']},{rec['seq']}")
+
+    if total > 0:
+        sys.stdout.write("\r[PROGRESS] ✅ CSV 數據轉換完成 (100%)\n")
+        sys.stdout.flush()
     return rows
 
 
@@ -203,6 +219,13 @@ def main():
         assert ok == 1 and resync == 0 and crc_err == 0
         print("SELFTEST PASS")
         return
+
+    if not args.file:
+        try:
+            from file_selector import select_input_file
+            args.file = select_input_file(title="請選擇 IMU 原始二進位檔 (.BIN)", extensions=[".bin"])
+        except Exception as e:
+            print(f"[WARNING] 無法啟動互動式檔案選擇器: {e}")
 
     if not args.file:
         ap.error("需要 --file（或使用 --selftest）")

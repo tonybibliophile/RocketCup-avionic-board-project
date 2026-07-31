@@ -5,13 +5,16 @@ gui_theme — RocketCom 地面站 GUI 共用視覺語彙與小工具庫。
 
 本模組把 gui_monitor.py（旗艦儀表板，4674 行）裡散落的硬編碼配色／字體／StyledButton／
 卡片與徽章工廠函式抽出來，供 ground_gui.py 與 GUI_avionic.py 匯入，讓三支 GUI 呈現一致的
-深色主題與版面骨架。gui_monitor.py 本身不匯入本模組（其工作區有大量未 commit 的變更，
+深色主題與版面骨架。gui_monitor.py 原則上不匯入本模組（其工作區有大量未 commit 的變更，
 故意不去動它），但抽出的每一段都是從它「原樣搬」出來的，沒有另外發明新配色。
+例外：PadRefTracker 三支 GUI 共用（重零凍結門檻這種規則複製兩份遲早會走鐘），
+gui_monitor.py 只 import 這一個名字。
 
 只依賴 stdlib + tkinter + matplotlib（numpy 是 matplotlib 的既有依賴，四元數換算借用它）。
 """
 
 import queue
+import re
 import signal
 import threading
 import time
@@ -117,11 +120,25 @@ FLAG_NAMES = [
     (0x40, "FAILSAFE"), (0x80, "熱啟動"),
 ]
 PEER_LINK_EVER, PEER_LINK_FRESH, PEER_LINK_LOST, PEER_LINK_DESYNC = 0x01, 0x02, 0x04, 0x08
-ARB_SHORT = {"NONE": "IDLE", "INTENT": "WANT", "DRIVING": "SWEEP", "DONE": "DONE"}
+# ServoArb_MsgName() 字串 → 頂部鏈路列短標籤（★互斥握手已取消，見下方 BENCH_ARB_NAMES）
+ARB_SHORT = {
+    "NONE": "IDLE", "BENCH_START": "BENCH", "BENCH_PRI_FIRE": "P-FIRE",
+    "BENCH_SEC_FIRE": "S-FIRE", "BENCH_MAIN_HIGH": "CO-HI", "MAIN_HIGH": "HIGH",
+    "DONE": "DONE", "LEGACY_DRIVING": "OLD-PWM",
+}
 
-# peer_bench_arb（telemetry.h:121-124，SERVO_ARB_MSG_*）：0=NONE 1=INTENT 2=DRIVING 3=DONE
+# LinkPacket.main_arb（韌體 servo_arb.h 的 SERVO_ARB_MSG_*）→ 顯示字串。
+# ★主傘已取消 PWM 舵機與互斥握手：改為兩板同時把 PD14 純 GPIO 拉高 1.5s。
+#   1 由舊 INTENT 改作「BENCH 序列開始宣告」；2(DRIVING) 隨 PWM 一起廢除，僅保留以看舊紀錄。
 BENCH_ARB_NAMES = {
-    0: "NONE", 1: "INTENT (廣播中)", 2: "DRIVING (驅動中)", 3: "DONE (完成)",
+    0: "NONE",
+    1: "BENCH_START (桌測開始)",
+    2: "LEGACY_DRIVING (舊版PWM，已廢除)",
+    3: "DONE (完成)",
+    4: "BENCH_PRI_FIRE (主板引傘通電)",
+    5: "BENCH_SEC_FIRE (副板引傘通電)",
+    6: "BENCH_MAIN_HIGH (雙板主傘共開)",
+    7: "MAIN_HIGH (主傘PD14拉高中)",
 }
 
 LINK_COLORS = {"433": CYAN, "920": "#c77dff"}
@@ -398,6 +415,9 @@ TERMINAL_TAGS = {
     "lora": dict(foreground="#e07bfb"),
     "link": dict(foreground=GREEN),
     "ack": dict(foreground=CYAN_HI, background="#00303a"),
+    # 電梯測試 profile 警告（見本檔下方 spam_elevator_console_warning）。放進共用表，
+    # 凡是用 config_console_tags(TERMINAL_TAGS) 的 GUI 都自動拿到，不必各自註冊。
+    "elevator_warn": dict(foreground="#000000", background=RED, font=F_MONO_BOLD),
 }
 EVENT_TAGS = {
     "cmd": dict(foreground=CYAN),
@@ -423,6 +443,75 @@ def install_signal_handlers(root, on_close):
     signal.signal(signal.SIGTERM, lambda *_: root.after(0, on_close))
 
 
+# ==================== 電梯測試 profile 醒目警示（三支 GUI 共用） ====================
+# 只要主/副任一板仍以 board_config.h FLIGHT_PROFILE_ELEVATOR=1 編譯（正式版已改回 0，
+# 這代表忘記重燒/換錯板），就必須讓操作員在任何一支 GUI 上都不可能漏看——閃爍紅/黃
+# 頂欄橫幅 + 主控台每收一筆就洗版警告。三支 GUI（gui_monitor/GUI_avionic/ground_gui）
+# 資料來源不同（直連 USB 文字行 vs. 經地面站板 LoRa 中繼的 [GS_PKT] 行），但視覺與
+# log 語彙統一由這裡出，不重新發明。
+ELEVATOR_BANNER_TEXT = "🚨 ELEVATOR TEST PROFILE ACTIVE — 電梯測試 profile 尚未切回正式版，禁止真實發射 DO NOT LAUNCH 🚨"
+ELEVATOR_WARN_TAG_CFG = dict(foreground="#000000", background=RED, font=F_MONO_BOLD)
+
+
+def make_elevator_banner(parent):
+    """建立橫幅（預設不 pack，由 show/hide 控制顯示）。呼叫端在最上層容器建立後立刻呼叫，
+    之後每收到一筆遙測/狀態行就呼叫 update_elevator_banner() 依偵測結果顯示/隱藏。"""
+    banner = tk.Label(parent, text=ELEVATOR_BANNER_TEXT, font=F_HDR, fg="#000000", bg=RED,
+                       anchor="center", pady=6, cursor="")
+    banner._blinking = False
+    banner._blink_on = False
+    return banner
+
+
+def _blink_elevator_banner(root, banner):
+    # 用 winfo_manager()（"pack"／""）判斷是否仍掛在版面上，不可用 winfo_ismapped()：
+    # 視窗被 withdraw/iconify、或 pack 後尚未跑到下一輪 idle 時 ismapped 都是 False，
+    # 會讓閃爍誤停、隱藏誤判成「已經隱藏」而留下過期的警示橫幅。
+    if not banner.winfo_manager():
+        banner._blinking = False
+        return
+    banner._blink_on = not banner._blink_on
+    banner.config(bg=YELLOW if banner._blink_on else RED,
+                   fg="#000000")
+    root.after(500, lambda: _blink_elevator_banner(root, banner))
+
+
+def update_elevator_banner(root, banner, active, who_text=""):
+    """active=True 時顯示（並啟動閃爍，若尚未啟動）、False 時隱藏並停止閃爍。
+    who_text 例如 "本板"/"對端(副板)"/"本板+對端(副板)"，併入橫幅文字方便辨識是哪一板。"""
+    if active:
+        text = ELEVATOR_BANNER_TEXT + (f"\n（{who_text}）" if who_text else "")
+        banner.config(text=text)
+        if not banner.winfo_manager():   # 見 _blink_elevator_banner 註解：不可用 winfo_ismapped()
+            sib = _first_sibling(banner)
+            if sib is not None:
+                banner.pack(side=tk.TOP, fill=tk.X, before=sib)
+            else:
+                banner.pack(side=tk.TOP, fill=tk.X)
+        if not banner._blinking:
+            banner._blinking = True
+            _blink_elevator_banner(root, banner)
+    else:
+        if banner.winfo_manager():
+            banner.pack_forget()
+
+
+def _first_sibling(widget):
+    """回傳 widget 所在容器內目前排在最前面的其他子元件，供 pack(before=...) 把橫幅擠到最上方；
+    容器目前空的（banner 尚未 pack 過）則回傳 None。"""
+    siblings = [w for w in widget.master.pack_slaves() if w is not widget]
+    return siblings[0] if siblings else None
+
+
+def spam_elevator_console_warning(console_widget, who_text="", tag="elevator_warn"):
+    """在主控台洗一行醒目警告（呼叫端需先對 console_widget 執行一次
+    `console_widget.tag_config("elevator_warn", **gui_theme.ELEVATOR_WARN_TAG_CFG)`）。
+    刻意每收一筆觸發就洗一次（而非只在邊緣觸發時提示一次）——「瘋狂提示」，避免操作員
+    捲動略過就忘記。"""
+    msg = f"🚨🚨🚨 [ELEVATOR TEST WARNING] {who_text or '仍為電梯測試 profile'} — 嚴禁真實發射 DO NOT LAUNCH FOR REAL FLIGHT 🚨🚨🚨\n"
+    append_console(console_widget, msg, tag)
+
+
 # ==================== 指令傳送（逐字慢送，抽自 gui_monitor.py:2441-2491） ====================
 class CommandSender:
     """板端命令台是 20ms 低優先權輪詢、1 byte 緩衝，不能整串 burst 送——必須逐字慢送
@@ -442,8 +531,11 @@ class CommandSender:
         self._tx_queue = queue.Queue()
         self._tx_thread = None
 
-    def send(self, cmd_str, parent=None):
-        if self._lock_var is not None and not self._lock_var.get():
+    def send(self, cmd_str, parent=None, bypass_lock=False):
+        """bypass_lock=True：跳過 LNA 安全鎖，僅供呼叫端明確知道這個指令不會讓 LoRa
+        模組真的發射 RF（本地查詢/本地參數/本地 Flash 操作）時使用——呼叫端自行負責
+        判斷，這裡不做字串內容檢查。預設 False（沿用既有「未解鎖一律擋下」行為）。"""
+        if not bypass_lock and self._lock_var is not None and not self._lock_var.get():
             if self._lock_warning:
                 messagebox.showwarning(*self._lock_warning, parent=parent)
             return False
@@ -518,3 +610,64 @@ class DeployLatch:
                 f"  對端[副:{mark(d['peer_drogue'])} 主:{mark(d['peer_main'])}]")
         color = "#ff8080" if any(d.values()) else TXT_MUTED
         return text, color
+
+
+class PadRefTracker:
+    """發射台氣壓零點（pad_ref）追蹤器 —— 「航電認為自己相對起點多高」的分母。
+
+    韌體側（main.c FSM_Update()）：`state <= STATE_PAD` 期間每 30s 用**單筆**氣壓快照
+    重零，之後 `baro_alt_rel = baro_alt - pad_ref` 就是 FSM 起飛／頂點／開傘判斷實際吃的
+    高度。注意重零停止的時機是 **ARM（STATE_PAD_ARMED=2 > STATE_PAD=1）**，不是韌體註解
+    寫的「起飛後」——ARM 完就凍結了。
+
+    唯一來源是 USB 文字行 `[FSM] pad_ref locked: <cm> cm (was first|refresh)`。LoRa 下鏈
+    的 `baro_alt_cm` 送的是**絕對海拔**（telemetry.c 填 baro_data.altitude），封包裡沒有
+    pad_ref 也沒有相對值，所以純走 LoRa 的地面站 GUI 用不到本追蹤器。
+
+    GUI 端讀不到 fsm_state 時，用「距上次重零超過 FROZEN_AFTER_S」反推已凍結（正常重零
+    週期 30s，留 10s 餘裕吸收排程抖動與掉行）。
+    """
+
+    RE_LOCK = re.compile(r"\[FSM\]\s*pad_ref locked:\s*(-?\d+)\s*cm(?:\s*\(was\s+(\w+)\))?")
+    FROZEN_AFTER_S = 40.0
+
+    def __init__(self):
+        self.pad_ref_m = None    # 最近一次鎖定的零點（m，絕對海拔尺度）
+        self.locked_at = None    # time.monotonic()，供計算「幾秒前重零」
+        self.lock_count = 0      # 已看到幾次重零（含首次）
+
+    def feed(self, line):
+        """餵一行終端輸出；命中 pad_ref 鎖定行時更新狀態並回傳 True。"""
+        m = self.RE_LOCK.search(line)
+        if not m:
+            return False
+        self.pad_ref_m = int(m.group(1)) / 100.0
+        self.locked_at = time.monotonic()
+        self.lock_count += 1
+        return True
+
+    @property
+    def valid(self):
+        return self.pad_ref_m is not None
+
+    @property
+    def age_s(self):
+        return None if self.locked_at is None else time.monotonic() - self.locked_at
+
+    @property
+    def frozen(self):
+        """已停止 30s 重零（多半代表已 ARM）。零點未知時不算凍結。"""
+        age = self.age_s
+        return age is not None and age > self.FROZEN_AFTER_S
+
+    def rel(self, abs_alt_m):
+        """絕對氣壓高度 → 相對發射台高度；零點還沒建立時回 None（呼叫端別畫）。"""
+        return None if self.pad_ref_m is None else abs_alt_m - self.pad_ref_m
+
+    def label_text(self):
+        """卡片文字 + 顏色：`47.6 m ｜12s` / `47.6 m ｜已凍結` / `-- m`。"""
+        if not self.valid:
+            return "-- m", TXT_MUTED
+        if self.frozen:
+            return f"{self.pad_ref_m:.1f} m ｜已凍結", AMBER
+        return f"{self.pad_ref_m:.1f} m ｜{self.age_s:.0f}s", GREEN
