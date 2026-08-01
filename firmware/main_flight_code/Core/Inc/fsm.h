@@ -57,13 +57,17 @@ typedef enum {
                                           // 分辨「手震」與「馬達點火」，需靠持續時間）。
                                           // h_est/baro_alt_rel 兩條路徑本身即為已累積位移量，
                                           // 不需要額外防手震。
-/* ⚠ FSM_LIFTOFF_ALT_M（估計器高度起飛門檻）仍兩 profile 共用 10.0f。
- * 舊註解聲稱「電梯 profile 已停用 FEATURE_FORCE_BARO_ONLY」，但 board_config.h 目前
- * 該巨集仍綁定 FLIGHT_PROFILE_ELEVATOR（見該檔），此變更從未真的完成/驗證——電梯
- * profile 目前仍強制 est_healthy=0，本門檻在電梯 profile 走不到。10m 對電梯起飛
- * 偵測是否合理待評估（同類問題已修 TARGET_MAIN_ALTITUDE，這裡尚未訂出電梯專用值，
- * 暫維持共用，待電梯實測後再決定是否分組）。 */
-#define FSM_LIFTOFF_ALT_M        10.0f   // 起飛觸發：估計器（VF，或 EKF）高度門檻 (m)（恢復原飛行值）
+/* FSM_LIFTOFF_ALT_M（估計器高度起飛門檻）已改依 profile 分組，見下方 Profile 隔離區塊。
+ * ★2026-08-02：飛行 profile 10m→30m（使用者決策，與 FSM_LIFTOFF_BARO_ALT_M 同步）。
+ * 理由：FEATURE_FORCE_BARO_ONLY 已固定 0（board_config.h），h_est 現行由 VF 輸出、而 VF
+ * 由 baro 帶動，故這條路徑的實質物理量與 baro 路徑相同——舊值 10m 比 baro 路徑的 20m
+ * 更早成立，等於整組起飛偵測的真實門檻只有 10m。而當時 pad_ref 在 ARM 當下即凍結，
+ * 武裝後任何垂直搬運/氣壓漂移都直接累加到這兩條路徑上（★同日已一併修正：main.c 的
+ * pad_ref 改為每 15s 重零且延伸到 PAD_ARMED，見該區塊），10m（≈1.2 hPa）過於容易在
+ * 台上組裝/搬運期間被吃掉。兩條一起提到 30m
+ * 後，需要 ~3.6 hPa 的等效變化才會誤觸發，而真實彈道通過 30m 僅需 ~0.5s（遠早於任何
+ * 開傘決策，且 a_z 路徑本就會先行觸發），對正常飛行的偵測時機無實質影響。
+ * 電梯 profile 維持 10m（井道僅 ~30m，30m 門檻等同停用該路徑）。 */
 #define FSM_APOGEE_MIN_FLIGHT_MS 3000U   // 頂點判定：起飛時間鎖 (ms)
 #define FSM_APOGEE_CONSEC_N      5U      // 頂點判定：連續成立週期數（5×10ms=50ms 防雜訊）
 #define FSM_APOGEE_VFALL_MPS     0.2f    // 頂點備用判定：速度過零門檻 (v_est < -0.2)
@@ -97,7 +101,9 @@ typedef enum {
  * baro 降級鏈，見 board_config.h 的 FEATURE_FORCE_BARO_ONLY 推導）。 */
 #if FLIGHT_PROFILE_ELEVATOR
 
-#define FSM_LIFTOFF_BARO_ALT_M   5.0f     // 電梯井道淺（頂樓僅 30m），10m/20m 飛行門檻不會越過（原 3.0m，使用者改為 5.0m）
+#define FSM_LIFTOFF_BARO_ALT_M   5.0f     // 電梯井道淺（頂樓僅 30m），30m 飛行門檻不會越過（原 3.0m，使用者改為 5.0m）
+#define FSM_LIFTOFF_ALT_M        10.0f    // 電梯：估計器高度起飛門檻 (m)。維持原值——井道僅 ~30m，
+                                          // 若跟著飛行 profile 提到 30m 則這條路徑在電梯剖面等同停用。
 #define FSM_BURNOUT_ACCEL_G      2.0f     // 電梯全程恆 1g，門檻恆滿足 → 實質由 FSM_BURNOUT_MIN_MS 時間制燒完
 #define FSM_BARO_APOGEE_DROP_M   2.0f     // 頂樓僅 30m，10m 飛行門檻在電梯剖面不會回落
 #define FSM_BARO_APOGEE_CONSEC   40U      // 400ms：電梯氣壓瞬變（開關門/風壓）比火箭噪聲更慢，需更長防雜訊窗
@@ -123,7 +129,13 @@ typedef enum {
 
 #else /* !FLIGHT_PROFILE_ELEVATOR：飛行 profile（預設，台灣盃 2026 3.16km 彈道） */
 
-#define FSM_LIFTOFF_BARO_ALT_M   20.0f    // 起飛第三冗餘：baro 相對高度門檻 (m)
+#define FSM_LIFTOFF_BARO_ALT_M   30.0f    // 起飛第三冗餘：baro 相對高度門檻 (m)。
+                                          // ★2026-08-02：20m→30m（使用者決策，與 FSM_LIFTOFF_ALT_M 同步提高）。
+                                          // 目的為拉開「武裝後搬運/氣壓漂移」與起飛判定的距離，理由詳見
+                                          // 上方 FSM_LIFTOFF_ALT_M 註解區塊。
+#define FSM_LIFTOFF_ALT_M        30.0f    // 起飛觸發：估計器（VF，或 EKF）高度門檻 (m)。
+                                          // ★2026-08-02：10m→30m，與上方 baro 門檻同值——現行 h_est 來自 VF、
+                                          // 由 baro 帶動，兩條路徑物理量相同，門檻不同只會讓低的那條決定實際靈敏度。
 #define FSM_BURNOUT_ACCEL_G      0.5f     // 馬達燒完：加速度低於此值 (g)
 #define FSM_BARO_APOGEE_DROP_M   10.0f    // baro 原始高度自峰值回落門檻 (m)（≈BMP388 噪聲 16σ）
 #define FSM_BARO_APOGEE_CONSEC   20U      // 連續 20 週期（200ms）成立（防雜訊）

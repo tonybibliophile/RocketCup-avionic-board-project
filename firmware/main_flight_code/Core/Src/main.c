@@ -2174,18 +2174,35 @@ static void FSM_Update(void)
     uint32_t now = HAL_GetTick();
 
     /* === P0-B：baro 發射台基準（pad_ref） ===
-     * PAD/INIT 期每 30s 重零（抗氣象漂移），起飛後凍結；
-     * 首筆有效氣壓樣本（pressure > 1000 Pa）才建立基準，避免開機初期髒值。 */
+     * INIT/PAD/PAD_ARMED 期每 PAD_REF_REFRESH_MS 重零（抗氣象漂移），起飛後凍結；
+     * 首筆有效氣壓樣本（pressure > 1000 Pa）才建立基準，避免開機初期髒值。
+     *
+     * ★2026-08-02（使用者決策）：週期 30s→15s，且重零視窗自 STATE_PAD 延伸到
+     * STATE_PAD_ARMED。原本 ARM 當下基準即凍結，武裝到點火之間的所有氣壓漂移與垂直
+     * 搬運都直接累加到 baro_alt_rel 上，而那正是起飛判定的兩條路徑（baro 直接吃、
+     * h_est 經 VF 也吃同一個相對值，見下方 vf_update_baro）——台上等待時間愈長、
+     * 誤判起飛的餘裕愈小。延伸後武裝期的基準誤差被壓在「15s 內的漂移」量級。
+     *
+     * 為何不必擔心「真起飛時被重零吃掉」：任何真實上升穿越起飛門檻（飛行 30m／
+     * 電梯 5m）所需時間都遠短於 15s 重零週期，最壞情況只是某次重零剛好落在上升途中，
+     * 之後幾十毫秒內就會再度越過門檻；且 a_z 路徑（3g/200ms）本就會更早觸發。
+     * 起飛一旦成立即離開 PAD_ARMED，基準隨即凍結，飛行全程不再變動。
+     * VF 那側同理安全：重零造成的 baro 輸入階躍量級為 15s 的漂移量（≪ VF_GATE_MIN_M
+     * 10m），不會被創新值閘擋掉；即使被擋，連續 10 週期(100ms)後 VF 會自動重對齊，
+     * 仍遠短於 est_healthy 的 300ms 判定窗。 */
+#define PAD_REF_REFRESH_MS  15000U
     static float    pad_ref       = 0.0f;
     static uint8_t  pad_ref_valid = 0U;
     static uint32_t pad_ref_tick  = 0U;
-    if (g_fsm_ctx.state <= STATE_PAD && baro_data.pressure > 1000.0f) {
-        if (!pad_ref_valid || (now - pad_ref_tick) >= 30000U) {
+    if (g_fsm_ctx.state <= STATE_PAD_ARMED && baro_data.pressure > 1000.0f) {
+        if (!pad_ref_valid || (now - pad_ref_tick) >= PAD_REF_REFRESH_MS) {
             /* 診斷：單筆快照鎖定 pad_ref，若這筆剛好是瞬態壞值（例如握持板子
-             * 造成氣壓瞬變），之後全部 baro_alt_rel 會持續偏移直到下次 30s
-             * 重零——印出來才能確認是否為 LIFTOFF 誤觸發的根因。 */
-            printf("[FSM] pad_ref locked: %d cm (was %s)\r\n",
-                   (int)(baro_data.altitude * 100.0f), pad_ref_valid ? "refresh" : "first");
+             * 造成氣壓瞬變），之後全部 baro_alt_rel 會持續偏移直到下次重零——
+             * 印出來才能確認是否為 LIFTOFF 誤觸發的根因。一併印出當下狀態：
+             * 武裝期的重零是本次新增行為，log 要看得出來它有沒有在跑。 */
+            printf("[FSM] pad_ref locked: %d cm (was %s, state=%s)\r\n",
+                   (int)(baro_data.altitude * 100.0f), pad_ref_valid ? "refresh" : "first",
+                   link_fsm_state_name((uint8_t)g_fsm_ctx.state));
             pad_ref       = baro_data.altitude;
             pad_ref_valid = 1U;
             pad_ref_tick  = now;
@@ -2611,7 +2628,7 @@ static void FSM_Update(void)
             /* 縮放整數輸出（nano.specs 無 %f，遵 gs_log.c 黃金法則）。
              * braw_cm：pad_ref 相對地面高度原始值（未經 VF 卡爾曼融合），
              * 直接反映 in.baro_alt_rel = baro_data.altitude - pad_ref（見本函式開頭
-             * pad_ref 每 30s 於 PAD 重零區塊）——地面站 bench 圖表要看「地面 0 點
+             * pad_ref 每 15s 於 PAD/PAD_ARMED 重零區塊）——地面站 bench 圖表要看「地面 0 點
              * 有沒有持續校正」需要這條未濾波的原始線，VF/EKF 都已經是融合後結果。 */
             printf("[VF] h_cm=%d v_cms=%d | EKF h_cm=%d v_cms=%d | braw_cm=%d\r\n",
                    (int)(vf_h(&s_vf) * 100.0f), (int)(vf_v(&s_vf) * 100.0f),
@@ -3110,12 +3127,33 @@ void SPI3_Bus_Unlock(void)
  * 但實際上行完全不通）。920 完全不受影響、維持全速率。
  * ⚠ 改動 LORA_TELEM_PERIOD_MS / LORA433_TX_EVERY / 封包大小 / 空中速率時，必須重算
  *   最大空中時間並確認 GUARD 仍然大於它，否則守衛帶失效、退回這次的失敗模式。 */
-#define UPLINK_LISTEN_PERIOD_MS  3000U  /* 每 N ms 開一次上行接收窗 */
+#define UPLINK_LISTEN_PERIOD_MS  3000U  /* 每 N ms 開一次上行接收窗（已 ARM／飛行中） */
 #define UPLINK_LISTEN_HOLD_MS     400U  /* 窗長（保證靜默的下限，見上方 GUARD 說明） */
 /* 窗前發射守衛帶：須 > 一包下行的最大空中時間。
  * 目前 TELEM_PACKET_SIZE=99B @2.4k：99*8/2400 = 330ms 純資料，加 LoRa 前導/表頭/CRC
  * 實測上限約 500ms → 取 600ms 留餘裕。 */
 #define UPLINK_TX_GUARD_MS        600U
+/* === ★2026-08-02：地面待命（未 ARM）加大接收窗 ================================
+ * 症狀：即使已有守衛帶，地面站 arm 仍打不進來。上面那組參數的「保證靜默」是
+ *     GUARD - 最大空中時間 + HOLD = 600 - 500 + 400 = 500ms／每 3000ms（17%），
+ *   而一筆上行幀（7B，含前導/表頭）空中約 80~150ms，且必須整筆落在靜默內、模組還得
+ *   在前導開始前就已進 RX。地面站 burst 4500ms 只橫跨 1.5 個窗，命中機率本來就低。
+ *
+ * 觀察：這個取捨在「未 ARM 的地面待命」階段根本不需要成立 —— 那時候 433 下行遙測
+ *   是冗餘的（920/E80 全速 10Hz + USB-CDC 直連都在），唯一要緊的事是把 ARM 收進來；
+ *   而 ARM 之後上行只剩手動開傘（低頻、可重打），下行遙測反而是主要價值。
+ * 故把窗做成隨飛行狀態切換的兩檔：
+ *   ① STATE_INIT / STATE_PAD（未 ARM）：PERIOD 2000 + HOLD 1000
+ *      → 保證靜默 = 600 - 500 + 1000 = 1100ms／每 2000ms（55%），且窗的間隔從 3s
+ *        縮到 2s，地面站 4500ms 的 burst 必定橫跨 2 個以上完整窗，每窗又夠地面站
+ *        以 UPLINK_TX_GAP_MS=150 重打 ~6 次 → 命中幾乎必然。
+ *      代價：433 下行剩 2000-600-1000 = 400ms 發射帶 ≈ 每 2s 一包（~0.5Hz）。刻意接受。
+ *   ② 其餘狀態（PAD_ARMED 起，含全飛行段）：維持原本 3000/400，433 下行密度不變。
+ * ⚠ ①的發射帶(400ms)已小於一包空中時間(~500ms)：這是允許的——守衛帶存在的目的就是
+ *   吸收「在發射帶尾端起飛、跨進守衛帶才送完」的封包；只要 GUARD > 最大空中時間，
+ *   窗開始時空中一定已靜默。但若封包再變大／空中速率再調低，必須同步重算 GUARD。 */
+#define UPLINK_LISTEN_PERIOD_PAD_MS  2000U
+#define UPLINK_LISTEN_HOLD_PAD_MS    1000U
 void LoRaTelemetry_Task(void *argument)
 {
     (void)argument;
@@ -3194,11 +3232,29 @@ void LoRaTelemetry_Task(void *argument)
          * 變數整個拿掉，用來判斷上行收不到到底是窗的問題還是 RF 層的問題。 */
         uint8_t listen_slot = 1U;
 #else
-        uint32_t uplink_phase = HAL_GetTick() % UPLINK_LISTEN_PERIOD_MS;
+        /* 未 ARM（地面待命）用大窗、ARM 後換回小窗：見 UPLINK_LISTEN_PERIOD_PAD_MS 註解。
+         * g_fsm_ctx.state 是單一 enum 讀取，與飛控任務無鎖競爭（讀到舊值最多讓這一槽
+         * 用了上一檔的窗，下一槽即修正）。 */
+        uint8_t  pad_idle      = (g_fsm_ctx.state == STATE_INIT) || (g_fsm_ctx.state == STATE_PAD);
+        uint32_t listen_period = pad_idle ? UPLINK_LISTEN_PERIOD_PAD_MS : UPLINK_LISTEN_PERIOD_MS;
+        uint32_t listen_hold   = pad_idle ? UPLINK_LISTEN_HOLD_PAD_MS   : UPLINK_LISTEN_HOLD_MS;
+        uint32_t uplink_phase  = HAL_GetTick() % listen_period;
         /* 窗內：phase < HOLD。守衛帶：phase 距離下一個窗起點不到 GUARD。
          * 兩段在時間軸上相連（… GUARD | 窗起點 | HOLD …），合計連續靜默 GUARD+HOLD。 */
-        uint8_t listen_slot = (uplink_phase < UPLINK_LISTEN_HOLD_MS) ||
-                              ((UPLINK_LISTEN_PERIOD_MS - uplink_phase) <= UPLINK_TX_GUARD_MS);
+        uint8_t listen_slot = (uplink_phase < listen_hold) ||
+                              ((listen_period - uplink_phase) <= UPLINK_TX_GUARD_MS);
+        /* 換檔時印一行：台面/場測時能直接確認現在用的是哪一組窗參數。 */
+        {
+            static uint8_t s_pad_idle_prev = 0xFFU;
+            if (pad_idle != s_pad_idle_prev) {
+                s_pad_idle_prev = pad_idle;
+                printf("[UPLINK_WIN] %s 窗：period=%lums hold=%lums guard=%lums（保證靜默 ~%lums）\r\n",
+                       pad_idle ? "地面待命(未ARM)大" : "已ARM/飛行小",
+                       (unsigned long)listen_period, (unsigned long)listen_hold,
+                       (unsigned long)UPLINK_TX_GUARD_MS,
+                       (unsigned long)(listen_hold + UPLINK_TX_GUARD_MS - 500UL));
+            }
+        }
 #endif
         uint8_t tx433_slot  = ((slot % LORA433_TX_EVERY) == 0U);   /* 降速：每 N 槽才發 433 */
         if (lora433_ok && !listen_slot && tx433_slot) {
@@ -5133,7 +5189,10 @@ void StartDefaultTask(void *argument)
             RATE_TICK_BMP388();   /* 統計 BMP388 實際採樣率 → g_sampling_rate.bmp388.rate_hz（現應報 ~50Hz） */
 
             /* P0-D：BMP388 健康餵入（氣壓 26–110 kPa、溫度 −40~85°C；
-             * 簽章取整數 Pa —— 卡死的感測器回傳逐位元相同的浮點值） */
+             * 簽章取整數 Pa —— 卡死的感測器回傳逐位元相同的浮點值）
+             * 💡 註解說明：強轉整數 Pa (1 Pa ≈ 8.5cm) 在地面發射台/靜止桌測時，
+             * 微小氣壓雜訊被抹平可能導致 >1s 簽章無變化而誤觸發 STUCK (sensor_bits=0x04)。
+             * 日後若重新燒錄韌體，可改為 (int32_t)(baro_data.pressure * 10.0f) 以保留 0.1 Pa 解析度。 */
             uint8_t bmp_range_ok = (baro_data.pressure    >= 26000.0f &&
                                     baro_data.pressure    <= 110000.0f &&
                                     baro_data.temperature >= -40.0f &&

@@ -176,11 +176,11 @@ static void test_pad_noise(void) {
     printf("[2] PAD 雜訊免疫 / 校準閘\n");
     Sim_t s;
 
-    /* 2.9g 突波 + 9.5m 高度抖動（皆低於門檻）持續 60s */
+    /* 2.9g 突波 + 29.5m 高度抖動（皆低於門檻；門檻 2026-08-02 由 10m 提為 30m）持續 60s */
     sim_init(&s, STATE_PAD, 0, 0, 0);
     while (s.now < 60000) {
         s.in.a_z_g = ((s.now / 10U) % 2U) ? 2.9f : 1.0f;
-        s.in.h_est = 9.5f;
+        s.in.h_est = 29.5f;
         s.in.v_est = 0.0f;
         sim_step(&s);
     }
@@ -327,20 +327,28 @@ static void test_failsafe_and_baro_crosscheck(void) {
     }
     check("baro 失效：EKF 主路徑照常 (t=11050)", s.t_apogee == 11050 && s.fire_n == 1);
 
-    /* 6e. 起飛第三冗餘：ADXL 死（a_z=1g）+ EKF 死（h=0）+ baro 相對高度 25m → 起飛；
-     * baro 失效位設起時則不得起飛。 */
+    /* 6e. 起飛第三冗餘：ADXL 死（a_z=1g）+ EKF 死（h=0）+ baro 相對高度 35m → 起飛；
+     * baro 失效位設起時則不得起飛。（門檻 2026-08-02 由 20m 提為 30m） */
+    sim_init(&s, STATE_PAD, 0, 0, 0);
+    s.in.a_z_g = 1.0f;
+    s.in.h_est = 0.0f;
+    s.in.baro_alt_rel = 35.0f;
+    sim_step(&s); /* step 1: PAD -> PAD_ARMED */
+    sim_step(&s); /* step 2: PAD_ARMED -> BOOST */
+    check("baro 起飛冗餘：baro_rel>30m 即起飛", s.ctx.state == STATE_BOOST);
+
+    /* 25m（新門檻以下、舊門檻以上）必須不起飛——鎖定本次提高後的行為 */
     sim_init(&s, STATE_PAD, 0, 0, 0);
     s.in.a_z_g = 1.0f;
     s.in.h_est = 0.0f;
     s.in.baro_alt_rel = 25.0f;
-    sim_step(&s); /* step 1: PAD -> PAD_ARMED */
-    sim_step(&s); /* step 2: PAD_ARMED -> BOOST */
-    check("baro 起飛冗餘：baro_rel>20m 即起飛", s.ctx.state == STATE_BOOST);
+    sim_run_until(&s, 5000);
+    check("baro 起飛冗餘：25m 未達新門檻不起飛", s.ctx.state == STATE_PAD_ARMED);
 
     sim_init(&s, STATE_PAD, 0, 0, 0);
     s.in.a_z_g = 1.0f;
     s.in.h_est = 0.0f;
-    s.in.baro_alt_rel = 25.0f;
+    s.in.baro_alt_rel = 35.0f;
     s.in.sensor_bits = FSM_SB_BARO_FAULT;
     sim_run_until(&s, 5000);
     check("baro 失效位起時不誤起飛", s.ctx.state == STATE_PAD_ARMED);
