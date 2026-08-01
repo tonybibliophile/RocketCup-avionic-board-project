@@ -103,3 +103,5 @@ ground_station/logs/
 ground_station/reports/
 # gps_live_analyzer / 即時側錄的每場 run 目錄（報告 + plot + raw log）
 ground_station/runs/
+# sensor_error_analyzer / vibration analyzer 對 tests/ 資料跑出來的圖表與報告（數十 MB，可重生）
+tests/output/

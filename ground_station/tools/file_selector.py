@@ -16,7 +16,7 @@ def select_input_file(title="請選擇要分析/解碼的檔案", extensions=Non
         extensions = [".csv", ".bin", ".hex", ".log"]
     if file_types is None:
         file_types = [
-            ("Supported RocketCom Files", "*.csv;*.bin;*.hex;*.log"),
+            ("Supported RocketCom Files", ("*.csv", "*.bin", "*.hex", "*.log")),
             ("CSV files", "*.csv"),
             ("Binary files", "*.bin"),
             ("Hex files", "*.hex"),

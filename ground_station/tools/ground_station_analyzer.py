@@ -55,9 +55,12 @@ try:
     import matplotlib
     if sys.platform == "darwin":
         try:
-            matplotlib.use("MacOSX")
-        except Exception:
             matplotlib.use("TkAgg")
+        except Exception:
+            try:
+                matplotlib.use("MacOSX")
+            except Exception:
+                pass
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
     HAS_MATPLOTLIB = True
